@@ -82,6 +82,7 @@ pub fn change_requests() -> Vec<ChangeRequest> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)] // Fixture constructor mirrors the visible dashboard dimensions.
 fn request(
     forge: &str,
     repo: &str,
@@ -118,26 +119,17 @@ fn request(
         updated_at,
         additions: 318,
         deletions: 84,
-        comments: vec![
-            Comment {
-                author: Person {
-                    login: "alice".into(),
-                    name: Some("Alice".into()),
-                },
-                body: "Looks good. The reader handles the old fixture now.".into(),
-                created_at: updated_at - Duration::minutes(8),
-                resolved: None,
-            },
-            Comment {
-                author: Person {
-                    login: "bob".into(),
-                    name: Some("Bob".into()),
-                },
-                body: "Could this keep the failure context?".into(),
-                created_at: updated_at - Duration::minutes(4),
-                resolved: Some(false),
-            },
-        ],
+        comments: (0..42).map(|index| Comment {
+            id: format!("{number}-{index}"),
+            author: Person { login: if index % 2 == 0 { "alice".into() } else { "bob".into() }, name: Some(if index % 2 == 0 { "Alice".into() } else { "Bob".into() }) },
+            body: if index == 41 { "Looks good overall.\n\nOne concern about the error context, but the reader change itself is solid.".into() } else { format!("Discussion note {} for this change request.", index + 1) },
+            created_at: updated_at - Duration::minutes(42 - index),
+            updated_at: (index == 40).then_some(updated_at - Duration::minutes(1)),
+            can_edit: index % 2 == 1,
+            can_delete: index % 2 == 1,
+            url: None,
+            resolved: (index == 3).then_some(false),
+        }).collect(),
         reviewers: vec![
             Reviewer {
                 person: Person {

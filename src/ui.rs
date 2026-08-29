@@ -1,14 +1,16 @@
-use crate::app::App;
+pub mod theme;
+use crate::app::{App, HitRegions};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-const ACCENT: Color = Color::Cyan;
-pub fn draw(frame: &mut Frame, app: &App) {
+use theme::Theme;
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let theme = Theme::detect();
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -25,8 +27,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Span::styled(
             " prtop ",
             Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
+                .fg(theme.background)
+                .bg(theme.primary)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" All  GitHub  GitLab  Codeberg"),
@@ -40,8 +42,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
         .split(outer[1]);
-    draw_list(frame, panes[0], app);
-    draw_detail(frame, panes[1], app);
+    let detail_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(panes[1]);
+    app.set_regions(HitRegions {
+        requests: panes[0],
+        details: panes[1],
+        comments: detail_columns[0],
+        ci: detail_columns[1],
+        reviewers: detail_columns[1],
+    });
+    draw_list(frame, panes[0], app, theme);
+    draw_detail(frame, panes[1], app, theme);
     let health = app
         .health
         .iter()
@@ -52,14 +65,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Paragraph::new(format!(
             " / filter  r refresh  Enter detail  ? keys  q quit   {health}"
         ))
-        .style(Style::default().fg(Color::DarkGray)),
+        .style(Style::default().fg(theme.muted)),
         outer[2],
     );
     if app.show_help {
         help(frame);
     }
 }
-fn draw_list(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_list(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let visible = app.visible();
     let items: Vec<ListItem> = visible
         .iter()
@@ -75,7 +88,10 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App) {
                         pr.id.display(pr.kind)
                     ),
                     if i == app.selected {
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(theme.selection_fg)
+                            .bg(theme.selection_bg)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
                     },
@@ -99,11 +115,16 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App) {
         format!(" requests  filter: {} ", app.filter)
     };
     frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border_active))
+                .title(title),
+        ),
         area,
     );
 }
-fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -120,12 +141,19 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
         .comments
         .iter()
         .rev()
+        .skip(app.comment_scroll)
         .take(10)
         .map(|c| {
             Line::from(format!(
-                "{}: {}",
+                "{} · {}{}\n{}",
                 c.author.name.as_deref().unwrap_or(&c.author.login),
-                c.body
+                c.created_at.format("%H:%M"),
+                if c.updated_at.is_some() {
+                    " edited"
+                } else {
+                    ""
+                },
+                c.body.replace('\n', " ")
             ))
         })
         .collect::<Vec<_>>();
@@ -140,7 +168,14 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             pr.deletions
         )),
         Line::from(""),
-        Line::styled("Latest comments", Style::default().fg(ACCENT)),
+        Line::styled(
+            format!(
+                "Comments (latest {} of {})",
+                comments.len(),
+                pr.comments.len()
+            ),
+            Style::default().fg(theme.secondary),
+        ),
     ];
     left.extend(comments);
     frame.render_widget(
@@ -153,7 +188,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     );
     let mut right = vec![Line::styled(
         "CI",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
     )];
     if let Some(pipeline) = &pr.pipeline {
         for job in &pipeline.jobs {
@@ -171,7 +206,9 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::styled(
             "Reviewers",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.secondary)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
     for reviewer in &pr.reviewers {

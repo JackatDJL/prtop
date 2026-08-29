@@ -22,10 +22,24 @@ pub enum ForgeError {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ForgeCapabilities {
+    pub comments: bool,
+    pub reviews: bool,
+    pub approve: bool,
+    pub request_changes: bool,
+    pub request_reviewers: bool,
+    pub edit_comments: bool,
+    pub delete_comments: bool,
+}
+
 #[allow(dead_code)] // Providers implement these methods as their milestone reaches the UI.
 #[async_trait]
 pub trait ForgeProvider: Send + Sync {
     fn name(&self) -> &str;
+    fn capabilities(&self) -> ForgeCapabilities {
+        ForgeCapabilities::default()
+    }
     async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, ForgeError>;
     async fn get_change_request(&self, _id: &ChangeRequestId) -> Result<ChangeRequest, ForgeError> {
         Err(ForgeError::Unsupported)
@@ -54,6 +68,7 @@ pub trait ForgeProvider: Send + Sync {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Kept private while adapters share the normalized mapping.
 pub(crate) fn normalized_request(
     forge: String,
     repository: String,

@@ -13,7 +13,7 @@ use anyhow::Result;
 use app::{App, AppEvent};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -35,14 +35,14 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -77,8 +77,10 @@ async fn run(
         tokio::select! {
             _ = tick.tick() => {
                 while event::poll(Duration::ZERO)? {
-                    if let Event::Key(key) = event::read()? {
-                        if key.kind == KeyEventKind::Press && app.handle_key(key.code) { return Ok(()); }
+                    match event::read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => { if app.handle_key(key.code) { return Ok(()); } }
+                        Event::Mouse(mouse) => app.handle_mouse(mouse),
+                        _ => {}
                     }
                 }
             }

@@ -16,6 +16,16 @@ A named repository registration. A project may have a local or remote working di
 
 The provider's execution grouping for CI work. A pipeline contains jobs.
 
+## Review
+
+An explicit response by a reviewer. Requested, pending, approved, changes requested, commented,
+and dismissed are normalized states. Provider approval rules remain provider metadata.
+
+## Comment
+
+A general change-request discussion entry. A comment has a stable provider ID, author, body,
+creation and optional edit times, and provider permissions for editing or deletion.
+
 ## Stack
 
 An ordered parent-child branch relationship, optionally connected to change requests. It is not inferred merely because two change requests share a repository.

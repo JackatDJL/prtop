@@ -11,6 +11,17 @@ normalized forge models, provider boundaries, TOML configuration, and a local ca
 GitHub, GitLab, and Forgejo adapters are intentionally limited to the safe read path until
 their API fixtures and write confirmations land in later milestones.
 
+## Reviews, comments, and mouse input
+
+Milestone 2 centralizes terminal colors in `ui::theme`. It selects truecolor when available,
+then 256-color or ANSI-safe colors. Mouse capture is enabled only while the alternate screen is
+active and is disabled during terminal restoration. Clicks and scrolling go through the same
+selection and focus state as keyboard navigation.
+
+Comments are stored chronologically. The detail pane begins at the newest ten comments and
+scrolls toward older entries. Provider capability flags will gate live write actions before the
+UI exposes them.
+
 ## Keys
 
 `j`/`k` select, `Enter` toggles detail focus, `/` filters, `r` refreshes, `?` toggles help,

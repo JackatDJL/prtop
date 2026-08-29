@@ -55,9 +55,14 @@ pub struct Person {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Comment {
+    pub id: String,
     pub author: Person,
     pub body: String,
     pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub can_edit: bool,
+    pub can_delete: bool,
+    pub url: Option<String>,
     pub resolved: Option<bool>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,10 +72,12 @@ pub struct Reviewer {
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum ReviewState {
+    Pending,
     Approved,
     ChangesRequested,
     Requested,
     Commented,
+    Dismissed,
     Waiting,
     None,
 }
@@ -105,20 +112,24 @@ pub struct Job {
 impl ReviewState {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Approved => "approved",
             Self::ChangesRequested => "changes",
             Self::Requested => "requested",
             Self::Commented => "commented",
+            Self::Dismissed => "dismissed",
             Self::Waiting => "waiting",
             Self::None => "-",
         }
     }
     pub fn glyph(self) -> &'static str {
         match self {
+            Self::Pending => "…",
             Self::Approved => "✓",
             Self::ChangesRequested => "✗",
             Self::Requested | Self::Waiting => "?",
             Self::Commented => "•",
+            Self::Dismissed => "-",
             Self::None => "·",
         }
     }

@@ -5,12 +5,29 @@ use crate::{
     model::*,
 };
 use anyhow::Result;
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use std::{sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
 pub enum AppEvent {
     Refresh(RefreshResult),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Focus {
+    Requests,
+    Details,
+    Comments,
+    Ci,
+    Reviewers,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HitRegions {
+    pub requests: Rect,
+    pub details: Rect,
+    pub comments: Rect,
+    pub ci: Rect,
+    pub reviewers: Rect,
 }
 pub struct RefreshResult {
     pub requests: Vec<ChangeRequest>,
@@ -27,6 +44,11 @@ pub struct App {
     pub health: Vec<(String, String)>,
     pub last_refresh: Option<Instant>,
     pub stale: bool,
+    pub focus: Focus,
+    pub comment_scroll: usize,
+    pub ci_scroll: usize,
+    pub regions: HitRegions,
+    pub toast: Option<String>,
     config: Config,
     demo: bool,
     scope: Option<String>,
@@ -55,6 +77,11 @@ impl App {
             health: vec![],
             last_refresh: None,
             stale: !demo,
+            focus: Focus::Requests,
+            comment_scroll: 0,
+            ci_scroll: 0,
+            regions: HitRegions::default(),
+            toast: None,
             config,
             demo,
             scope,
@@ -105,6 +132,27 @@ impl App {
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('r') => self.request_refresh(),
             KeyCode::Char('?') => self.show_help = !self.show_help,
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Focus::Requests => Focus::Details,
+                    Focus::Details => Focus::Ci,
+                    Focus::Ci => Focus::Reviewers,
+                    Focus::Reviewers => Focus::Comments,
+                    Focus::Comments => Focus::Requests,
+                }
+            }
+            KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Requests => Focus::Comments,
+                    Focus::Details => Focus::Requests,
+                    Focus::Ci => Focus::Details,
+                    Focus::Reviewers => Focus::Ci,
+                    Focus::Comments => Focus::Reviewers,
+                }
+            }
+            KeyCode::Char('c') => {
+                self.toast = Some("Comment editor is coming next in this slice".into())
+            }
             KeyCode::Esc | KeyCode::Char('h') => {
                 self.detail = false;
                 self.show_help = false;
@@ -112,6 +160,45 @@ impl App {
             _ => {}
         };
         false
+    }
+    pub fn set_regions(&mut self, regions: HitRegions) {
+        self.regions = regions;
+    }
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        let point = |rect: Rect| {
+            event.column >= rect.x
+                && event.column < rect.x + rect.width
+                && event.row >= rect.y
+                && event.row < rect.y + rect.height
+        };
+        match event.kind {
+            MouseEventKind::Down(_) if point(self.regions.requests) => {
+                self.focus = Focus::Requests;
+                let row = event.row.saturating_sub(self.regions.requests.y + 1) as usize;
+                if row < self.visible().len() {
+                    self.selected = row;
+                }
+            }
+            MouseEventKind::Down(_) if point(self.regions.details) => self.focus = Focus::Details,
+            MouseEventKind::Down(_) if point(self.regions.comments) => self.focus = Focus::Comments,
+            MouseEventKind::Down(_) if point(self.regions.ci) => self.focus = Focus::Ci,
+            MouseEventKind::Down(_) if point(self.regions.reviewers) => {
+                self.focus = Focus::Reviewers
+            }
+            MouseEventKind::ScrollUp if point(self.regions.comments) => {
+                self.comment_scroll = self.comment_scroll.saturating_sub(3)
+            }
+            MouseEventKind::ScrollDown if point(self.regions.comments) => {
+                self.comment_scroll = self.comment_scroll.saturating_add(3)
+            }
+            MouseEventKind::ScrollUp if point(self.regions.ci) => {
+                self.ci_scroll = self.ci_scroll.saturating_sub(1)
+            }
+            MouseEventKind::ScrollDown if point(self.regions.ci) => {
+                self.ci_scroll = self.ci_scroll.saturating_add(1)
+            }
+            _ => {}
+        }
     }
     pub fn request_refresh(&self) {
         let sender = self.events.clone();
@@ -131,6 +218,53 @@ impl App {
         if self.selected >= self.visible().len() {
             self.selected = self.visible().len().saturating_sub(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton};
+
+    #[tokio::test]
+    async fn click_and_keyboard_share_request_selection() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.set_regions(HitRegions {
+            requests: Rect::new(0, 0, 80, 10),
+            ..HitRegions::default()
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, 1);
+        app.handle_key(KeyCode::Char('j'));
+        assert_eq!(app.selected, 2);
+    }
+
+    #[tokio::test]
+    async fn wheel_targets_comment_panel() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.set_regions(HitRegions {
+            comments: Rect::new(0, 10, 40, 10),
+            ..HitRegions::default()
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Requests);
+        assert_eq!(app.comment_scroll, 3);
     }
 }
 async fn refresh(config: Config, demo: bool, scope: Option<String>) -> RefreshResult {
