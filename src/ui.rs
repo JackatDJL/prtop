@@ -1,5 +1,5 @@
 pub mod theme;
-use crate::app::{App, HitRegions, Overlay, View};
+use crate::app::{App, DetailFocus, HitRegions, Overlay, View};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -56,9 +56,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.set_regions(HitRegions {
         requests: panes[0],
         details: panes[1],
+        description: detail_columns[0],
         comments: detail_columns[0],
         ci: detail_columns[1],
         reviewers: detail_columns[1],
+        metadata: detail_columns[1],
     });
     draw_list(frame, panes[0], app, theme);
     draw_detail(frame, panes[1], app, theme);
@@ -94,7 +96,7 @@ fn draw_full_detail(frame: &mut Frame, app: &mut App, theme: Theme) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-    let Some(pr) = app.selected_request() else {
+    let Some(pr) = app.detail_request() else {
         frame.render_widget(
             Paragraph::new(
                 "Change request is no longer available.\n\nEsc returns to the dashboard.",
@@ -126,16 +128,34 @@ fn draw_full_detail(frame: &mut Frame, app: &mut App, theme: Theme) {
         outer[0],
     );
     let detail = outer[1];
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(detail);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(8)])
+        .split(columns[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Percentage(30),
+            Constraint::Percentage(25),
+        ])
+        .split(columns[1]);
     app.set_regions(HitRegions {
         details: detail,
-        comments: detail,
-        ci: detail,
-        reviewers: detail,
+        description: left[0],
+        comments: left[1],
+        ci: right[0],
+        reviewers: right[1],
+        metadata: right[2],
         ..HitRegions::default()
     });
     draw_detail(frame, detail, app, theme);
     frame.render_widget(
-        Paragraph::new(" Esc back   Tab focus   ↑↓ scroll   c comment   R review   : commands")
+        Paragraph::new(" ↑↓ scroll  PgUp/PgDn fast  Tab panel  c comment  R review  Esc back")
             .style(Style::default().fg(theme.muted)),
         outer[2],
     );
@@ -278,11 +298,23 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     );
 }
 fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    let split = Layout::default()
+    let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
-    let Some(pr) = app.selected_request() else {
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(8)])
+        .split(columns[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Percentage(30),
+            Constraint::Percentage(25),
+        ])
+        .split(columns[1]);
+    let Some(pr) = app.request_for_view() else {
         frame.render_widget(
             Paragraph::new("No requests. Configure a forge or use --demo.")
                 .block(Block::default().borders(Borders::ALL).title(" detail ")),
@@ -310,42 +342,48 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             ))
         })
         .collect::<Vec<_>>();
-    let mut left = vec![
+    let description = vec![
         Line::styled(&pr.title, Style::default().add_modifier(Modifier::BOLD)),
         Line::from(format!(
-            "{} · {} → {} · +{} / -{}",
+            "{} · {} → {}",
             pr.id.display(pr.kind),
             pr.source_branch,
-            pr.target_branch,
-            pr.additions,
-            pr.deletions
+            pr.target_branch
         )),
-        Line::from(""),
-        Line::styled(
-            format!(
-                "Comments (latest {} of {})",
-                comments.len(),
-                pr.comments.len()
-            ),
-            Style::default().fg(theme.secondary),
-        ),
+        Line::from(format!(
+            "+{} / -{} · {}",
+            pr.additions,
+            pr.deletions,
+            pr.mergeability.label()
+        )),
     ];
-    left.extend(comments);
     frame.render_widget(
-        Paragraph::new(left).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" selected request "),
-        ),
-        split[0],
+        Paragraph::new(description).block(panel_block(
+            " description ",
+            app.detail_focus == DetailFocus::Description,
+            theme,
+        )),
+        left[0],
     );
-    let mut right = vec![Line::styled(
-        "CI",
-        Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
+    let mut comment_lines = vec![Line::styled(
+        format!("latest {} of {}", comments.len(), pr.comments.len()),
+        Style::default().fg(theme.secondary),
     )];
+    comment_lines.extend(comments);
+    frame.render_widget(
+        Paragraph::new(comment_lines)
+            .wrap(Wrap { trim: true })
+            .block(panel_block(
+                " comments ",
+                app.detail_focus == DetailFocus::Comments,
+                theme,
+            )),
+        left[1],
+    );
+    let mut ci = vec![];
     if let Some(pipeline) = &pr.pipeline {
-        for job in &pipeline.jobs {
-            right.push(Line::from(format!(
+        for job in pipeline.jobs.iter().skip(app.ci_scroll).take(8) {
+            ci.push(Line::from(format!(
                 "{} {:<24} {}",
                 job.status.glyph(),
                 job.name,
@@ -354,36 +392,64 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
                     .unwrap_or_else(|| job.status.label().into())
             )));
         }
-    }
-    right.extend([
-        Line::from(""),
-        Line::styled(
-            "Reviewers",
-            Style::default()
-                .fg(theme.secondary)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    for reviewer in &pr.reviewers {
-        right.push(Line::from(format!(
-            "{} {:<16} {}",
-            reviewer.state.glyph(),
-            reviewer
-                .person
-                .name
-                .as_deref()
-                .unwrap_or(&reviewer.person.login),
-            reviewer.state.label()
-        )));
+    } else {
+        ci.push(Line::from("No pipeline reported"));
     }
     frame.render_widget(
-        Paragraph::new(right).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" CI / review "),
-        ),
-        split[1],
+        Paragraph::new(ci).block(panel_block(
+            " CI ",
+            app.detail_focus == DetailFocus::Ci,
+            theme,
+        )),
+        right[0],
     );
+    let reviewers = pr
+        .reviewers
+        .iter()
+        .map(|reviewer| {
+            Line::from(format!(
+                "{} {:<16} {}",
+                reviewer.state.glyph(),
+                reviewer
+                    .person
+                    .name
+                    .as_deref()
+                    .unwrap_or(&reviewer.person.login),
+                reviewer.state.label()
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(reviewers).block(panel_block(
+            " reviewers ",
+            app.detail_focus == DetailFocus::Reviewers,
+            theme,
+        )),
+        right[1],
+    );
+    let metadata = vec![
+        Line::from(format!("{} / {}", pr.id.forge, pr.id.repository)),
+        Line::from(format!("author: {}", pr.author.login)),
+        Line::from(format!("review: {}", pr.review.label())),
+    ];
+    frame.render_widget(
+        Paragraph::new(metadata).block(panel_block(
+            " metadata ",
+            app.detail_focus == DetailFocus::Metadata,
+            theme,
+        )),
+        right[2],
+    );
+}
+fn panel_block(title: &str, active: bool, theme: Theme) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if active {
+            theme.border_active
+        } else {
+            theme.muted
+        }))
+        .title(title)
 }
 fn help(frame: &mut Frame) {
     let area = centered(frame.area(), 60, 50);

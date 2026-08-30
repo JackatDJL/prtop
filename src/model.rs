@@ -96,6 +96,16 @@ pub enum Mergeability {
     Blocked,
     Unknown,
 }
+impl Mergeability {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mergeable => "mergeable",
+            Self::Conflicting => "conflicting",
+            Self::Blocked => "blocked",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pipeline {
     pub number: u64,

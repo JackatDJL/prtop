@@ -31,6 +31,34 @@ pub enum Focus {
     Ci,
     Reviewers,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DetailFocus {
+    Comments,
+    Description,
+    Reviewers,
+    Ci,
+    Metadata,
+}
+impl DetailFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Comments => Self::Description,
+            Self::Description => Self::Reviewers,
+            Self::Reviewers => Self::Ci,
+            Self::Ci => Self::Metadata,
+            Self::Metadata => Self::Comments,
+        }
+    }
+    fn previous(self) -> Self {
+        match self {
+            Self::Comments => Self::Metadata,
+            Self::Description => Self::Comments,
+            Self::Reviewers => Self::Description,
+            Self::Ci => Self::Reviewers,
+            Self::Metadata => Self::Ci,
+        }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum View {
     Dashboard,
@@ -47,9 +75,11 @@ pub enum Overlay {
 pub struct HitRegions {
     pub requests: Rect,
     pub details: Rect,
+    pub description: Rect,
     pub comments: Rect,
     pub ci: Rect,
     pub reviewers: Rect,
+    pub metadata: Rect,
 }
 pub struct RefreshResult {
     pub requests: Vec<ChangeRequest>,
@@ -67,6 +97,7 @@ pub struct App {
     pub last_refresh: Option<Instant>,
     pub stale: bool,
     pub focus: Focus,
+    pub detail_focus: DetailFocus,
     pub comment_scroll: usize,
     pub ci_scroll: usize,
     pub regions: HitRegions,
@@ -103,6 +134,7 @@ impl App {
             last_refresh: None,
             stale: !demo,
             focus: Focus::Requests,
+            detail_focus: DetailFocus::Comments,
             comment_scroll: 0,
             ci_scroll: 0,
             regions: HitRegions::default(),
@@ -130,6 +162,18 @@ impl App {
     }
     pub fn selected_request(&self) -> Option<&ChangeRequest> {
         self.visible().get(self.selected).copied()
+    }
+    pub fn detail_request(&self) -> Option<&ChangeRequest> {
+        let View::ChangeRequestDetail(id) = &self.view else {
+            return None;
+        };
+        self.requests.iter().find(|request| request.id == *id)
+    }
+    pub fn request_for_view(&self) -> Option<&ChangeRequest> {
+        match self.view {
+            View::Dashboard => self.selected_request(),
+            View::ChangeRequestDetail(_) => self.detail_request(),
+        }
     }
     #[cfg(test)]
     pub fn handle_key(&mut self, key: KeyCode) -> bool {
@@ -216,7 +260,7 @@ impl App {
             }
             return false;
         }
-        if self.filtering {
+        if self.filtering && self.view == View::Dashboard {
             match key {
                 KeyCode::Esc | KeyCode::Enter => self.filtering = false,
                 KeyCode::Backspace => {
@@ -231,14 +275,14 @@ impl App {
             };
             return false;
         }
+        match self.view.clone() {
+            View::Dashboard => self.handle_dashboard_key(key),
+            View::ChangeRequestDetail(id) => self.handle_detail_key(&id, key),
+        }
+    }
+    fn handle_dashboard_key(&mut self, key: KeyCode) -> bool {
         match key {
-            KeyCode::Char('q') if self.view == View::Dashboard => return true,
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h')
-                if self.view != View::Dashboard =>
-            {
-                self.view = View::Dashboard;
-                self.focus = Focus::Requests;
-            }
+            KeyCode::Char('q') => return true,
             KeyCode::Char('j') | KeyCode::Down if self.focus == Focus::Comments => {
                 self.comment_scroll = self.comment_scroll.saturating_add(1)
             }
@@ -323,16 +367,108 @@ impl App {
         };
         false
     }
+    fn handle_detail_key(&mut self, id: &ChangeRequestId, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') => {
+                self.view = View::Dashboard;
+                self.focus = Focus::Requests;
+            }
+            KeyCode::Tab => self.detail_focus = self.detail_focus.next(),
+            KeyCode::BackTab => self.detail_focus = self.detail_focus.previous(),
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_detail(id, 1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_detail(id, -1),
+            KeyCode::PageDown => self.scroll_detail(id, 10),
+            KeyCode::PageUp => self.scroll_detail(id, -10),
+            KeyCode::Home => self.home_detail(id),
+            KeyCode::End => self.end_detail(),
+            KeyCode::Char('c') if self.can(|capabilities| capabilities.comments) => {
+                self.overlay = Some(Overlay::Composer {
+                    body: String::new(),
+                })
+            }
+            KeyCode::Char('R') if self.can(|capabilities| capabilities.reviews) => {
+                self.overlay = Some(Overlay::ReviewMenu { selected: 0 })
+            }
+            KeyCode::Char('a') if self.can(|capabilities| capabilities.approve) => {
+                self.apply_review(ReviewState::Approved)
+            }
+            KeyCode::Char('x') if self.can(|capabilities| capabilities.request_changes) => {
+                self.apply_review(ReviewState::ChangesRequested)
+            }
+            KeyCode::Char('c') | KeyCode::Char('R') | KeyCode::Char('a') | KeyCode::Char('x') => {
+                self.toast = Some("This forge has not advertised this write capability".into())
+            }
+            KeyCode::Char(':') => {
+                self.overlay = Some(Overlay::Palette {
+                    query: String::new(),
+                    selected: 0,
+                })
+            }
+            _ => {}
+        }
+        false
+    }
+    fn scroll_detail(&mut self, id: &ChangeRequestId, delta: isize) {
+        match self.detail_focus {
+            DetailFocus::Comments => {
+                let max = self
+                    .requests
+                    .iter()
+                    .find(|request| request.id == *id)
+                    .map_or(0, |request| request.comments.len().saturating_sub(10));
+                self.comment_scroll = self.comment_scroll.saturating_add_signed(delta).min(max);
+            }
+            DetailFocus::Ci => {
+                let max = self
+                    .requests
+                    .iter()
+                    .find(|request| request.id == *id)
+                    .and_then(|request| request.pipeline.as_ref())
+                    .map_or(0, |pipeline| pipeline.jobs.len().saturating_sub(8));
+                self.ci_scroll = self.ci_scroll.saturating_add_signed(delta).min(max);
+            }
+            DetailFocus::Description | DetailFocus::Reviewers | DetailFocus::Metadata => {}
+        }
+    }
+    fn home_detail(&mut self, id: &ChangeRequestId) {
+        match self.detail_focus {
+            DetailFocus::Comments => {
+                self.comment_scroll = self
+                    .requests
+                    .iter()
+                    .find(|request| request.id == *id)
+                    .map_or(0, |request| request.comments.len().saturating_sub(10));
+            }
+            DetailFocus::Ci => {
+                self.ci_scroll = self
+                    .requests
+                    .iter()
+                    .find(|request| request.id == *id)
+                    .and_then(|request| request.pipeline.as_ref())
+                    .map_or(0, |pipeline| pipeline.jobs.len().saturating_sub(8));
+            }
+            DetailFocus::Description | DetailFocus::Reviewers | DetailFocus::Metadata => {}
+        }
+    }
+    fn end_detail(&mut self) {
+        match self.detail_focus {
+            DetailFocus::Comments => self.comment_scroll = 0,
+            DetailFocus::Ci => self.ci_scroll = 0,
+            DetailFocus::Description | DetailFocus::Reviewers | DetailFocus::Metadata => {}
+        }
+    }
     fn open_selected(&mut self) {
         if let Some(request) = self.selected_request() {
             self.view = View::ChangeRequestDetail(request.id.clone());
-            self.focus = Focus::Details;
+            self.detail_focus = DetailFocus::Comments;
+            self.comment_scroll = 0;
+            self.ci_scroll = 0;
         }
     }
     fn can(&self, predicate: impl Fn(forge::ForgeCapabilities) -> bool) -> bool {
         self.demo
             || self
-                .selected_request()
+                .request_for_view()
                 .and_then(|request| self.providers.get(&request.id.forge))
                 .is_some_and(|provider| predicate(provider.capabilities()))
     }
@@ -341,11 +477,7 @@ impl App {
             self.toast = Some("Comment is empty".into());
             return;
         }
-        let Some(request) = self
-            .visible()
-            .get(self.selected)
-            .map(|item| item.id.clone())
-        else {
+        let Some(request) = self.request_for_view().map(|item| item.id.clone()) else {
             return;
         };
         let temporary_id = format!(
@@ -388,11 +520,7 @@ impl App {
         self.toast = Some("Sending comment".into());
     }
     fn apply_review(&mut self, state: ReviewState) {
-        let Some(request) = self
-            .visible()
-            .get(self.selected)
-            .map(|item| item.id.clone())
-        else {
+        let Some(request) = self.request_for_view().map(|item| item.id.clone()) else {
             return;
         };
         if self.demo {
@@ -448,6 +576,10 @@ impl App {
                 && event.row >= rect.y
                 && event.row < rect.y + rect.height
         };
+        if matches!(self.view, View::ChangeRequestDetail(_)) {
+            self.handle_detail_mouse(event, &point);
+            return;
+        }
         match event.kind {
             MouseEventKind::Down(_) if point(self.regions.requests) => {
                 self.focus = Focus::Requests;
@@ -477,6 +609,50 @@ impl App {
             }
             MouseEventKind::ScrollDown if point(self.regions.ci) => {
                 self.ci_scroll = self.ci_scroll.saturating_add(1)
+            }
+            _ => {}
+        }
+    }
+    fn handle_detail_mouse(&mut self, event: MouseEvent, point: &impl Fn(Rect) -> bool) {
+        match event.kind {
+            MouseEventKind::Down(_) if point(self.regions.description) => {
+                self.detail_focus = DetailFocus::Description
+            }
+            MouseEventKind::Down(_) if point(self.regions.comments) => {
+                self.detail_focus = DetailFocus::Comments
+            }
+            MouseEventKind::Down(_) if point(self.regions.reviewers) => {
+                self.detail_focus = DetailFocus::Reviewers
+            }
+            MouseEventKind::Down(_) if point(self.regions.ci) => {
+                self.detail_focus = DetailFocus::Ci
+            }
+            MouseEventKind::Down(_) if point(self.regions.metadata) => {
+                self.detail_focus = DetailFocus::Metadata
+            }
+            MouseEventKind::ScrollUp if point(self.regions.comments) => {
+                self.detail_focus = DetailFocus::Comments;
+                if let View::ChangeRequestDetail(id) = self.view.clone() {
+                    self.scroll_detail(&id, -3);
+                }
+            }
+            MouseEventKind::ScrollDown if point(self.regions.comments) => {
+                self.detail_focus = DetailFocus::Comments;
+                if let View::ChangeRequestDetail(id) = self.view.clone() {
+                    self.scroll_detail(&id, 3);
+                }
+            }
+            MouseEventKind::ScrollUp if point(self.regions.ci) => {
+                self.detail_focus = DetailFocus::Ci;
+                if let View::ChangeRequestDetail(id) = self.view.clone() {
+                    self.scroll_detail(&id, -3);
+                }
+            }
+            MouseEventKind::ScrollDown if point(self.regions.ci) => {
+                self.detail_focus = DetailFocus::Ci;
+                if let View::ChangeRequestDetail(id) = self.view.clone() {
+                    self.scroll_detail(&id, 3);
+                }
             }
             _ => {}
         }
@@ -660,6 +836,83 @@ mod tests {
         assert_eq!(app.view, View::ChangeRequestDetail(id));
         app.handle_key(KeyCode::Esc);
         assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[tokio::test]
+    async fn detail_arrows_scroll_comments_without_changing_dashboard_selection() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.selected = 3;
+        let id = app.selected_request().unwrap().id.clone();
+
+        app.handle_key(KeyCode::Enter);
+        app.handle_key(KeyCode::Down);
+
+        assert_eq!(app.selected, 3);
+        assert_eq!(app.view, View::ChangeRequestDetail(id));
+        assert_eq!(app.comment_scroll, 1);
+    }
+
+    #[tokio::test]
+    async fn detail_request_is_stable_when_dashboard_selection_changes() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.selected_request().unwrap().id.clone();
+        app.handle_key(KeyCode::Enter);
+        app.selected = 1;
+
+        assert_eq!(app.detail_request().unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn detail_tab_cycles_panels_and_escape_preserves_selection() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.selected = 2;
+        app.handle_key(KeyCode::Enter);
+
+        assert_eq!(app.detail_focus, DetailFocus::Comments);
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.detail_focus, DetailFocus::Description);
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.detail_focus, DetailFocus::Reviewers);
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.detail_focus, DetailFocus::Description);
+        app.handle_key(KeyCode::Esc);
+
+        assert_eq!(app.view, View::Dashboard);
+        assert_eq!(app.selected, 2);
+    }
+
+    #[tokio::test]
+    async fn detail_comment_wheel_does_not_change_dashboard_selection() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.selected = 3;
+        app.handle_key(KeyCode::Enter);
+        app.set_regions(HitRegions {
+            comments: Rect::new(0, 10, 40, 10),
+            requests: Rect::new(0, 0, 80, 10),
+            ..HitRegions::default()
+        });
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.selected, 3);
+        assert_eq!(app.comment_scroll, 3);
     }
 }
 async fn refresh(config: Config, demo: bool, scope: Option<String>) -> RefreshResult {
