@@ -18,8 +18,26 @@ pub enum ForgeError {
     AuthenticationRequired(String),
     #[error("provider unavailable: {0}")]
     Unavailable(String),
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("rate limited")]
+    RateLimited { retry_after_seconds: Option<u64> },
+    #[error("resource not found")]
+    NotFound,
+    #[error("validation failed: {0}")]
+    Validation(String),
+    #[error("conflict")]
+    Conflict,
     #[error("operation is not implemented by this provider yet")]
     Unsupported,
+}
+
+#[allow(dead_code)] // Constructed once app write dispatch routes through the provider registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewAction {
+    Approve,
+    RequestChanges,
+    Comment,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -61,6 +79,50 @@ pub trait ForgeProvider: Send + Sync {
         Err(ForgeError::Unsupported)
     }
     async fn create_comment(&self, _id: &ChangeRequestId, _body: &str) -> Result<(), ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
+    async fn edit_comment(
+        &self,
+        _id: &ChangeRequestId,
+        _comment_id: &str,
+        _body: &str,
+    ) -> Result<Comment, ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
+    async fn delete_comment(
+        &self,
+        _id: &ChangeRequestId,
+        _comment_id: &str,
+    ) -> Result<(), ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
+    async fn submit_review_action(
+        &self,
+        _id: &ChangeRequestId,
+        _action: ReviewAction,
+        _body: &str,
+    ) -> Result<(), ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
+    async fn search_reviewers(
+        &self,
+        _id: &ChangeRequestId,
+        _query: &str,
+    ) -> Result<Vec<Person>, ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
+    async fn request_reviewer(
+        &self,
+        _id: &ChangeRequestId,
+        _reviewer: &str,
+    ) -> Result<(), ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
+    async fn remove_reviewer(
+        &self,
+        _id: &ChangeRequestId,
+        _reviewer: &str,
+    ) -> Result<(), ForgeError> {
         Err(ForgeError::Unsupported)
     }
     async fn merge(&self, _id: &ChangeRequestId) -> Result<(), ForgeError> {
@@ -107,3 +169,4 @@ pub(crate) fn normalized_request(
         pipeline: None,
     }
 }
+pub mod auth;

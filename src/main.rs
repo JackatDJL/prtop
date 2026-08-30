@@ -78,7 +78,7 @@ async fn run(
             _ = tick.tick() => {
                 while event::poll(Duration::ZERO)? {
                     match event::read()? {
-                        Event::Key(key) if key.kind == KeyEventKind::Press => { if app.handle_key(key.code) { return Ok(()); } }
+                        Event::Key(key) if key.kind == KeyEventKind::Press => { if app.handle_key_event(key) { return Ok(()); } }
                         Event::Mouse(mouse) => app.handle_mouse(mouse),
                         _ => {}
                     }
@@ -86,6 +86,8 @@ async fn run(
             }
             Some(message) = receiver.recv() => match message {
                 AppEvent::Refresh(result) => app.apply_refresh(result),
+                AppEvent::CommentWrite { temporary_id, result } => app.apply_comment_write(temporary_id, result),
+                AppEvent::ReviewWrite { state, result } => app.apply_review_write(state, result),
             }
         }
     }

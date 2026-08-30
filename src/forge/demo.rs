@@ -177,5 +177,12 @@ mod tests {
                 .iter()
                 .any(|request| request.ci == CiState::Running)
         );
+        assert_eq!(requests[0].comments.len(), 42);
+        assert!(
+            requests[0]
+                .comments
+                .iter()
+                .any(|comment| comment.updated_at.is_some())
+        );
     }
 }

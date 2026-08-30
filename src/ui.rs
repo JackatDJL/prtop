@@ -1,5 +1,5 @@
 pub mod theme;
-use crate::app::{App, HitRegions};
+use crate::app::{App, HitRegions, Overlay};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -71,6 +71,97 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         help(frame);
     }
+    if let Some(message) = &app.toast {
+        toast(frame, message, theme);
+    }
+    if let Some(overlay) = &app.overlay {
+        overlay_view(frame, overlay, theme);
+    }
+}
+fn toast(frame: &mut Frame, message: &str, theme: Theme) {
+    let area = Rect::new(
+        frame.area().x.saturating_add(2),
+        frame.area().bottom().saturating_sub(3),
+        (message.len() as u16 + 6).min(frame.area().width.saturating_sub(4)),
+        2,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(format!(" ✓ {message} "))
+            .style(Style::default().fg(theme.background).bg(theme.success))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.success)),
+            ),
+        area,
+    );
+}
+fn overlay_view(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
+    let area = centered(frame.area(), 62, 42);
+    frame.render_widget(Clear, area);
+    let (title, body) = match overlay {
+        Overlay::Composer { body } => (
+            "Add comment",
+            format!("{}\n\nCtrl+Enter submits · Esc cancels", body),
+        ),
+        Overlay::ReviewMenu { selected } => {
+            let options = ["Approve", "Request changes", "Comment"];
+            (
+                "Review",
+                options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        format!("{} {item}", if index == *selected { ">" } else { " " })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }
+        Overlay::Palette { query, selected } => {
+            let commands = [
+                "Add comment",
+                "Approve",
+                "Request changes",
+                "Refresh",
+                "Request reviewer",
+                "Open in browser",
+            ];
+            (
+                "Command palette",
+                format!(
+                    "{}\n\n{}",
+                    query,
+                    commands
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, command)| command
+                            .to_lowercase()
+                            .contains(&query.to_lowercase()))
+                        .map(|(index, command)| format!(
+                            "{} {command}",
+                            if index == *selected { ">" } else { " " }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            )
+        }
+        Overlay::ConfirmDelete => (
+            "Delete comment",
+            "Delete this comment?\n\nEnter / Esc cancel    d delete".into(),
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border_active))
+                .title(title),
+        ),
+        area,
+    );
 }
 fn draw_list(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let visible = app.visible();
