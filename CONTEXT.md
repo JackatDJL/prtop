@@ -16,6 +16,14 @@ A named repository registration. A project may have a local or remote working di
 
 The provider's execution grouping for CI work. A pipeline contains jobs.
 
+## Job
+
+One executable CI unit in a pipeline. A job has a provider-stable ID and may have more than one attempt. Retrying does not overwrite earlier attempts.
+
+## Log chunk
+
+An increment of a job's textual output. prtop bounds retained log lines and may discard the oldest lines with an explicit marker.
+
 ## Review
 
 An explicit response by a reviewer. Requested, pending, approved, changes requested, commented,

@@ -14,21 +14,9 @@ pub fn change_requests() -> Vec<ChangeRequest> {
             ReviewState::Approved,
             now - Duration::minutes(4),
             vec![
-                Job {
-                    name: "lint".into(),
-                    status: CiState::Passed,
-                    duration_seconds: Some(38),
-                },
-                Job {
-                    name: "test".into(),
-                    status: CiState::Passed,
-                    duration_seconds: Some(82),
-                },
-                Job {
-                    name: "android".into(),
-                    status: CiState::Running,
-                    duration_seconds: None,
-                },
+                ("lint", "lint", PipelineStatus::Success, Some(38)),
+                ("test", "test", PipelineStatus::Success, Some(82)),
+                ("android", "build", PipelineStatus::Running, None),
             ],
         ),
         request(
@@ -41,16 +29,9 @@ pub fn change_requests() -> Vec<ChangeRequest> {
             ReviewState::Requested,
             now - Duration::minutes(12),
             vec![
-                Job {
-                    name: "unit".into(),
-                    status: CiState::Passed,
-                    duration_seconds: Some(41),
-                },
-                Job {
-                    name: "integration".into(),
-                    status: CiState::Running,
-                    duration_seconds: None,
-                },
+                ("unit", "test", PipelineStatus::Success, Some(41)),
+                ("integration", "test", PipelineStatus::Running, None),
+                ("deploy-preview", "deploy", PipelineStatus::Manual, None),
             ],
         ),
         request(
@@ -62,11 +43,12 @@ pub fn change_requests() -> Vec<ChangeRequest> {
             CiState::Failed,
             ReviewState::Waiting,
             now - Duration::minutes(27),
-            vec![Job {
-                name: "test_transfer_mobile".into(),
-                status: CiState::Failed,
-                duration_seconds: Some(133),
-            }],
+            vec![(
+                "test_transfer_mobile",
+                "test",
+                PipelineStatus::Failed,
+                Some(133),
+            )],
         ),
         request(
             "github",
@@ -92,7 +74,7 @@ fn request(
     ci: CiState,
     review: ReviewState,
     updated_at: chrono::DateTime<Utc>,
-    jobs: Vec<Job>,
+    jobs: Vec<(&str, &str, PipelineStatus, Option<u64>)>,
 ) -> ChangeRequest {
     ChangeRequest {
         id: ChangeRequestId {
@@ -150,11 +132,78 @@ fn request(
                 },
             },
         ],
-        pipeline: Some(Pipeline {
-            number: number + 200,
-            status: ci,
-            jobs,
-        }),
+        pipelines: vec![pipeline(forge, repo, number + 200, &format!("workflow-{number}"), &format!("feature/{number}"), ci, updated_at, jobs)],
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Fixture mirrors the user-visible pipeline identity.
+fn pipeline(
+    forge: &str,
+    repo: &str,
+    number: u64,
+    name: &str,
+    branch: &str,
+    ci: CiState,
+    created_at: chrono::DateTime<Utc>,
+    jobs: Vec<(&str, &str, PipelineStatus, Option<u64>)>,
+) -> Pipeline {
+    let id = PipelineId {
+        forge: forge.into(),
+        repository: repo.into(),
+        value: number.to_string(),
+    };
+    Pipeline {
+        id: id.clone(),
+        name: name.into(),
+        ref_name: branch.into(),
+        sha: "4e2f73a".into(),
+        status: match ci {
+            CiState::Passed => PipelineStatus::Success,
+            CiState::Failed => PipelineStatus::Failed,
+            CiState::Running => PipelineStatus::Running,
+            CiState::Pending => PipelineStatus::Pending,
+            CiState::None => PipelineStatus::Unknown,
+        },
+        created_at,
+        started_at: Some(created_at),
+        finished_at: None,
+        stages: vec![
+            PipelineStage {
+                name: "lint".into(),
+                status: PipelineStatus::Success,
+            },
+            PipelineStage {
+                name: "test".into(),
+                status: PipelineStatus::Running,
+            },
+            PipelineStage {
+                name: "deploy".into(),
+                status: PipelineStatus::Manual,
+            },
+        ],
+        jobs: jobs
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, stage, status, duration_seconds))| Job {
+                id: JobId {
+                    pipeline: id.clone(),
+                    value: format!("{}-{}", number, index + 1),
+                },
+                name: name.into(),
+                stage: Some(stage.into()),
+                status,
+                started_at: Some(created_at),
+                finished_at: None,
+                duration_seconds,
+                runner: Some("linux-x64".into()),
+                attempt: 1,
+                allow_failure: false,
+                url: None,
+                environment: (stage == "deploy").then_some("preview".into()),
+            })
+            .collect(),
+        url: None,
+        environment: None,
     }
 }
 

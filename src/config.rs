@@ -11,6 +11,41 @@ pub struct Config {
     pub projects: Vec<ProjectConfig>,
     #[serde(default, rename = "host")]
     pub hosts: Vec<HostConfig>,
+    #[serde(default)]
+    pub ci: CiConfig,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CiConfig {
+    #[serde(default = "default_running_refresh")]
+    pub running_refresh_seconds: u64,
+    #[serde(default = "default_finished_refresh")]
+    pub finished_refresh_seconds: u64,
+    #[serde(default = "default_max_log_lines")]
+    pub max_log_lines: usize,
+    #[serde(default = "default_follow_logs")]
+    pub follow_logs_by_default: bool,
+}
+impl Default for CiConfig {
+    fn default() -> Self {
+        Self {
+            running_refresh_seconds: default_running_refresh(),
+            finished_refresh_seconds: default_finished_refresh(),
+            max_log_lines: default_max_log_lines(),
+            follow_logs_by_default: default_follow_logs(),
+        }
+    }
+}
+fn default_running_refresh() -> u64 {
+    8
+}
+fn default_finished_refresh() -> u64 {
+    60
+}
+fn default_max_log_lines() -> usize {
+    30_000
+}
+fn default_follow_logs() -> bool {
+    true
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ForgeConfig {
@@ -85,6 +120,12 @@ const SAMPLE: &str = r#"# prtop configuration. Tokens belong in your environment
 # hostname = "djl-dev"
 # user = "jack"
 # timeout_seconds = 8
+#
+# [ci]
+# running_refresh_seconds = 8
+# finished_refresh_seconds = 60
+# max_log_lines = 30000
+# follow_logs_by_default = true
 "#;
 
 #[cfg(test)]

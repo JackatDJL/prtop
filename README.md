@@ -22,6 +22,12 @@ Comments are stored chronologically. The detail pane begins at the newest ten co
 scrolls toward older entries. Provider capability flags will gate live write actions before the
 UI exposes them.
 
+## CI/CD
+
+Focus a change request's CI panel and press `Enter` to open a pipeline, then `Enter` on a job to inspect logs. Pipeline and job screens use `Esc`, `h`, or `q` to move back one level. `R` and `x` ask for confirmation before retry and cancel operations; capabilities and permissions decide which actions are available.
+
+Logs are fetched in the background, retain 30,000 lines by default, support `/` search with `n`/`N`, and use `f` to follow a running job. Older retained content is marked when discarded. GitHub maps workflow runs to pipelines and supports whole-run rerun/cancel. GitLab maps pipelines, stages, jobs, traces, retry/cancel, and manual jobs. Forgejo Actions remains capability-gated because support differs by server version.
+
 ## Keys
 
 `j`/`k` select, `Enter` toggles detail focus, `/` filters, `r` refreshes, `?` toggles help,

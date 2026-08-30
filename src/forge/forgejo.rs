@@ -60,6 +60,9 @@ impl ForgeProvider for ForgejoProvider {
             request_reviewers: false,
             edit_comments: true,
             delete_comments: true,
+            // Forgejo Actions is optional and varies by server release. Discovery can later
+            // promote these flags; the conservative default never offers unsafe CI writes.
+            ..ForgeCapabilities::default()
         }
     }
     async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, ForgeError> {

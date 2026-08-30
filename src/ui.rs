@@ -11,6 +11,14 @@ use ratatui::{
 use theme::Theme;
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = Theme::detect();
+    if matches!(app.view, View::PipelineDetail(_)) {
+        draw_pipeline(frame, app, theme);
+        return;
+    }
+    if matches!(app.view, View::JobDetail(_)) {
+        draw_job(frame, app, theme);
+        return;
+    }
     if matches!(app.view, View::ChangeRequestDetail(_)) {
         draw_full_detail(frame, app, theme);
         if app.show_help {
@@ -67,6 +75,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ci: detail_columns[1],
         reviewers: detail_columns[1],
         metadata: detail_columns[1],
+        ..HitRegions::default()
     });
     draw_list(frame, panes[0], app, theme);
     draw_detail(frame, panes[1], app, theme);
@@ -228,6 +237,19 @@ fn overlay_view(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
             "Delete comment",
             "Delete this comment?\n\nEnter / Esc cancel    d delete".into(),
         ),
+        Overlay::ConfirmCi { action } => (
+            "Confirm CI action",
+            format!(
+                "{}?\n\nEnter / Esc cancels    y confirms",
+                match action {
+                    crate::app::CiAction::RetryJob(_) => "Retry job",
+                    crate::app::CiAction::RetryPipeline(_) => "Retry pipeline",
+                    crate::app::CiAction::CancelJob(_) => "Cancel running job",
+                    crate::app::CiAction::CancelPipeline(_) => "Cancel running pipeline",
+                    crate::app::CiAction::PlayJob(_) => "Start manual job",
+                }
+            ),
+        ),
     };
     frame.render_widget(
         Paragraph::new(body).wrap(Wrap { trim: false }).block(
@@ -375,15 +397,13 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         left[1],
     );
     let mut ci = vec![];
-    if let Some(pipeline) = &pr.pipeline {
-        for job in pipeline.jobs.iter().skip(app.ci_scroll).take(8) {
+    if !pr.pipelines.is_empty() {
+        for pipeline in pr.pipelines.iter().skip(app.ci_scroll).take(8) {
             ci.push(Line::from(format!(
                 "{} {:<24} {}",
-                job.status.glyph(),
-                job.name,
-                job.duration_seconds
-                    .map(|s| format!("{s}s"))
-                    .unwrap_or_else(|| job.status.label().into())
+                pipeline.status.glyph(),
+                pipeline.name,
+                pipeline.status.label()
             )));
         }
     } else {
@@ -434,6 +454,147 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         )),
         right[2],
     );
+}
+fn draw_pipeline(frame: &mut Frame, app: &mut App, theme: Theme) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    let Some(pipeline) = app.pipeline_for_view() else {
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!(" {} · {}", pipeline.name, pipeline.ref_name),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from(format!(" {} · {}", pipeline.sha, pipeline.status.label())),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" pipeline ")),
+        outer[0],
+    );
+    let rows = pipeline
+        .jobs
+        .iter()
+        .enumerate()
+        .map(|(index, job)| {
+            Line::from(format!(
+                "{} {:<14} {:<28} {:<10} {}",
+                if index == app.job_selected { ">" } else { " " },
+                job.stage.as_deref().unwrap_or("-"),
+                job.name,
+                job.status.label(),
+                job.duration_seconds
+                    .map(|seconds| format!("{seconds}s"))
+                    .unwrap_or_default()
+            ))
+        })
+        .collect::<Vec<_>>();
+    app.set_regions(HitRegions {
+        jobs: outer[1],
+        ..HitRegions::default()
+    });
+    frame.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" stage          job                          status      time "),
+        ),
+        outer[1],
+    );
+    frame.render_widget(
+        Paragraph::new(" ↑↓ select  Enter logs  R retry pipeline  x cancel  r refresh  Esc back")
+            .style(Style::default().fg(theme.muted)),
+        outer[2],
+    );
+    if let Some(message) = &app.toast {
+        toast(frame, message, theme);
+    }
+    if let Some(overlay) = &app.overlay {
+        overlay_view(frame, overlay, theme);
+    }
+}
+fn draw_job(frame: &mut Frame, app: &mut App, theme: Theme) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    let Some(job) = app.job_for_view() else {
+        return;
+    };
+    let id = job.id.clone();
+    let name = job.name.clone();
+    let status = job.status;
+    let lines = app.logs.get(&id).cloned().unwrap_or_default();
+    let skip = if app.follow_logs {
+        lines.len().saturating_sub(100)
+    } else {
+        lines
+            .len()
+            .saturating_sub(100)
+            .saturating_sub(app.log_scroll)
+    };
+    let query = app.log_query.as_deref().unwrap_or("");
+    let rendered = lines
+        .iter()
+        .skip(skip)
+        .take(100)
+        .map(|line| {
+            Line::styled(
+                line.clone(),
+                if !query.is_empty() && line.to_lowercase().contains(&query.to_lowercase()) {
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!(" {name} · {}", status.label()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from(format!(
+                " follow: {}  search: {}",
+                if app.follow_logs { "on" } else { "off" },
+                query
+            )),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" job ")),
+        outer[0],
+    );
+    app.set_regions(HitRegions {
+        logs: outer[1],
+        ..HitRegions::default()
+    });
+    frame.render_widget(
+        Paragraph::new(rendered).block(Block::default().borders(Borders::ALL).title(" logs ")),
+        outer[1],
+    );
+    frame.render_widget(
+        Paragraph::new(" ↑↓ scroll  f follow  / search  n/N next/previous  R retry  Esc back")
+            .style(Style::default().fg(theme.muted)),
+        outer[2],
+    );
+    if let Some(message) = &app.toast {
+        toast(frame, message, theme);
+    }
+    if let Some(overlay) = &app.overlay {
+        overlay_view(frame, overlay, theme);
+    }
 }
 fn panel_block(title: &str, active: bool, theme: Theme) -> Block<'_> {
     Block::default()

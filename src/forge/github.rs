@@ -1,7 +1,10 @@
 use crate::{
     config::ProjectConfig,
     forge::{ForgeCapabilities, ForgeError, ForgeProvider, ReviewAction, auth, normalized_request},
-    model::{ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Person},
+    model::{
+        ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Job, JobId, Person, Pipeline,
+        PipelineId, PipelineStatus,
+    },
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -64,6 +67,13 @@ impl ForgeProvider for GitHubProvider {
             request_reviewers: true,
             edit_comments: true,
             delete_comments: true,
+            ci_read: true,
+            // Job-log download is a ZIP archive in GitHub's REST API. Do not advertise it
+            // until the archive reader is in place.
+            ci_logs: false,
+            ci_retry_pipeline: true,
+            ci_cancel_pipeline: true,
+            ..ForgeCapabilities::default()
         }
     }
     async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, ForgeError> {
@@ -235,6 +245,85 @@ impl ForgeProvider for GitHubProvider {
             .map_err(network)?;
         ensure(response).await.map(|_| ())
     }
+    async fn list_pipelines(&self, id: &ChangeRequestId) -> Result<Vec<Pipeline>, ForgeError> {
+        let token = self.credential().await?;
+        let response = reqwest::Client::new()
+            .get(self.api(&format!(
+                "repos/{}/actions/runs?event=pull_request&per_page=100",
+                id.repository
+            )))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", "prtop")
+            .send()
+            .await
+            .map_err(network)?;
+        let runs: WorkflowRuns = ensure(response).await?.json().await.map_err(network)?;
+        Ok(runs
+            .workflow_runs
+            .into_iter()
+            .map(|run| github_pipeline(&self.name, &id.repository, run))
+            .collect())
+    }
+    async fn get_pipeline(&self, id: &PipelineId) -> Result<Pipeline, ForgeError> {
+        let token = self.credential().await?;
+        let response = reqwest::Client::new()
+            .get(self.api(&format!(
+                "repos/{}/actions/runs/{}/jobs?per_page=100",
+                id.repository, id.value
+            )))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", "prtop")
+            .send()
+            .await
+            .map_err(network)?;
+        let jobs: WorkflowJobs = ensure(response).await?.json().await.map_err(network)?;
+        Ok(Pipeline {
+            id: id.clone(),
+            name: format!("workflow #{}", id.value),
+            ref_name: String::new(),
+            sha: String::new(),
+            status: PipelineStatus::Unknown,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            stages: vec![],
+            jobs: jobs
+                .jobs
+                .into_iter()
+                .map(|job| github_job(id, job))
+                .collect(),
+            url: None,
+            environment: None,
+        })
+    }
+    async fn retry_pipeline(&self, id: &PipelineId) -> Result<(), ForgeError> {
+        let token = self.credential().await?;
+        let response = reqwest::Client::new()
+            .post(self.api(&format!(
+                "repos/{}/actions/runs/{}/rerun-failed-jobs",
+                id.repository, id.value
+            )))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", "prtop")
+            .send()
+            .await
+            .map_err(network)?;
+        ensure(response).await.map(|_| ())
+    }
+    async fn cancel_pipeline(&self, id: &PipelineId) -> Result<(), ForgeError> {
+        let token = self.credential().await?;
+        let response = reqwest::Client::new()
+            .post(self.api(&format!(
+                "repos/{}/actions/runs/{}/cancel",
+                id.repository, id.value
+            )))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", "prtop")
+            .send()
+            .await
+            .map_err(network)?;
+        ensure(response).await.map(|_| ())
+    }
 }
 fn network(error: reqwest::Error) -> ForgeError {
     ForgeError::Unavailable(error.to_string())
@@ -305,6 +394,94 @@ impl IssueComment {
 #[derive(Deserialize)]
 struct SearchUsers {
     items: Vec<User>,
+}
+#[derive(Deserialize)]
+struct WorkflowRuns {
+    workflow_runs: Vec<WorkflowRun>,
+}
+#[derive(Deserialize)]
+struct WorkflowRun {
+    id: u64,
+    name: Option<String>,
+    head_branch: Option<String>,
+    head_sha: String,
+    status: Option<String>,
+    conclusion: Option<String>,
+    created_at: DateTime<Utc>,
+    run_started_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+    html_url: Option<String>,
+}
+#[derive(Deserialize)]
+struct WorkflowJobs {
+    jobs: Vec<WorkflowJob>,
+}
+#[derive(Deserialize)]
+struct WorkflowJob {
+    id: u64,
+    name: String,
+    status: Option<String>,
+    conclusion: Option<String>,
+    started_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+    html_url: Option<String>,
+}
+fn github_status(status: Option<&str>, conclusion: Option<&str>) -> PipelineStatus {
+    match conclusion.or(status) {
+        Some("success") => PipelineStatus::Success,
+        Some("failure") => PipelineStatus::Failed,
+        Some("cancelled") => PipelineStatus::Cancelled,
+        Some("skipped") => PipelineStatus::Skipped,
+        Some("timed_out") => PipelineStatus::TimedOut,
+        Some("in_progress") => PipelineStatus::Running,
+        Some("queued") => PipelineStatus::Queued,
+        Some("waiting") => PipelineStatus::Waiting,
+        _ => PipelineStatus::Unknown,
+    }
+}
+fn github_pipeline(forge: &str, repo: &str, row: WorkflowRun) -> Pipeline {
+    let id = PipelineId {
+        forge: forge.into(),
+        repository: repo.into(),
+        value: row.id.to_string(),
+    };
+    Pipeline {
+        id,
+        name: row.name.unwrap_or_else(|| "workflow".into()),
+        ref_name: row.head_branch.unwrap_or_default(),
+        sha: row.head_sha,
+        status: github_status(row.status.as_deref(), row.conclusion.as_deref()),
+        created_at: row.created_at,
+        started_at: row.run_started_at,
+        finished_at: Some(row.updated_at),
+        stages: vec![],
+        jobs: vec![],
+        url: row.html_url,
+        environment: None,
+    }
+}
+fn github_job(pipeline: &PipelineId, row: WorkflowJob) -> Job {
+    let duration_seconds = row
+        .started_at
+        .zip(row.completed_at)
+        .map(|(start, end)| (end - start).num_seconds().max(0) as u64);
+    Job {
+        id: JobId {
+            pipeline: pipeline.clone(),
+            value: row.id.to_string(),
+        },
+        name: row.name,
+        stage: None,
+        status: github_status(row.status.as_deref(), row.conclusion.as_deref()),
+        started_at: row.started_at,
+        finished_at: row.completed_at,
+        duration_seconds,
+        runner: None,
+        attempt: 1,
+        allow_failure: false,
+        url: row.html_url,
+        environment: None,
+    }
 }
 fn normalize(forge: &str, repo: &str, row: Row) -> ChangeRequest {
     normalized_request(

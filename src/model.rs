@@ -45,7 +45,10 @@ pub struct ChangeRequest {
     pub deletions: u32,
     pub comments: Vec<Comment>,
     pub reviewers: Vec<Reviewer>,
-    pub pipeline: Option<Pipeline>,
+    /// Pipelines are kept separately from the compact dashboard CI summary. A change request
+    /// may legitimately have several workflow runs for the same head SHA.
+    #[serde(default)]
+    pub pipelines: Vec<Pipeline>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +92,76 @@ pub enum CiState {
     Pending,
     None,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub struct PipelineId {
+    pub forge: String,
+    pub repository: String,
+    pub value: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub struct JobId {
+    pub pipeline: PipelineId,
+    pub value: String,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum PipelineStatus {
+    Queued,
+    Pending,
+    Running,
+    Success,
+    Failed,
+    Cancelled,
+    Skipped,
+    Manual,
+    TimedOut,
+    Waiting,
+    Unknown,
+}
+impl PipelineStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
+            Self::Manual => "manual",
+            Self::TimedOut => "timed out",
+            Self::Waiting => "waiting",
+            Self::Unknown => "unknown",
+        }
+    }
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Success => "✓",
+            Self::Failed | Self::TimedOut => "✗",
+            Self::Running => "●",
+            Self::Manual => "▶",
+            Self::Queued | Self::Pending | Self::Waiting => "…",
+            Self::Cancelled | Self::Skipped => "-",
+            Self::Unknown => "?",
+        }
+    }
+    #[allow(dead_code)]
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Pending | Self::Running | Self::Waiting
+        )
+    }
+    #[allow(dead_code)]
+    pub fn ci_state(self) -> CiState {
+        match self {
+            Self::Success => CiState::Passed,
+            Self::Failed | Self::TimedOut => CiState::Failed,
+            Self::Running => CiState::Running,
+            Self::Queued | Self::Pending | Self::Waiting | Self::Manual => CiState::Pending,
+            _ => CiState::None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum Mergeability {
     Mergeable,
@@ -108,15 +181,51 @@ impl Mergeability {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pipeline {
-    pub number: u64,
-    pub status: CiState,
+    pub id: PipelineId,
+    pub name: String,
+    pub ref_name: String,
+    pub sha: String,
+    pub status: PipelineStatus,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub stages: Vec<PipelineStage>,
     pub jobs: Vec<Job>,
+    pub url: Option<String>,
+    pub environment: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PipelineStage {
+    pub name: String,
+    pub status: PipelineStatus,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Job {
+    pub id: JobId,
     pub name: String,
-    pub status: CiState,
+    pub stage: Option<String>,
+    pub status: PipelineStatus,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
     pub duration_seconds: Option<u64>,
+    pub runner: Option<String>,
+    pub attempt: u32,
+    pub allow_failure: bool,
+    pub url: Option<String>,
+    pub environment: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LogChunk {
+    pub text: String,
+    pub complete: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct Artifact {
+    pub name: String,
+    pub url: Option<String>,
+    pub expired: bool,
 }
 
 impl ReviewState {
