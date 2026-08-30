@@ -12,6 +12,15 @@ use std::collections::HashMap;
 use std::{sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
+pub const PALETTE_COMMANDS: [&str; 6] = [
+    "Add comment",
+    "Approve",
+    "Request changes",
+    "Refresh",
+    "Request reviewer",
+    "Open in browser",
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Scope {
     Exact(String),
@@ -25,6 +34,7 @@ pub enum AppEvent {
         result: Result<(), forge::ForgeError>,
     },
     ReviewWrite {
+        request: ChangeRequestId,
         state: ReviewState,
         result: Result<(), forge::ForgeError>,
     },
@@ -244,14 +254,14 @@ impl App {
                         self.overlay = Some(Overlay::Palette { query, selected });
                     }
                     KeyCode::Down => {
-                        selected = (selected + 1).min(5);
+                        selected = (selected + 1).min(Self::palette_command_count(&query));
                         self.overlay = Some(Overlay::Palette { query, selected });
                     }
                     KeyCode::Up => {
                         selected = selected.saturating_sub(1);
                         self.overlay = Some(Overlay::Palette { query, selected });
                     }
-                    KeyCode::Enter => self.run_palette(selected),
+                    KeyCode::Enter => self.run_palette(&query, selected),
                     _ => self.overlay = Some(Overlay::Palette { query, selected }),
                 },
                 Overlay::ConfirmDelete => match key {
@@ -378,6 +388,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') => {
                 self.view = View::Dashboard;
                 self.focus = Focus::Requests;
+                self.filtering = false;
             }
             KeyCode::Tab => self.detail_focus = self.detail_focus.next(),
             KeyCode::BackTab => self.detail_focus = self.detail_focus.previous(),
@@ -466,6 +477,7 @@ impl App {
     fn open_selected(&mut self) {
         if let Some(request) = self.selected_request() {
             self.view = View::ChangeRequestDetail(request.id.clone());
+            self.filtering = false;
             self.detail_focus = DetailFocus::Comments;
             self.comment_scroll = 0;
             self.ci_scroll = 0;
@@ -526,6 +538,10 @@ impl App {
         self.toast = Some("Sending comment".into());
     }
     fn apply_review(&mut self, state: ReviewState) {
+        if !self.can_review_action(state) {
+            self.toast = Some("This forge has not advertised this write capability".into());
+            return;
+        }
         let Some(request) = self.request_for_view().map(|item| item.id.clone()) else {
             return;
         };
@@ -555,20 +571,44 @@ impl App {
         let sender = self.events.clone();
         tokio::spawn(async move {
             let result = provider.submit_review_action(&request, action, "").await;
-            let _ = sender.send(AppEvent::ReviewWrite { state, result });
+            let _ = sender.send(AppEvent::ReviewWrite {
+                request,
+                state,
+                result,
+            });
         });
         self.toast = Some("Submitting review".into());
     }
-    fn run_palette(&mut self, selected: usize) {
-        match selected {
-            0 => {
+    fn can_review_action(&self, state: ReviewState) -> bool {
+        match state {
+            ReviewState::Approved => self.can(|capabilities| capabilities.approve),
+            ReviewState::ChangesRequested => self.can(|capabilities| capabilities.request_changes),
+            _ => self.can(|capabilities| capabilities.reviews),
+        }
+    }
+    fn palette_command_count(query: &str) -> usize {
+        PALETTE_COMMANDS
+            .iter()
+            .filter(|command| command.to_lowercase().contains(&query.to_lowercase()))
+            .count()
+            .saturating_sub(1)
+    }
+    fn run_palette(&mut self, query: &str, selected: usize) {
+        let command = PALETTE_COMMANDS
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| command.to_lowercase().contains(&query.to_lowercase()))
+            .nth(selected)
+            .map(|(index, _)| index);
+        match command {
+            Some(0) => {
                 self.overlay = Some(Overlay::Composer {
                     body: String::new(),
                 })
             }
-            1 => self.apply_review(ReviewState::Approved),
-            2 => self.apply_review(ReviewState::ChangesRequested),
-            3 => self.request_refresh(),
+            Some(1) => self.apply_review(ReviewState::Approved),
+            Some(2) => self.apply_review(ReviewState::ChangesRequested),
+            Some(3) => self.request_refresh(),
             _ => self.toast = Some("Command unavailable for this forge".into()),
         }
     }
@@ -708,14 +748,13 @@ impl App {
     }
     pub fn apply_review_write(
         &mut self,
+        id: ChangeRequestId,
         state: ReviewState,
         result: Result<(), forge::ForgeError>,
     ) {
         match result {
             Ok(()) => {
-                if let Some(id) = self.request_for_view().map(|request| request.id.clone())
-                    && let Some(request) = self.requests.iter_mut().find(|request| request.id == id)
-                {
+                if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
                     request.review = state;
                 }
                 self.toast = Some("Review submitted".into());
@@ -757,6 +796,35 @@ fn providers(config: &Config) -> HashMap<String, Arc<dyn ForgeProvider>> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyModifiers, MouseButton};
+
+    struct TestProvider {
+        name: String,
+        capabilities: forge::ForgeCapabilities,
+    }
+
+    #[async_trait::async_trait]
+    impl ForgeProvider for TestProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn capabilities(&self) -> forge::ForgeCapabilities {
+            self.capabilities
+        }
+
+        async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, forge::ForgeError> {
+            Ok(vec![])
+        }
+
+        async fn submit_review_action(
+            &self,
+            _id: &ChangeRequestId,
+            _action: forge::ReviewAction,
+            _body: &str,
+        ) -> Result<(), forge::ForgeError> {
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn click_and_keyboard_share_request_selection() {
@@ -862,6 +930,142 @@ mod tests {
         assert_eq!(app.view, View::ChangeRequestDetail(id));
         app.handle_key(KeyCode::Esc);
         assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[tokio::test]
+    async fn opening_and_closing_detail_clears_an_active_filter() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.filter = "droplet".into();
+        app.filtering = true;
+        app.set_regions(HitRegions {
+            requests: Rect::new(0, 0, 80, 10),
+            ..HitRegions::default()
+        });
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_key(KeyCode::Esc);
+
+        assert_eq!(app.view, View::Dashboard);
+        assert!(!app.filtering);
+    }
+
+    #[tokio::test]
+    async fn review_menu_rejects_actions_the_provider_does_not_advertise() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.demo = false;
+        let id = app.requests[2].id.clone();
+        app.providers.insert(
+            id.forge.clone(),
+            Arc::new(TestProvider {
+                name: id.forge.clone(),
+                capabilities: forge::ForgeCapabilities {
+                    reviews: true,
+                    ..forge::ForgeCapabilities::default()
+                },
+            }),
+        );
+        app.selected = 2;
+        app.handle_key(KeyCode::Enter);
+        app.overlay = Some(Overlay::ReviewMenu { selected: 0 });
+
+        app.handle_key(KeyCode::Enter);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("This forge has not advertised this write capability")
+        );
+
+        app.handle_key(KeyCode::Char(':'));
+        for key in "approve".chars() {
+            app.handle_key(KeyCode::Char(key));
+        }
+        app.handle_key(KeyCode::Enter);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("This forge has not advertised this write capability")
+        );
+    }
+
+    #[tokio::test]
+    async fn palette_dispatches_the_selected_filtered_command() {
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.handle_key(KeyCode::Enter);
+        app.handle_key(KeyCode::Char(':'));
+        for key in "refresh".chars() {
+            app.handle_key(KeyCode::Char(key));
+        }
+
+        app.handle_key(KeyCode::Enter);
+
+        assert!(!matches!(app.overlay, Some(Overlay::Composer { .. })));
+    }
+
+    #[tokio::test]
+    async fn review_write_completion_updates_the_request_that_was_submitted() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.demo = false;
+        let submitted_id = app.requests[2].id.clone();
+        app.providers.insert(
+            submitted_id.forge.clone(),
+            Arc::new(TestProvider {
+                name: submitted_id.forge.clone(),
+                capabilities: forge::ForgeCapabilities {
+                    approve: true,
+                    ..forge::ForgeCapabilities::default()
+                },
+            }),
+        );
+        app.selected = 2;
+        app.apply_review(ReviewState::Approved);
+        app.selected = 3;
+
+        let AppEvent::ReviewWrite {
+            request,
+            state,
+            result,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected a review completion");
+        };
+        app.apply_review_write(request, state, result);
+
+        assert_eq!(
+            app.requests
+                .iter()
+                .find(|request| request.id == submitted_id)
+                .unwrap()
+                .review,
+            ReviewState::Approved
+        );
+        assert_eq!(app.requests[3].review, ReviewState::None);
     }
 
     #[tokio::test]

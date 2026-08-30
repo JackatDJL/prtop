@@ -1,5 +1,5 @@
 pub mod theme;
-use crate::app::{App, DetailFocus, HitRegions, Overlay, View};
+use crate::app::{App, DetailFocus, HitRegions, Overlay, PALETTE_COMMANDS, View};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -207,35 +207,23 @@ fn overlay_view(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
                     .join("\n"),
             )
         }
-        Overlay::Palette { query, selected } => {
-            let commands = [
-                "Add comment",
-                "Approve",
-                "Request changes",
-                "Refresh",
-                "Request reviewer",
-                "Open in browser",
-            ];
-            (
-                "Command palette",
-                format!(
-                    "{}\n\n{}",
-                    query,
-                    commands
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, command)| command
-                            .to_lowercase()
-                            .contains(&query.to_lowercase()))
-                        .map(|(index, command)| format!(
-                            "{} {command}",
-                            if index == *selected { ">" } else { " " }
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ),
-            )
-        }
+        Overlay::Palette { query, selected } => (
+            "Command palette",
+            format!(
+                "{}\n\n{}",
+                query,
+                PALETTE_COMMANDS
+                    .iter()
+                    .filter(|command| command.to_lowercase().contains(&query.to_lowercase()))
+                    .enumerate()
+                    .map(|(index, command)| format!(
+                        "{} {command}",
+                        if index == *selected { ">" } else { " " }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        ),
         Overlay::ConfirmDelete => (
             "Delete comment",
             "Delete this comment?\n\nEnter / Esc cancel    d delete".into(),
