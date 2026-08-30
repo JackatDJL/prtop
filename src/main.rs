@@ -4,13 +4,14 @@ mod config;
 mod forge;
 mod git;
 mod model;
+mod scope;
 mod ssh;
 mod ui;
 
 use std::{io, time::Duration};
 
 use anyhow::Result;
-use app::{App, AppEvent};
+use app::{App, AppEvent, Scope};
 use clap::Parser;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
@@ -27,6 +28,9 @@ struct Cli {
     /// Use deterministic fixture data and never contact a forge.
     #[arg(long)]
     demo: bool,
+    /// Show every configured project even when run inside a Git repository.
+    #[arg(long)]
+    global: bool,
     /// Limit the initial view to a configured project, forge, repository, or PR URL.
     scope: Option<String>,
 }
@@ -53,9 +57,49 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let config = config::Config::load_or_create()?;
+    let mut config = config::Config::load_or_create()?;
+    let startup = scope::resolve(
+        &std::env::current_dir()?,
+        cli.global,
+        cli.demo,
+        cli.scope.as_deref(),
+    )
+    .await;
+    let mut startup_notice = None;
+    let requested_scope = match &startup {
+        scope::StartupScope::Project {
+            host,
+            repository,
+            path,
+        } => {
+            if host == "github.com" {
+                register_github_project(&mut config, repository, path);
+                Some(Scope::Project {
+                    host: host.clone(),
+                    repository: repository.clone(),
+                })
+            } else if has_configured_project(&config, host, repository) {
+                Some(Scope::Project {
+                    host: host.clone(),
+                    repository: repository.clone(),
+                })
+            } else {
+                startup_notice = Some(format!(
+                    "Repository detected: {host}/{repository}. No configured project matches this repository."
+                ));
+                None
+            }
+        }
+        _ => cli.scope.clone().map(Scope::Exact),
+    };
     let (events, mut receiver) = mpsc::unbounded_channel();
-    let mut app = App::new(config, cli.demo, cli.scope, events.clone()).await?;
+    let mut app = App::new(config, cli.demo, requested_scope, events.clone()).await?;
+    if let scope::StartupScope::UnknownRepository { remote, .. } = startup {
+        startup_notice = Some(format!(
+            "Repository detected, but its remote is not recognized: {remote}"
+        ));
+    }
+    app.toast = startup_notice;
     app.request_refresh();
 
     let _guard = TerminalGuard::enter()?;
@@ -64,6 +108,101 @@ async fn main() -> Result<()> {
     let result = run(&mut terminal, &mut app, &mut receiver).await;
     terminal.show_cursor()?;
     result
+}
+
+fn has_configured_project(config: &config::Config, host: &str, repository: &str) -> bool {
+    config.projects.iter().any(|project| {
+        project.repo == repository
+            && config
+                .forges
+                .iter()
+                .any(|forge| forge.name == project.forge && forge.host == host)
+    })
+}
+
+fn register_github_project(config: &mut config::Config, repository: &str, path: &str) {
+    let forge_name = config
+        .forges
+        .iter()
+        .find(|forge| forge.host == "github.com" && matches!(forge.kind, config::ForgeKind::Github))
+        .map(|forge| forge.name.clone())
+        .unwrap_or_else(|| {
+            let base = "github";
+            let mut candidate = base.to_owned();
+            let mut suffix = 2;
+            while config.forges.iter().any(|forge| forge.name == candidate) {
+                candidate = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            config.forges.push(config::ForgeConfig {
+                name: candidate.clone(),
+                kind: config::ForgeKind::Github,
+                host: "github.com".into(),
+            });
+            candidate
+        });
+    if !config
+        .projects
+        .iter()
+        .any(|project| project.forge == forge_name && project.repo == repository)
+    {
+        config.projects.push(config::ProjectConfig {
+            name: repository.into(),
+            forge: forge_name,
+            repo: repository.into(),
+            path: Some(path.into()),
+            host: None,
+        });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registers_a_project_against_an_existing_github_forge() {
+        let mut config = config::Config {
+            forges: vec![config::ForgeConfig {
+                name: "personal".into(),
+                kind: config::ForgeKind::Github,
+                host: "github.com".into(),
+            }],
+            ..config::Config::default()
+        };
+
+        register_github_project(&mut config, "jack/prtop", "/work/prtop");
+
+        assert_eq!(config.forges.len(), 1);
+        assert!(config.projects.iter().any(|project| {
+            project.forge == "personal"
+                && project.repo == "jack/prtop"
+                && project.path.as_deref() == Some("/work/prtop")
+        }));
+    }
+
+    #[test]
+    fn github_registration_avoids_an_existing_forge_name() {
+        let mut config = config::Config {
+            forges: vec![config::ForgeConfig {
+                name: "github".into(),
+                kind: config::ForgeKind::Gitlab,
+                host: "gitlab.example.test".into(),
+            }],
+            ..config::Config::default()
+        };
+
+        register_github_project(&mut config, "jack/prtop", "/work/prtop");
+
+        assert!(config.forges.iter().any(|forge| forge.name == "github-2"));
+        assert!(
+            config
+                .projects
+                .iter()
+                .any(|project| project.forge == "github-2")
+        );
+    }
 }
 
 async fn run(

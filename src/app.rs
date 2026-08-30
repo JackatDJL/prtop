@@ -12,6 +12,12 @@ use std::collections::HashMap;
 use std::{sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Scope {
+    Exact(String),
+    Project { host: String, repository: String },
+}
+
 pub enum AppEvent {
     Refresh(RefreshResult),
     CommentWrite {
@@ -30,6 +36,11 @@ pub enum Focus {
     Comments,
     Ci,
     Reviewers,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum View {
+    Dashboard,
+    ChangeRequestDetail(ChangeRequestId),
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Overlay {
@@ -57,7 +68,7 @@ pub struct App {
     pub filter: String,
     pub filtering: bool,
     pub show_help: bool,
-    pub detail: bool,
+    pub view: View,
     pub health: Vec<(String, String)>,
     pub last_refresh: Option<Instant>,
     pub stale: bool,
@@ -69,7 +80,7 @@ pub struct App {
     pub overlay: Option<Overlay>,
     config: Config,
     demo: bool,
-    scope: Option<String>,
+    scope: Option<Scope>,
     events: mpsc::UnboundedSender<AppEvent>,
     providers: HashMap<String, Arc<dyn ForgeProvider>>,
 }
@@ -78,7 +89,7 @@ impl App {
     pub async fn new(
         config: Config,
         demo: bool,
-        scope: Option<String>,
+        scope: Option<Scope>,
         events: mpsc::UnboundedSender<AppEvent>,
     ) -> Result<Self> {
         let requests = if demo {
@@ -93,7 +104,7 @@ impl App {
             filter: String::new(),
             filtering: false,
             show_help: false,
-            detail: false,
+            view: View::Dashboard,
             health: vec![],
             last_refresh: None,
             stale: !demo,
@@ -125,6 +136,12 @@ impl App {
     }
     pub fn selected_request(&self) -> Option<&ChangeRequest> {
         self.visible().get(self.selected).copied()
+    }
+    pub fn active_request(&self) -> Option<&ChangeRequest> {
+        match &self.view {
+            View::Dashboard => self.selected_request(),
+            View::ChangeRequestDetail(id) => self.requests.iter().find(|request| request.id == *id),
+        }
     }
     #[cfg(test)]
     pub fn handle_key(&mut self, key: KeyCode) -> bool {
@@ -227,7 +244,13 @@ impl App {
             return false;
         }
         match key {
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') if self.view == View::Dashboard => return true,
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h')
+                if self.view != View::Dashboard =>
+            {
+                self.view = View::Dashboard;
+                self.focus = Focus::Requests;
+            }
             KeyCode::Char('j') | KeyCode::Down if self.focus == Focus::Comments => {
                 self.comment_scroll = self.comment_scroll.saturating_add(1)
             }
@@ -242,7 +265,7 @@ impl App {
             }
             KeyCode::Home if self.focus == Focus::Comments => {
                 self.comment_scroll = self
-                    .selected_request()
+                    .active_request()
                     .map(|pr| pr.comments.len().saturating_sub(10))
                     .unwrap_or(0)
             }
@@ -253,13 +276,15 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if self.focus == Focus::Ci => {
                 self.ci_scroll = self.ci_scroll.saturating_sub(1)
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Char('j') | KeyCode::Down if self.view == View::Dashboard => {
                 if self.selected + 1 < self.visible().len() {
                     self.selected += 1;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Enter | KeyCode::Char('l') => self.detail = !self.detail,
+            KeyCode::Char('k') | KeyCode::Up if self.view == View::Dashboard => {
+                self.selected = self.selected.saturating_sub(1)
+            }
+            KeyCode::Enter | KeyCode::Char('l') => self.open_selected(),
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('r') => self.request_refresh(),
             KeyCode::Char('?') => self.show_help = !self.show_help,
@@ -306,17 +331,24 @@ impl App {
             }
             KeyCode::Char('d') => self.overlay = Some(Overlay::ConfirmDelete),
             KeyCode::Esc | KeyCode::Char('h') => {
-                self.detail = false;
                 self.show_help = false;
             }
             _ => {}
         };
         false
     }
+    fn open_selected(&mut self) {
+        if let Some(request) = self.selected_request() {
+            self.view = View::ChangeRequestDetail(request.id.clone());
+            self.focus = Focus::Comments;
+            self.comment_scroll = 0;
+            self.ci_scroll = 0;
+        }
+    }
     fn can(&self, predicate: impl Fn(forge::ForgeCapabilities) -> bool) -> bool {
         self.demo
             || self
-                .selected_request()
+                .active_request()
                 .and_then(|request| self.providers.get(&request.id.forge))
                 .is_some_and(|provider| predicate(provider.capabilities()))
     }
@@ -325,11 +357,7 @@ impl App {
             self.toast = Some("Comment is empty".into());
             return;
         }
-        let Some(request) = self
-            .visible()
-            .get(self.selected)
-            .map(|item| item.id.clone())
-        else {
+        let Some(request) = self.active_request().map(|item| item.id.clone()) else {
             return;
         };
         let temporary_id = format!(
@@ -372,11 +400,7 @@ impl App {
         self.toast = Some("Sending comment".into());
     }
     fn apply_review(&mut self, state: ReviewState) {
-        let Some(request) = self
-            .visible()
-            .get(self.selected)
-            .map(|item| item.id.clone())
-        else {
+        let Some(request) = self.active_request().map(|item| item.id.clone()) else {
             return;
         };
         if self.demo {
@@ -437,7 +461,11 @@ impl App {
                 self.focus = Focus::Requests;
                 let row = event.row.saturating_sub(self.regions.requests.y + 1) as usize;
                 if row < self.visible().len() {
-                    self.selected = row;
+                    if row == self.selected {
+                        self.open_selected();
+                    } else {
+                        self.selected = row;
+                    }
                 }
             }
             MouseEventKind::Down(_) if point(self.regions.details) => self.focus = Focus::Details,
@@ -511,10 +539,7 @@ impl App {
     ) {
         match result {
             Ok(()) => {
-                if let Some(id) = self
-                    .visible()
-                    .get(self.selected)
-                    .map(|request| request.id.clone())
+                if let Some(id) = self.active_request().map(|request| request.id.clone())
                     && let Some(request) = self.requests.iter_mut().find(|request| request.id == id)
                 {
                     request.review = state;
@@ -554,6 +579,7 @@ fn providers(config: &Config) -> HashMap<String, Arc<dyn ForgeProvider>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyModifiers, MouseButton};
@@ -600,6 +626,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wheel_targets_ci_panel_without_scrolling_comments() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.set_regions(HitRegions {
+            comments: Rect::new(0, 10, 40, 10),
+            ci: Rect::new(40, 10, 40, 10),
+            ..HitRegions::default()
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 44,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.comment_scroll, 0);
+        assert_eq!(app.ci_scroll, 1);
+    }
+
+    #[tokio::test]
     async fn composer_keeps_draft_and_submits_in_demo() {
         let (sender, _) = mpsc::unbounded_channel();
         let mut app = App::new(Config::default(), true, None, sender)
@@ -628,8 +675,34 @@ mod tests {
             ReviewState::ChangesRequested
         );
     }
+
+    #[tokio::test]
+    async fn enter_opens_and_back_returns_to_dashboard() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.selected_request().unwrap().id.clone();
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.view, View::ChangeRequestDetail(id));
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[tokio::test]
+    async fn detail_view_keeps_the_opened_request_when_selection_changes() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.selected = 1;
+        let opened = app.selected_request().unwrap().id.clone();
+        app.handle_key(KeyCode::Enter);
+        app.selected = 0;
+        assert_eq!(app.active_request().unwrap().id, opened);
+    }
 }
-async fn refresh(config: Config, demo: bool, scope: Option<String>) -> RefreshResult {
+async fn refresh(config: Config, demo: bool, scope: Option<Scope>) -> RefreshResult {
     if demo {
         return RefreshResult {
             requests: forge::demo::change_requests(),
@@ -673,8 +746,8 @@ async fn refresh(config: Config, demo: bool, scope: Option<String>) -> RefreshRe
             Err(error) => health.push((provider.name().into(), error.to_string())),
         }
     }
-    if let Some(scope) = scope {
-        all.retain(|p| p.id.forge == scope || p.id.repository == scope);
+    if let Some(scope) = &scope {
+        retain_scope(&mut all, scope, &config);
     }
     if !all.is_empty() {
         let _ = cache::store(&all);
@@ -684,10 +757,26 @@ async fn refresh(config: Config, demo: bool, scope: Option<String>) -> RefreshRe
             from_cache: false,
         };
     }
-    let cached = cache::load().unwrap_or_default();
+    let mut cached = cache::load().unwrap_or_default();
+    if let Some(scope) = &scope {
+        retain_scope(&mut cached, scope, &config);
+    }
     RefreshResult {
         requests: cached,
         health,
         from_cache: true,
     }
+}
+
+fn retain_scope(requests: &mut Vec<ChangeRequest>, scope: &Scope, config: &Config) {
+    requests.retain(|request| match scope {
+        Scope::Exact(scope) => request.id.forge == *scope || request.id.repository == *scope,
+        Scope::Project { host, repository } => {
+            request.id.repository == *repository
+                && config
+                    .forges
+                    .iter()
+                    .any(|forge| forge.name == request.id.forge && forge.host == *host)
+        }
+    });
 }

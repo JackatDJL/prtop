@@ -1,5 +1,5 @@
 pub mod theme;
-use crate::app::{App, HitRegions, Overlay};
+use crate::app::{App, HitRegions, Overlay, View};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -11,6 +11,19 @@ use ratatui::{
 use theme::Theme;
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = Theme::detect();
+    if matches!(app.view, View::ChangeRequestDetail(_)) {
+        draw_full_detail(frame, app, theme);
+        if app.show_help {
+            help(frame);
+        }
+        if let Some(message) = &app.toast {
+            toast(frame, message, theme);
+        }
+        if let Some(overlay) = &app.overlay {
+            overlay_view(frame, overlay, theme);
+        }
+        return;
+    }
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -77,6 +90,65 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(overlay) = &app.overlay {
         overlay_view(frame, overlay, theme);
     }
+}
+fn draw_full_detail(frame: &mut Frame, app: &mut App, theme: Theme) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(10),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    let Some(pr) = app.active_request() else {
+        frame.render_widget(
+            Paragraph::new(
+                "Change request is no longer available.\n\nEsc returns to the dashboard.",
+            )
+            .block(Block::default().borders(Borders::ALL).title(" detail ")),
+            outer[1],
+        );
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!(" {} {}", pr.id.display(pr.kind), pr.title),
+                Style::default()
+                    .fg(theme.foreground)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from(format!(
+                " {} · {}   {} → {}",
+                pr.id.forge, pr.id.repository, pr.source_branch, pr.target_branch
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border_active))
+                .title(" change request "),
+        ),
+        outer[0],
+    );
+    let detail = outer[1];
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(detail);
+    app.set_regions(HitRegions {
+        details: outer[0],
+        comments: columns[0],
+        ci: columns[1],
+        reviewers: columns[1],
+        ..HitRegions::default()
+    });
+    draw_detail(frame, detail, app, theme);
+    frame.render_widget(
+        Paragraph::new(" Esc back   Tab focus   ↑↓ scroll   c comment   R review   : commands")
+            .style(Style::default().fg(theme.muted)),
+        outer[2],
+    );
 }
 fn toast(frame: &mut Frame, message: &str, theme: Theme) {
     let area = Rect::new(
@@ -220,7 +292,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
-    let Some(pr) = app.selected_request() else {
+    let Some(pr) = app.active_request() else {
         frame.render_widget(
             Paragraph::new("No requests. Configure a forge or use --demo.")
                 .block(Block::default().borders(Borders::ALL).title(" detail ")),
@@ -282,7 +354,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
     )];
     if let Some(pipeline) = &pr.pipeline {
-        for job in &pipeline.jobs {
+        for job in pipeline.jobs.iter().skip(app.ci_scroll).take(10) {
             right.push(Line::from(format!(
                 "{} {:<24} {}",
                 job.status.glyph(),
