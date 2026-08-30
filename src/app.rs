@@ -32,6 +32,11 @@ pub enum Focus {
     Reviewers,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum View {
+    Dashboard,
+    ChangeRequestDetail(ChangeRequestId),
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Overlay {
     Composer { body: String },
     ReviewMenu { selected: usize },
@@ -57,7 +62,7 @@ pub struct App {
     pub filter: String,
     pub filtering: bool,
     pub show_help: bool,
-    pub detail: bool,
+    pub view: View,
     pub health: Vec<(String, String)>,
     pub last_refresh: Option<Instant>,
     pub stale: bool,
@@ -93,7 +98,7 @@ impl App {
             filter: String::new(),
             filtering: false,
             show_help: false,
-            detail: false,
+            view: View::Dashboard,
             health: vec![],
             last_refresh: None,
             stale: !demo,
@@ -227,7 +232,13 @@ impl App {
             return false;
         }
         match key {
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') if self.view == View::Dashboard => return true,
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h')
+                if self.view != View::Dashboard =>
+            {
+                self.view = View::Dashboard;
+                self.focus = Focus::Requests;
+            }
             KeyCode::Char('j') | KeyCode::Down if self.focus == Focus::Comments => {
                 self.comment_scroll = self.comment_scroll.saturating_add(1)
             }
@@ -259,7 +270,7 @@ impl App {
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Enter | KeyCode::Char('l') => self.detail = !self.detail,
+            KeyCode::Enter | KeyCode::Char('l') => self.open_selected(),
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('r') => self.request_refresh(),
             KeyCode::Char('?') => self.show_help = !self.show_help,
@@ -306,12 +317,17 @@ impl App {
             }
             KeyCode::Char('d') => self.overlay = Some(Overlay::ConfirmDelete),
             KeyCode::Esc | KeyCode::Char('h') => {
-                self.detail = false;
                 self.show_help = false;
             }
             _ => {}
         };
         false
+    }
+    fn open_selected(&mut self) {
+        if let Some(request) = self.selected_request() {
+            self.view = View::ChangeRequestDetail(request.id.clone());
+            self.focus = Focus::Details;
+        }
     }
     fn can(&self, predicate: impl Fn(forge::ForgeCapabilities) -> bool) -> bool {
         self.demo
@@ -437,7 +453,11 @@ impl App {
                 self.focus = Focus::Requests;
                 let row = event.row.saturating_sub(self.regions.requests.y + 1) as usize;
                 if row < self.visible().len() {
-                    self.selected = row;
+                    if row == self.selected {
+                        self.open_selected();
+                    } else {
+                        self.selected = row;
+                    }
                 }
             }
             MouseEventKind::Down(_) if point(self.regions.details) => self.focus = Focus::Details,
@@ -627,6 +647,19 @@ mod tests {
             app.selected_request().unwrap().review,
             ReviewState::ChangesRequested
         );
+    }
+
+    #[tokio::test]
+    async fn enter_opens_and_back_returns_to_dashboard() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.selected_request().unwrap().id.clone();
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.view, View::ChangeRequestDetail(id));
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.view, View::Dashboard);
     }
 }
 async fn refresh(config: Config, demo: bool, scope: Option<String>) -> RefreshResult {

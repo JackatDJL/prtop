@@ -4,6 +4,7 @@ mod config;
 mod forge;
 mod git;
 mod model;
+mod scope;
 mod ssh;
 mod ui;
 
@@ -27,6 +28,9 @@ struct Cli {
     /// Use deterministic fixture data and never contact a forge.
     #[arg(long)]
     demo: bool,
+    /// Show every configured project even when run inside a Git repository.
+    #[arg(long)]
+    global: bool,
     /// Limit the initial view to a configured project, forge, repository, or PR URL.
     scope: Option<String>,
 }
@@ -53,9 +57,51 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let config = config::Config::load_or_create()?;
+    let mut config = config::Config::load_or_create()?;
+    let startup = scope::resolve(
+        &std::env::current_dir()?,
+        cli.global,
+        cli.demo,
+        cli.scope.as_deref(),
+    )
+    .await;
+    let mut startup_notice = None;
+    let requested_scope = match &startup {
+        scope::StartupScope::Project {
+            host,
+            repository,
+            path,
+        } => {
+            if !config.forges.iter().any(|forge| forge.host == *host) && host == "github.com" {
+                config.forges.push(config::ForgeConfig {
+                    name: "github".into(),
+                    kind: config::ForgeKind::Github,
+                    host: host.clone(),
+                });
+                config.projects.push(config::ProjectConfig {
+                    name: repository.clone(),
+                    forge: "github".into(),
+                    repo: repository.clone(),
+                    path: Some(path.clone()),
+                    host: None,
+                });
+            } else if !config.forges.iter().any(|forge| forge.host == *host) {
+                startup_notice = Some(format!(
+                    "Repository detected: {host}/{repository}. No forge configuration matches {host}."
+                ));
+            }
+            Some(repository.clone())
+        }
+        _ => cli.scope.clone(),
+    };
     let (events, mut receiver) = mpsc::unbounded_channel();
-    let mut app = App::new(config, cli.demo, cli.scope, events.clone()).await?;
+    let mut app = App::new(config, cli.demo, requested_scope, events.clone()).await?;
+    if let scope::StartupScope::UnknownRepository { remote, .. } = startup {
+        startup_notice = Some(format!(
+            "Repository detected, but its remote is not recognized: {remote}"
+        ));
+    }
+    app.toast = startup_notice;
     app.request_refresh();
 
     let _guard = TerminalGuard::enter()?;
