@@ -17,10 +17,11 @@ pub enum StartupScope {
 
 pub fn parse_remote(remote: &str) -> Option<(String, String)> {
     let value = remote.trim().trim_end_matches('/').trim_end_matches(".git");
-    let (host, repository) = if let Some(rest) = value.strip_prefix("git@") {
-        rest.split_once(':')?
-    } else if let Some(rest) = value.strip_prefix("ssh://git@") {
+    let (host, repository) = if let Some(rest) = value.strip_prefix("ssh://") {
+        let rest = rest.split_once('@').map(|(_, host)| host).unwrap_or(rest);
         rest.split_once('/')?
+    } else if let Some((_, rest)) = value.split_once('@') {
+        rest.split_once(':')?
     } else {
         let rest = value.strip_prefix("https://")?;
         rest.split_once('/')?
@@ -89,6 +90,10 @@ mod tests {
         assert_eq!(
             parse_remote("ssh://git@codeberg.org/jack/foo.git"),
             Some(("codeberg.org".into(), "jack/foo".into()))
+        );
+        assert_eq!(
+            parse_remote("deploy@gitlab.example.com:team/api.git"),
+            Some(("gitlab.example.com".into(), "team/api".into()))
         );
     }
 

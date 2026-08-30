@@ -13,6 +13,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = Theme::detect();
     if matches!(app.view, View::ChangeRequestDetail(_)) {
         draw_full_detail(frame, app, theme);
+        if app.show_help {
+            help(frame);
+        }
+        if let Some(message) = &app.toast {
+            toast(frame, message, theme);
+        }
         if let Some(overlay) = &app.overlay {
             overlay_view(frame, overlay, theme);
         }

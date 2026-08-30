@@ -12,6 +12,12 @@ use std::collections::HashMap;
 use std::{sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Scope {
+    Exact(String),
+    Project { host: String, repository: String },
+}
+
 pub enum AppEvent {
     Refresh(RefreshResult),
     CommentWrite {
@@ -105,7 +111,7 @@ pub struct App {
     pub overlay: Option<Overlay>,
     config: Config,
     demo: bool,
-    scope: Option<String>,
+    scope: Option<Scope>,
     events: mpsc::UnboundedSender<AppEvent>,
     providers: HashMap<String, Arc<dyn ForgeProvider>>,
 }
@@ -114,7 +120,7 @@ impl App {
     pub async fn new(
         config: Config,
         demo: bool,
-        scope: Option<String>,
+        scope: Option<Scope>,
         events: mpsc::UnboundedSender<AppEvent>,
     ) -> Result<Self> {
         let requests = if demo {
@@ -707,10 +713,7 @@ impl App {
     ) {
         match result {
             Ok(()) => {
-                if let Some(id) = self
-                    .visible()
-                    .get(self.selected)
-                    .map(|request| request.id.clone())
+                if let Some(id) = self.request_for_view().map(|request| request.id.clone())
                     && let Some(request) = self.requests.iter_mut().find(|request| request.id == id)
                 {
                     request.review = state;
@@ -750,6 +753,7 @@ fn providers(config: &Config) -> HashMap<String, Arc<dyn ForgeProvider>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyModifiers, MouseButton};
@@ -793,6 +797,28 @@ mod tests {
         });
         assert_eq!(app.focus, Focus::Requests);
         assert_eq!(app.comment_scroll, 3);
+    }
+
+    #[tokio::test]
+    async fn wheel_targets_ci_panel_without_scrolling_comments() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.set_regions(HitRegions {
+            comments: Rect::new(0, 10, 40, 10),
+            ci: Rect::new(40, 10, 40, 10),
+            ..HitRegions::default()
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 44,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.comment_scroll, 0);
+        assert_eq!(app.ci_scroll, 1);
     }
 
     #[tokio::test]
@@ -915,7 +941,7 @@ mod tests {
         assert_eq!(app.comment_scroll, 3);
     }
 }
-async fn refresh(config: Config, demo: bool, scope: Option<String>) -> RefreshResult {
+async fn refresh(config: Config, demo: bool, scope: Option<Scope>) -> RefreshResult {
     if demo {
         return RefreshResult {
             requests: forge::demo::change_requests(),
@@ -959,8 +985,8 @@ async fn refresh(config: Config, demo: bool, scope: Option<String>) -> RefreshRe
             Err(error) => health.push((provider.name().into(), error.to_string())),
         }
     }
-    if let Some(scope) = scope {
-        all.retain(|p| p.id.forge == scope || p.id.repository == scope);
+    if let Some(scope) = &scope {
+        retain_scope(&mut all, scope, &config);
     }
     if !all.is_empty() {
         let _ = cache::store(&all);
@@ -970,10 +996,26 @@ async fn refresh(config: Config, demo: bool, scope: Option<String>) -> RefreshRe
             from_cache: false,
         };
     }
-    let cached = cache::load().unwrap_or_default();
+    let mut cached = cache::load().unwrap_or_default();
+    if let Some(scope) = &scope {
+        retain_scope(&mut cached, scope, &config);
+    }
     RefreshResult {
         requests: cached,
         health,
         from_cache: true,
     }
+}
+
+fn retain_scope(requests: &mut Vec<ChangeRequest>, scope: &Scope, config: &Config) {
+    requests.retain(|request| match scope {
+        Scope::Exact(scope) => request.id.forge == *scope || request.id.repository == *scope,
+        Scope::Project { host, repository } => {
+            request.id.repository == *repository
+                && config
+                    .forges
+                    .iter()
+                    .any(|forge| forge.name == request.id.forge && forge.host == *host)
+        }
+    });
 }
