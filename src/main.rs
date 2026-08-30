@@ -226,7 +226,7 @@ async fn run(
             Some(message) = receiver.recv() => match message {
                 AppEvent::Refresh(result) => app.apply_refresh(result),
                 AppEvent::CommentWrite { temporary_id, result } => app.apply_comment_write(temporary_id, result),
-                AppEvent::ReviewWrite { state, result } => app.apply_review_write(state, result),
+                AppEvent::ReviewWrite { request, state, result } => app.apply_review_write(request, state, result),
             }
         }
     }

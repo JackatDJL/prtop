@@ -12,6 +12,15 @@ use std::collections::HashMap;
 use std::{sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
+pub const PALETTE_COMMANDS: [&str; 6] = [
+    "Add comment",
+    "Approve",
+    "Request changes",
+    "Refresh",
+    "Request reviewer",
+    "Open in browser",
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Scope {
     Exact(String),
@@ -25,6 +34,7 @@ pub enum AppEvent {
         result: Result<(), forge::ForgeError>,
     },
     ReviewWrite {
+        request: ChangeRequestId,
         state: ReviewState,
         result: Result<(), forge::ForgeError>,
     },
@@ -36,6 +46,34 @@ pub enum Focus {
     Comments,
     Ci,
     Reviewers,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DetailFocus {
+    Comments,
+    Description,
+    Reviewers,
+    Ci,
+    Metadata,
+}
+impl DetailFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Comments => Self::Description,
+            Self::Description => Self::Reviewers,
+            Self::Reviewers => Self::Ci,
+            Self::Ci => Self::Metadata,
+            Self::Metadata => Self::Comments,
+        }
+    }
+    fn previous(self) -> Self {
+        match self {
+            Self::Comments => Self::Metadata,
+            Self::Description => Self::Comments,
+            Self::Reviewers => Self::Description,
+            Self::Ci => Self::Reviewers,
+            Self::Metadata => Self::Ci,
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum View {
@@ -53,9 +91,11 @@ pub enum Overlay {
 pub struct HitRegions {
     pub requests: Rect,
     pub details: Rect,
+    pub description: Rect,
     pub comments: Rect,
     pub ci: Rect,
     pub reviewers: Rect,
+    pub metadata: Rect,
 }
 pub struct RefreshResult {
     pub requests: Vec<ChangeRequest>,
@@ -73,6 +113,7 @@ pub struct App {
     pub last_refresh: Option<Instant>,
     pub stale: bool,
     pub focus: Focus,
+    pub detail_focus: DetailFocus,
     pub comment_scroll: usize,
     pub ci_scroll: usize,
     pub regions: HitRegions,
@@ -109,6 +150,7 @@ impl App {
             last_refresh: None,
             stale: !demo,
             focus: Focus::Requests,
+            detail_focus: DetailFocus::Comments,
             comment_scroll: 0,
             ci_scroll: 0,
             regions: HitRegions::default(),
@@ -137,10 +179,16 @@ impl App {
     pub fn selected_request(&self) -> Option<&ChangeRequest> {
         self.visible().get(self.selected).copied()
     }
-    pub fn active_request(&self) -> Option<&ChangeRequest> {
-        match &self.view {
+    pub fn detail_request(&self) -> Option<&ChangeRequest> {
+        let View::ChangeRequestDetail(id) = &self.view else {
+            return None;
+        };
+        self.requests.iter().find(|request| request.id == *id)
+    }
+    pub fn request_for_view(&self) -> Option<&ChangeRequest> {
+        match self.view {
             View::Dashboard => self.selected_request(),
-            View::ChangeRequestDetail(id) => self.requests.iter().find(|request| request.id == *id),
+            View::ChangeRequestDetail(_) => self.detail_request(),
         }
     }
     #[cfg(test)]
@@ -206,14 +254,14 @@ impl App {
                         self.overlay = Some(Overlay::Palette { query, selected });
                     }
                     KeyCode::Down => {
-                        selected = (selected + 1).min(5);
+                        selected = (selected + 1).min(Self::palette_command_count(&query));
                         self.overlay = Some(Overlay::Palette { query, selected });
                     }
                     KeyCode::Up => {
                         selected = selected.saturating_sub(1);
                         self.overlay = Some(Overlay::Palette { query, selected });
                     }
-                    KeyCode::Enter => self.run_palette(selected),
+                    KeyCode::Enter => self.run_palette(&query, selected),
                     _ => self.overlay = Some(Overlay::Palette { query, selected }),
                 },
                 Overlay::ConfirmDelete => match key {
@@ -228,7 +276,7 @@ impl App {
             }
             return false;
         }
-        if self.filtering {
+        if self.filtering && self.view == View::Dashboard {
             match key {
                 KeyCode::Esc | KeyCode::Enter => self.filtering = false,
                 KeyCode::Backspace => {
@@ -243,14 +291,14 @@ impl App {
             };
             return false;
         }
+        match self.view.clone() {
+            View::Dashboard => self.handle_dashboard_key(key),
+            View::ChangeRequestDetail(id) => self.handle_detail_key(&id, key),
+        }
+    }
+    fn handle_dashboard_key(&mut self, key: KeyCode) -> bool {
         match key {
-            KeyCode::Char('q') if self.view == View::Dashboard => return true,
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h')
-                if self.view != View::Dashboard =>
-            {
-                self.view = View::Dashboard;
-                self.focus = Focus::Requests;
-            }
+            KeyCode::Char('q') => return true,
             KeyCode::Char('j') | KeyCode::Down if self.focus == Focus::Comments => {
                 self.comment_scroll = self.comment_scroll.saturating_add(1)
             }
@@ -265,7 +313,7 @@ impl App {
             }
             KeyCode::Home if self.focus == Focus::Comments => {
                 self.comment_scroll = self
-                    .active_request()
+                    .selected_request()
                     .map(|pr| pr.comments.len().saturating_sub(10))
                     .unwrap_or(0)
             }
@@ -276,14 +324,12 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up if self.focus == Focus::Ci => {
                 self.ci_scroll = self.ci_scroll.saturating_sub(1)
             }
-            KeyCode::Char('j') | KeyCode::Down if self.view == View::Dashboard => {
+            KeyCode::Char('j') | KeyCode::Down => {
                 if self.selected + 1 < self.visible().len() {
                     self.selected += 1;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up if self.view == View::Dashboard => {
-                self.selected = self.selected.saturating_sub(1)
-            }
+            KeyCode::Char('k') | KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Enter | KeyCode::Char('l') => self.open_selected(),
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('r') => self.request_refresh(),
@@ -337,10 +383,102 @@ impl App {
         };
         false
     }
+    fn handle_detail_key(&mut self, id: &ChangeRequestId, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') => {
+                self.view = View::Dashboard;
+                self.focus = Focus::Requests;
+                self.filtering = false;
+            }
+            KeyCode::Tab => self.detail_focus = self.detail_focus.next(),
+            KeyCode::BackTab => self.detail_focus = self.detail_focus.previous(),
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_detail(id, 1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_detail(id, -1),
+            KeyCode::PageDown => self.scroll_detail(id, 10),
+            KeyCode::PageUp => self.scroll_detail(id, -10),
+            KeyCode::Home => self.home_detail(id),
+            KeyCode::End => self.end_detail(),
+            KeyCode::Char('c') if self.can(|capabilities| capabilities.comments) => {
+                self.overlay = Some(Overlay::Composer {
+                    body: String::new(),
+                })
+            }
+            KeyCode::Char('R') if self.can(|capabilities| capabilities.reviews) => {
+                self.overlay = Some(Overlay::ReviewMenu { selected: 0 })
+            }
+            KeyCode::Char('a') if self.can(|capabilities| capabilities.approve) => {
+                self.apply_review(ReviewState::Approved)
+            }
+            KeyCode::Char('x') if self.can(|capabilities| capabilities.request_changes) => {
+                self.apply_review(ReviewState::ChangesRequested)
+            }
+            KeyCode::Char('c') | KeyCode::Char('R') | KeyCode::Char('a') | KeyCode::Char('x') => {
+                self.toast = Some("This forge has not advertised this write capability".into())
+            }
+            KeyCode::Char(':') => {
+                self.overlay = Some(Overlay::Palette {
+                    query: String::new(),
+                    selected: 0,
+                })
+            }
+            _ => {}
+        }
+        false
+    }
+    fn scroll_detail(&mut self, id: &ChangeRequestId, delta: isize) {
+        match self.detail_focus {
+            DetailFocus::Comments => {
+                let max = self
+                    .requests
+                    .iter()
+                    .find(|request| request.id == *id)
+                    .map_or(0, |request| request.comments.len().saturating_sub(10));
+                self.comment_scroll = self.comment_scroll.saturating_add_signed(delta).min(max);
+            }
+            DetailFocus::Ci => {
+                let max = self
+                    .requests
+                    .iter()
+                    .find(|request| request.id == *id)
+                    .and_then(|request| request.pipeline.as_ref())
+                    .map_or(0, |pipeline| pipeline.jobs.len().saturating_sub(8));
+                self.ci_scroll = self.ci_scroll.saturating_add_signed(delta).min(max);
+            }
+            DetailFocus::Description | DetailFocus::Reviewers | DetailFocus::Metadata => {}
+        }
+    }
+    fn home_detail(&mut self, id: &ChangeRequestId) {
+        match self.detail_focus {
+            DetailFocus::Comments => {
+                self.comment_scroll = self
+                    .requests
+                    .iter()
+                    .find(|request| request.id == *id)
+                    .map_or(0, |request| request.comments.len().saturating_sub(10));
+            }
+            DetailFocus::Ci => {
+                self.ci_scroll = self
+                    .requests
+                    .iter()
+                    .find(|request| request.id == *id)
+                    .and_then(|request| request.pipeline.as_ref())
+                    .map_or(0, |pipeline| pipeline.jobs.len().saturating_sub(8));
+            }
+            DetailFocus::Description | DetailFocus::Reviewers | DetailFocus::Metadata => {}
+        }
+    }
+    fn end_detail(&mut self) {
+        match self.detail_focus {
+            DetailFocus::Comments => self.comment_scroll = 0,
+            DetailFocus::Ci => self.ci_scroll = 0,
+            DetailFocus::Description | DetailFocus::Reviewers | DetailFocus::Metadata => {}
+        }
+    }
     fn open_selected(&mut self) {
         if let Some(request) = self.selected_request() {
             self.view = View::ChangeRequestDetail(request.id.clone());
-            self.focus = Focus::Comments;
+            self.filtering = false;
+            self.detail_focus = DetailFocus::Comments;
             self.comment_scroll = 0;
             self.ci_scroll = 0;
         }
@@ -348,7 +486,7 @@ impl App {
     fn can(&self, predicate: impl Fn(forge::ForgeCapabilities) -> bool) -> bool {
         self.demo
             || self
-                .active_request()
+                .request_for_view()
                 .and_then(|request| self.providers.get(&request.id.forge))
                 .is_some_and(|provider| predicate(provider.capabilities()))
     }
@@ -357,7 +495,7 @@ impl App {
             self.toast = Some("Comment is empty".into());
             return;
         }
-        let Some(request) = self.active_request().map(|item| item.id.clone()) else {
+        let Some(request) = self.request_for_view().map(|item| item.id.clone()) else {
             return;
         };
         let temporary_id = format!(
@@ -400,7 +538,11 @@ impl App {
         self.toast = Some("Sending comment".into());
     }
     fn apply_review(&mut self, state: ReviewState) {
-        let Some(request) = self.active_request().map(|item| item.id.clone()) else {
+        if !self.can_review_action(state) {
+            self.toast = Some("This forge has not advertised this write capability".into());
+            return;
+        }
+        let Some(request) = self.request_for_view().map(|item| item.id.clone()) else {
             return;
         };
         if self.demo {
@@ -429,20 +571,44 @@ impl App {
         let sender = self.events.clone();
         tokio::spawn(async move {
             let result = provider.submit_review_action(&request, action, "").await;
-            let _ = sender.send(AppEvent::ReviewWrite { state, result });
+            let _ = sender.send(AppEvent::ReviewWrite {
+                request,
+                state,
+                result,
+            });
         });
         self.toast = Some("Submitting review".into());
     }
-    fn run_palette(&mut self, selected: usize) {
-        match selected {
-            0 => {
+    fn can_review_action(&self, state: ReviewState) -> bool {
+        match state {
+            ReviewState::Approved => self.can(|capabilities| capabilities.approve),
+            ReviewState::ChangesRequested => self.can(|capabilities| capabilities.request_changes),
+            _ => self.can(|capabilities| capabilities.reviews),
+        }
+    }
+    fn palette_command_count(query: &str) -> usize {
+        PALETTE_COMMANDS
+            .iter()
+            .filter(|command| command.to_lowercase().contains(&query.to_lowercase()))
+            .count()
+            .saturating_sub(1)
+    }
+    fn run_palette(&mut self, query: &str, selected: usize) {
+        let command = PALETTE_COMMANDS
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| command.to_lowercase().contains(&query.to_lowercase()))
+            .nth(selected)
+            .map(|(index, _)| index);
+        match command {
+            Some(0) => {
                 self.overlay = Some(Overlay::Composer {
                     body: String::new(),
                 })
             }
-            1 => self.apply_review(ReviewState::Approved),
-            2 => self.apply_review(ReviewState::ChangesRequested),
-            3 => self.request_refresh(),
+            Some(1) => self.apply_review(ReviewState::Approved),
+            Some(2) => self.apply_review(ReviewState::ChangesRequested),
+            Some(3) => self.request_refresh(),
             _ => self.toast = Some("Command unavailable for this forge".into()),
         }
     }
@@ -456,6 +622,10 @@ impl App {
                 && event.row >= rect.y
                 && event.row < rect.y + rect.height
         };
+        if matches!(self.view, View::ChangeRequestDetail(_)) {
+            self.handle_detail_mouse(event, &point);
+            return;
+        }
         match event.kind {
             MouseEventKind::Down(_) if point(self.regions.requests) => {
                 self.focus = Focus::Requests;
@@ -485,6 +655,50 @@ impl App {
             }
             MouseEventKind::ScrollDown if point(self.regions.ci) => {
                 self.ci_scroll = self.ci_scroll.saturating_add(1)
+            }
+            _ => {}
+        }
+    }
+    fn handle_detail_mouse(&mut self, event: MouseEvent, point: &impl Fn(Rect) -> bool) {
+        match event.kind {
+            MouseEventKind::Down(_) if point(self.regions.description) => {
+                self.detail_focus = DetailFocus::Description
+            }
+            MouseEventKind::Down(_) if point(self.regions.comments) => {
+                self.detail_focus = DetailFocus::Comments
+            }
+            MouseEventKind::Down(_) if point(self.regions.reviewers) => {
+                self.detail_focus = DetailFocus::Reviewers
+            }
+            MouseEventKind::Down(_) if point(self.regions.ci) => {
+                self.detail_focus = DetailFocus::Ci
+            }
+            MouseEventKind::Down(_) if point(self.regions.metadata) => {
+                self.detail_focus = DetailFocus::Metadata
+            }
+            MouseEventKind::ScrollUp if point(self.regions.comments) => {
+                self.detail_focus = DetailFocus::Comments;
+                if let View::ChangeRequestDetail(id) = self.view.clone() {
+                    self.scroll_detail(&id, -3);
+                }
+            }
+            MouseEventKind::ScrollDown if point(self.regions.comments) => {
+                self.detail_focus = DetailFocus::Comments;
+                if let View::ChangeRequestDetail(id) = self.view.clone() {
+                    self.scroll_detail(&id, 3);
+                }
+            }
+            MouseEventKind::ScrollUp if point(self.regions.ci) => {
+                self.detail_focus = DetailFocus::Ci;
+                if let View::ChangeRequestDetail(id) = self.view.clone() {
+                    self.scroll_detail(&id, -3);
+                }
+            }
+            MouseEventKind::ScrollDown if point(self.regions.ci) => {
+                self.detail_focus = DetailFocus::Ci;
+                if let View::ChangeRequestDetail(id) = self.view.clone() {
+                    self.scroll_detail(&id, 3);
+                }
             }
             _ => {}
         }
@@ -534,14 +748,13 @@ impl App {
     }
     pub fn apply_review_write(
         &mut self,
+        id: ChangeRequestId,
         state: ReviewState,
         result: Result<(), forge::ForgeError>,
     ) {
         match result {
             Ok(()) => {
-                if let Some(id) = self.active_request().map(|request| request.id.clone())
-                    && let Some(request) = self.requests.iter_mut().find(|request| request.id == id)
-                {
+                if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
                     request.review = state;
                 }
                 self.toast = Some("Review submitted".into());
@@ -583,6 +796,35 @@ fn providers(config: &Config) -> HashMap<String, Arc<dyn ForgeProvider>> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyModifiers, MouseButton};
+
+    struct TestProvider {
+        name: String,
+        capabilities: forge::ForgeCapabilities,
+    }
+
+    #[async_trait::async_trait]
+    impl ForgeProvider for TestProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn capabilities(&self) -> forge::ForgeCapabilities {
+            self.capabilities
+        }
+
+        async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, forge::ForgeError> {
+            Ok(vec![])
+        }
+
+        async fn submit_review_action(
+            &self,
+            _id: &ChangeRequestId,
+            _action: forge::ReviewAction,
+            _body: &str,
+        ) -> Result<(), forge::ForgeError> {
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn click_and_keyboard_share_request_selection() {
@@ -642,6 +884,7 @@ mod tests {
             row: 12,
             modifiers: KeyModifiers::NONE,
         });
+
         assert_eq!(app.comment_scroll, 0);
         assert_eq!(app.ci_scroll, 1);
     }
@@ -690,16 +933,216 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detail_view_keeps_the_opened_request_when_selection_changes() {
+    async fn opening_and_closing_detail_clears_an_active_filter() {
         let (sender, _) = mpsc::unbounded_channel();
         let mut app = App::new(Config::default(), true, None, sender)
             .await
             .unwrap();
-        app.selected = 1;
-        let opened = app.selected_request().unwrap().id.clone();
+        app.filter = "droplet".into();
+        app.filtering = true;
+        app.set_regions(HitRegions {
+            requests: Rect::new(0, 0, 80, 10),
+            ..HitRegions::default()
+        });
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_key(KeyCode::Esc);
+
+        assert_eq!(app.view, View::Dashboard);
+        assert!(!app.filtering);
+    }
+
+    #[tokio::test]
+    async fn review_menu_rejects_actions_the_provider_does_not_advertise() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.demo = false;
+        let id = app.requests[2].id.clone();
+        app.providers.insert(
+            id.forge.clone(),
+            Arc::new(TestProvider {
+                name: id.forge.clone(),
+                capabilities: forge::ForgeCapabilities {
+                    reviews: true,
+                    ..forge::ForgeCapabilities::default()
+                },
+            }),
+        );
+        app.selected = 2;
         app.handle_key(KeyCode::Enter);
-        app.selected = 0;
-        assert_eq!(app.active_request().unwrap().id, opened);
+        app.overlay = Some(Overlay::ReviewMenu { selected: 0 });
+
+        app.handle_key(KeyCode::Enter);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("This forge has not advertised this write capability")
+        );
+
+        app.handle_key(KeyCode::Char(':'));
+        for key in "approve".chars() {
+            app.handle_key(KeyCode::Char(key));
+        }
+        app.handle_key(KeyCode::Enter);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("This forge has not advertised this write capability")
+        );
+    }
+
+    #[tokio::test]
+    async fn palette_dispatches_the_selected_filtered_command() {
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.handle_key(KeyCode::Enter);
+        app.handle_key(KeyCode::Char(':'));
+        for key in "refresh".chars() {
+            app.handle_key(KeyCode::Char(key));
+        }
+
+        app.handle_key(KeyCode::Enter);
+
+        assert!(!matches!(app.overlay, Some(Overlay::Composer { .. })));
+    }
+
+    #[tokio::test]
+    async fn review_write_completion_updates_the_request_that_was_submitted() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.demo = false;
+        let submitted_id = app.requests[2].id.clone();
+        app.providers.insert(
+            submitted_id.forge.clone(),
+            Arc::new(TestProvider {
+                name: submitted_id.forge.clone(),
+                capabilities: forge::ForgeCapabilities {
+                    approve: true,
+                    ..forge::ForgeCapabilities::default()
+                },
+            }),
+        );
+        app.selected = 2;
+        app.apply_review(ReviewState::Approved);
+        app.selected = 3;
+
+        let AppEvent::ReviewWrite {
+            request,
+            state,
+            result,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected a review completion");
+        };
+        app.apply_review_write(request, state, result);
+
+        assert_eq!(
+            app.requests
+                .iter()
+                .find(|request| request.id == submitted_id)
+                .unwrap()
+                .review,
+            ReviewState::Approved
+        );
+        assert_eq!(app.requests[3].review, ReviewState::None);
+    }
+
+    #[tokio::test]
+    async fn detail_arrows_scroll_comments_without_changing_dashboard_selection() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.selected = 3;
+        let id = app.selected_request().unwrap().id.clone();
+
+        app.handle_key(KeyCode::Enter);
+        app.handle_key(KeyCode::Down);
+
+        assert_eq!(app.selected, 3);
+        assert_eq!(app.view, View::ChangeRequestDetail(id));
+        assert_eq!(app.comment_scroll, 1);
+    }
+
+    #[tokio::test]
+    async fn detail_request_is_stable_when_dashboard_selection_changes() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.selected_request().unwrap().id.clone();
+        app.handle_key(KeyCode::Enter);
+        app.selected = 1;
+
+        assert_eq!(app.detail_request().unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn detail_tab_cycles_panels_and_escape_preserves_selection() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.selected = 2;
+        app.handle_key(KeyCode::Enter);
+
+        assert_eq!(app.detail_focus, DetailFocus::Comments);
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.detail_focus, DetailFocus::Description);
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.detail_focus, DetailFocus::Reviewers);
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.detail_focus, DetailFocus::Description);
+        app.handle_key(KeyCode::Esc);
+
+        assert_eq!(app.view, View::Dashboard);
+        assert_eq!(app.selected, 2);
+    }
+
+    #[tokio::test]
+    async fn detail_comment_wheel_does_not_change_dashboard_selection() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.selected = 3;
+        app.handle_key(KeyCode::Enter);
+        app.set_regions(HitRegions {
+            comments: Rect::new(0, 10, 40, 10),
+            requests: Rect::new(0, 0, 80, 10),
+            ..HitRegions::default()
+        });
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.selected, 3);
+        assert_eq!(app.comment_scroll, 3);
     }
 }
 async fn refresh(config: Config, demo: bool, scope: Option<Scope>) -> RefreshResult {
