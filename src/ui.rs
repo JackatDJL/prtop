@@ -13,6 +13,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = Theme::detect();
     if matches!(app.view, View::ChangeRequestDetail(_)) {
         draw_full_detail(frame, app, theme);
+        if app.show_help {
+            help(frame);
+        }
+        if let Some(message) = &app.toast {
+            toast(frame, message, theme);
+        }
         if let Some(overlay) = &app.overlay {
             overlay_view(frame, overlay, theme);
         }
@@ -94,7 +100,7 @@ fn draw_full_detail(frame: &mut Frame, app: &mut App, theme: Theme) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-    let Some(pr) = app.selected_request() else {
+    let Some(pr) = app.active_request() else {
         frame.render_widget(
             Paragraph::new(
                 "Change request is no longer available.\n\nEsc returns to the dashboard.",
@@ -126,11 +132,15 @@ fn draw_full_detail(frame: &mut Frame, app: &mut App, theme: Theme) {
         outer[0],
     );
     let detail = outer[1];
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(detail);
     app.set_regions(HitRegions {
-        details: detail,
-        comments: detail,
-        ci: detail,
-        reviewers: detail,
+        details: outer[0],
+        comments: columns[0],
+        ci: columns[1],
+        reviewers: columns[1],
         ..HitRegions::default()
     });
     draw_detail(frame, detail, app, theme);
@@ -282,7 +292,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
-    let Some(pr) = app.selected_request() else {
+    let Some(pr) = app.active_request() else {
         frame.render_widget(
             Paragraph::new("No requests. Configure a forge or use --demo.")
                 .block(Block::default().borders(Borders::ALL).title(" detail ")),
@@ -344,7 +354,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
     )];
     if let Some(pipeline) = &pr.pipeline {
-        for job in &pipeline.jobs {
+        for job in pipeline.jobs.iter().skip(app.ci_scroll).take(10) {
             right.push(Line::from(format!(
                 "{} {:<24} {}",
                 job.status.glyph(),
