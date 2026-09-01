@@ -234,10 +234,19 @@ impl ForgeProvider for GitLabProvider {
     }
     async fn get_pipeline(&self, id: &PipelineId) -> Result<Pipeline, ForgeError> {
         let token = self.credential().await?;
-        let response = reqwest::Client::new()
+        let client = reqwest::Client::new();
+        let project =
+            url::form_urlencoded::byte_serialize(id.repository.as_bytes()).collect::<String>();
+        let response = client
+            .get(self.api(&format!("projects/{project}/pipelines/{}", id.value)))
+            .header("PRIVATE-TOKEN", &token)
+            .send()
+            .await
+            .map_err(network)?;
+        let row: PipelineRow = ensure(response).await?.json().await.map_err(network)?;
+        let response = client
             .get(self.api(&format!(
-                "projects/{}/pipelines/{}/jobs?per_page=100",
-                url::form_urlencoded::byte_serialize(id.repository.as_bytes()).collect::<String>(),
+                "projects/{project}/pipelines/{}/jobs?per_page=100",
                 id.value
             )))
             .header("PRIVATE-TOKEN", token)
@@ -261,20 +270,10 @@ impl ForgeProvider for GitLabProvider {
                 stages
             },
         );
-        Ok(Pipeline {
-            id: id.clone(),
-            name: format!("pipeline #{}", id.value),
-            ref_name: String::new(),
-            sha: String::new(),
-            status: PipelineStatus::Unknown,
-            created_at: Utc::now(),
-            started_at: None,
-            finished_at: None,
-            stages,
-            jobs,
-            url: None,
-            environment: None,
-        })
+        let mut pipeline = gitlab_pipeline(&id.forge, &id.repository, row);
+        pipeline.stages = stages;
+        pipeline.jobs = jobs;
+        Ok(pipeline)
     }
     async fn get_job_log(&self, id: &JobId, offset: usize) -> Result<LogChunk, ForgeError> {
         let token = self.credential().await?;
@@ -304,6 +303,20 @@ impl ForgeProvider for GitLabProvider {
                         .collect::<String>(),
                     id.value
                 )))
+            .header("PRIVATE-TOKEN", token)
+            .send()
+            .await
+            .map_err(network)?;
+        ensure(response).await.map(|_| ())
+    }
+    async fn retry_pipeline(&self, id: &PipelineId) -> Result<(), ForgeError> {
+        let token = self.credential().await?;
+        let response = reqwest::Client::new()
+            .post(self.api(&format!(
+                "projects/{}/pipelines/{}/retry",
+                url::form_urlencoded::byte_serialize(id.repository.as_bytes()).collect::<String>(),
+                id.value
+            )))
             .header("PRIVATE-TOKEN", token)
             .send()
             .await
@@ -404,11 +417,16 @@ struct PipelineRow {
     name: Option<String>,
     #[serde(default, rename = "ref")]
     ref_: Option<String>,
+    #[serde(default)]
     sha: String,
     status: String,
-    created_at: DateTime<Utc>,
+    #[serde(default)]
+    created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     web_url: Option<String>,
 }
 #[derive(Deserialize)]
@@ -429,7 +447,10 @@ fn gitlab_status(value: &str) -> PipelineStatus {
         "success" => PipelineStatus::Success,
         "failed" => PipelineStatus::Failed,
         "running" => PipelineStatus::Running,
-        "pending" | "created" | "preparing" => PipelineStatus::Pending,
+        "pending" | "created" | "preparing" | "scheduled" | "waiting_for_callback" => {
+            PipelineStatus::Pending
+        }
+        "canceling" => PipelineStatus::Running,
         "canceled" => PipelineStatus::Cancelled,
         "skipped" => PipelineStatus::Skipped,
         "manual" => PipelineStatus::Manual,
@@ -449,7 +470,7 @@ fn gitlab_pipeline(forge: &str, repo: &str, row: PipelineRow) -> Pipeline {
         ref_name: row.ref_.unwrap_or_default(),
         sha: row.sha,
         status: gitlab_status(&row.status),
-        created_at: row.created_at,
+        created_at: row.created_at.unwrap_or_else(Utc::now),
         started_at: row.started_at,
         finished_at: row.finished_at,
         stages: vec![],
@@ -523,5 +544,25 @@ mod tests {
     fn normalizes_note_write_response() {
         let row: Note = serde_json::from_str(r#"{"id":7,"body":"done","author":{"username":"jack"},"created_at":"2026-08-29T12:00:00Z","updated_at":null,"web_url":null}"#).unwrap();
         assert_eq!(row.into_comment().id, "7");
+    }
+
+    #[test]
+    fn merge_request_pipeline_rows_allow_absent_detail_timestamps() {
+        let row: PipelineRow =
+            serde_json::from_str(r#"{"id":7,"sha":"abc","status":"running","ref":"feature"}"#)
+                .unwrap();
+        let pipeline = gitlab_pipeline("work", "team/repo", row);
+        assert_eq!(pipeline.status, PipelineStatus::Running);
+        assert!(pipeline.started_at.is_none());
+    }
+
+    #[test]
+    fn maps_active_gitlab_job_statuses() {
+        assert_eq!(gitlab_status("scheduled"), PipelineStatus::Pending);
+        assert_eq!(gitlab_status("canceling"), PipelineStatus::Running);
+        assert_eq!(
+            gitlab_status("waiting_for_callback"),
+            PipelineStatus::Pending
+        );
     }
 }

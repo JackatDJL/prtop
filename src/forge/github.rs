@@ -261,22 +261,38 @@ impl ForgeProvider for GitHubProvider {
         Ok(runs
             .workflow_runs
             .into_iter()
+            .filter(|run| {
+                run.pull_requests
+                    .iter()
+                    .any(|pull| pull.number == id.number)
+            })
             .map(|run| github_pipeline(&self.name, &id.repository, run))
             .collect())
     }
     async fn get_pipeline(&self, id: &PipelineId) -> Result<Pipeline, ForgeError> {
         let token = self.credential().await?;
-        let response = reqwest::Client::new()
-            .get(self.api(&format!(
-                "repos/{}/actions/runs/{}/jobs?per_page=100",
-                id.repository, id.value
-            )))
-            .header("Authorization", format!("Bearer {token}"))
-            .header("User-Agent", "prtop")
-            .send()
-            .await
-            .map_err(network)?;
-        let jobs: WorkflowJobs = ensure(response).await?.json().await.map_err(network)?;
+        let client = reqwest::Client::new();
+        let mut page = 1;
+        let mut all_jobs = vec![];
+        loop {
+            let response = client
+                .get(self.api(&format!(
+                    "repos/{}/actions/runs/{}/jobs?per_page=100&page={page}",
+                    id.repository, id.value
+                )))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", "prtop")
+                .send()
+                .await
+                .map_err(network)?;
+            let jobs: WorkflowJobs = ensure(response).await?.json().await.map_err(network)?;
+            let count = jobs.jobs.len();
+            all_jobs.extend(jobs.jobs);
+            if count < 100 {
+                break;
+            }
+            page += 1;
+        }
         Ok(Pipeline {
             id: id.clone(),
             name: format!("workflow #{}", id.value),
@@ -287,8 +303,7 @@ impl ForgeProvider for GitHubProvider {
             started_at: None,
             finished_at: None,
             stages: vec![],
-            jobs: jobs
-                .jobs
+            jobs: all_jobs
                 .into_iter()
                 .map(|job| github_job(id, job))
                 .collect(),
@@ -411,6 +426,12 @@ struct WorkflowRun {
     run_started_at: Option<DateTime<Utc>>,
     updated_at: DateTime<Utc>,
     html_url: Option<String>,
+    #[serde(default)]
+    pull_requests: Vec<AssociatedPull>,
+}
+#[derive(Deserialize)]
+struct AssociatedPull {
+    number: u64,
 }
 #[derive(Deserialize)]
 struct WorkflowJobs {
@@ -445,15 +466,16 @@ fn github_pipeline(forge: &str, repo: &str, row: WorkflowRun) -> Pipeline {
         repository: repo.into(),
         value: row.id.to_string(),
     };
+    let status = github_status(row.status.as_deref(), row.conclusion.as_deref());
     Pipeline {
         id,
         name: row.name.unwrap_or_else(|| "workflow".into()),
         ref_name: row.head_branch.unwrap_or_default(),
         sha: row.head_sha,
-        status: github_status(row.status.as_deref(), row.conclusion.as_deref()),
+        status,
         created_at: row.created_at,
         started_at: row.run_started_at,
-        finished_at: Some(row.updated_at),
+        finished_at: (!status.is_active()).then_some(row.updated_at),
         stages: vec![],
         jobs: vec![],
         url: row.html_url,
@@ -511,5 +533,27 @@ mod tests {
     fn normalizes_comment_write_response() {
         let row: IssueComment = serde_json::from_str(r#"{"id":7,"body":"done","user":{"login":"jack"},"created_at":"2026-08-29T12:00:00Z","updated_at":"2026-08-29T12:01:00Z","html_url":"https://example.test/comment/7"}"#).unwrap();
         assert_eq!(row.into_comment().id, "7");
+    }
+
+    #[test]
+    fn keeps_only_workflow_runs_for_the_requested_pull() {
+        let runs: WorkflowRuns = serde_json::from_str(r#"{"workflow_runs":[{"id":1,"name":"one","head_sha":"a","status":"completed","conclusion":"success","created_at":"2026-08-29T12:00:00Z","updated_at":"2026-08-29T12:01:00Z","pull_requests":[{"number":4}]},{"id":2,"name":"two","head_sha":"b","status":"completed","conclusion":"failure","created_at":"2026-08-29T12:00:00Z","updated_at":"2026-08-29T12:01:00Z","pull_requests":[{"number":5}]}]}"#).unwrap();
+        assert_eq!(
+            runs.workflow_runs
+                .into_iter()
+                .filter(|run| run.pull_requests.iter().any(|pull| pull.number == 4))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn active_workflow_has_no_finished_time() {
+        let run: WorkflowRun = serde_json::from_str(r#"{"id":1,"head_sha":"a","status":"in_progress","created_at":"2026-08-29T12:00:00Z","updated_at":"2026-08-29T12:01:00Z"}"#).unwrap();
+        assert!(
+            github_pipeline("github", "jack/prtop", run)
+                .finished_at
+                .is_none()
+        );
     }
 }

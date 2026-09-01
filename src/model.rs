@@ -28,7 +28,7 @@ impl ChangeRequestKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ChangeRequest {
     pub id: ChangeRequestId,
     pub kind: ChangeRequestKind,
@@ -47,8 +47,115 @@ pub struct ChangeRequest {
     pub reviewers: Vec<Reviewer>,
     /// Pipelines are kept separately from the compact dashboard CI summary. A change request
     /// may legitimately have several workflow runs for the same head SHA.
-    #[serde(default)]
     pub pipelines: Vec<Pipeline>,
+}
+#[derive(Deserialize)]
+struct ChangeRequestWire {
+    id: ChangeRequestId,
+    kind: ChangeRequestKind,
+    title: String,
+    author: Person,
+    source_branch: String,
+    target_branch: String,
+    draft: bool,
+    mergeability: Mergeability,
+    review: ReviewState,
+    ci: CiState,
+    updated_at: DateTime<Utc>,
+    additions: u32,
+    deletions: u32,
+    comments: Vec<Comment>,
+    reviewers: Vec<Reviewer>,
+    #[serde(default)]
+    pipelines: Vec<Pipeline>,
+    #[serde(default)]
+    pipeline: Option<LegacyPipeline>,
+}
+impl<'de> Deserialize<'de> for ChangeRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ChangeRequestWire::deserialize(deserializer)?;
+        let pipelines = if wire.pipelines.is_empty() {
+            wire.pipeline
+                .map(|pipeline| legacy_pipeline(pipeline, &wire.id))
+                .into_iter()
+                .collect()
+        } else {
+            wire.pipelines
+        };
+        Ok(Self {
+            id: wire.id,
+            kind: wire.kind,
+            title: wire.title,
+            author: wire.author,
+            source_branch: wire.source_branch,
+            target_branch: wire.target_branch,
+            draft: wire.draft,
+            mergeability: wire.mergeability,
+            review: wire.review,
+            ci: wire.ci,
+            updated_at: wire.updated_at,
+            additions: wire.additions,
+            deletions: wire.deletions,
+            comments: wire.comments,
+            reviewers: wire.reviewers,
+            pipelines,
+        })
+    }
+}
+#[derive(Deserialize)]
+struct LegacyPipeline {
+    number: u64,
+    status: CiState,
+    #[serde(default)]
+    jobs: Vec<LegacyJob>,
+}
+#[derive(Deserialize)]
+struct LegacyJob {
+    name: String,
+    status: CiState,
+    duration_seconds: Option<u64>,
+}
+fn legacy_pipeline(legacy: LegacyPipeline, request: &ChangeRequestId) -> Pipeline {
+    let id = PipelineId {
+        forge: request.forge.clone(),
+        repository: request.repository.clone(),
+        value: legacy.number.to_string(),
+    };
+    Pipeline {
+        id: id.clone(),
+        name: format!("pipeline #{}", legacy.number),
+        ref_name: String::new(),
+        sha: String::new(),
+        status: legacy.status.into(),
+        created_at: Utc::now(),
+        started_at: None,
+        finished_at: None,
+        stages: vec![],
+        jobs: legacy
+            .jobs
+            .into_iter()
+            .enumerate()
+            .map(|(index, job)| Job {
+                id: JobId {
+                    pipeline: id.clone(),
+                    value: (index + 1).to_string(),
+                },
+                name: job.name,
+                stage: None,
+                status: job.status.into(),
+                started_at: None,
+                finished_at: None,
+                duration_seconds: job.duration_seconds,
+                runner: None,
+                attempt: 1,
+                allow_failure: false,
+                url: None,
+                environment: None,
+            })
+            .collect(),
+        url: None,
+        environment: None,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -270,6 +377,28 @@ impl CiState {
             Self::Running => "●",
             Self::Pending => "…",
             Self::None => "·",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn migrates_a_cached_singular_pipeline() {
+        let request: ChangeRequest = serde_json::from_str(r#"{"id":{"forge":"github","repository":"jack/prtop","number":1},"kind":"PullRequest","title":"x","author":{"login":"jack","name":null},"source_branch":"x","target_branch":"main","draft":false,"mergeability":"Mergeable","review":"None","ci":"Passed","updated_at":"2026-08-29T12:00:00Z","additions":0,"deletions":0,"comments":[],"reviewers":[],"pipeline":{"number":9,"status":"Passed","jobs":[{"name":"test","status":"Passed","duration_seconds":3}]}}"#).unwrap();
+        assert_eq!(request.pipelines.len(), 1);
+        assert_eq!(request.pipelines[0].jobs[0].name, "test");
+    }
+}
+impl From<CiState> for PipelineStatus {
+    fn from(value: CiState) -> Self {
+        match value {
+            CiState::Passed => Self::Success,
+            CiState::Failed => Self::Failed,
+            CiState::Running => Self::Running,
+            CiState::Pending => Self::Pending,
+            CiState::None => Self::Unknown,
         }
     }
 }

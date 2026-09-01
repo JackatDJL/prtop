@@ -58,6 +58,10 @@ pub enum AppEvent {
         id: PipelineId,
         pipeline: Box<Result<Pipeline, forge::ForgeError>>,
     },
+    CiActionCompleted {
+        action: CiAction,
+        result: Result<(), forge::ForgeError>,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -352,7 +356,7 @@ impl App {
                 },
                 Overlay::ConfirmCi { action } => match key {
                     KeyCode::Enter | KeyCode::Esc => {}
-                    KeyCode::Char('y') => self.apply_ci_action(action),
+                    KeyCode::Char('y') => self.start_ci_action(action),
                     _ => self.overlay = Some(Overlay::ConfirmCi { action }),
                 },
             }
@@ -564,7 +568,7 @@ impl App {
                     self.open_job(job);
                 }
             }
-            KeyCode::Char('r') => self.toast = Some("Pipeline refresh requested".into()),
+            KeyCode::Char('r') => self.load_pipeline(),
             KeyCode::Char('R') => {
                 self.overlay = Some(Overlay::ConfirmCi {
                     action: CiAction::RetryPipeline(id.clone()),
@@ -675,7 +679,7 @@ impl App {
             self.log_scroll = lines.len().saturating_sub(index + 1);
         }
     }
-    fn apply_ci_action(&mut self, action: CiAction) {
+    fn start_ci_action(&mut self, action: CiAction) {
         if !self.demo {
             let forge = match &action {
                 CiAction::RetryJob(id) | CiAction::CancelJob(id) | CiAction::PlayJob(id) => {
@@ -694,18 +698,22 @@ impl App {
                 CiAction::CancelPipeline(_) => "Cancel pipeline",
                 CiAction::PlayJob(_) => "Start manual job",
             };
+            let completed_action = action.clone();
+            let sender = self.events.clone();
             tokio::spawn(async move {
-                let _ = match action {
+                let result = match action {
                     CiAction::RetryJob(id) => provider.retry_job(&id).await,
                     CiAction::RetryPipeline(id) => provider.retry_pipeline(&id).await,
                     CiAction::CancelJob(id) => provider.cancel_job(&id).await,
                     CiAction::CancelPipeline(id) => provider.cancel_pipeline(&id).await,
                     CiAction::PlayJob(id) => provider.play_job(&id).await,
                 };
+                let _ = sender.send(AppEvent::CiActionCompleted {
+                    action: completed_action,
+                    result,
+                });
             });
-            self.toast = Some(format!(
-                "{description} sent. Refreshing this pipeline will reconcile its state."
-            ));
+            self.toast = Some(format!("{description} in progress"));
             return;
         }
         match action {
@@ -987,7 +995,10 @@ impl App {
             return;
         }
         if matches!(self.view, View::PipelineDetail(_)) {
-            if matches!(event.kind, MouseEventKind::Down(_)) && point(self.regions.jobs) {
+            if matches!(event.kind, MouseEventKind::Down(_))
+                && point(self.regions.jobs)
+                && event.row > self.regions.jobs.y
+            {
                 let row = event.row.saturating_sub(self.regions.jobs.y + 1) as usize;
                 let pipeline = self.pipeline_for_view();
                 if row < pipeline.map_or(0, |pipeline| pipeline.jobs.len()) {
@@ -1209,6 +1220,15 @@ impl App {
             Err(error) => self.toast = Some(format!("Pipeline refresh failed: {error}")),
         }
     }
+    pub fn apply_ci_action(&mut self, _action: CiAction, result: Result<(), forge::ForgeError>) {
+        match result {
+            Ok(()) => {
+                self.toast = Some("CI action completed. Refreshing pipeline.".into());
+                self.load_pipeline();
+            }
+            Err(error) => self.toast = Some(format!("CI action failed: {error}")),
+        }
+    }
 }
 
 fn demo_log(id: &JobId) -> Vec<String> {
@@ -1399,6 +1419,46 @@ mod tests {
         assert!(matches!(app.overlay, Some(Overlay::ConfirmCi { .. })));
         app.handle_key(KeyCode::Enter);
         assert!(app.overlay.is_none());
+    }
+
+    #[tokio::test]
+    async fn ci_action_error_is_shown_to_the_user() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.requests[0].pipelines[0].id.clone();
+        app.apply_ci_action(
+            CiAction::RetryPipeline(id),
+            Err(forge::ForgeError::PermissionDenied),
+        );
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("CI action failed: permission denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_pipeline_border_does_not_select_a_job() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.open_selected();
+        app.detail_focus = DetailFocus::Ci;
+        app.handle_key(KeyCode::Enter);
+        app.job_selected = 1;
+        app.set_regions(HitRegions {
+            jobs: Rect::new(0, 10, 80, 10),
+            ..HitRegions::default()
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.job_selected, 1);
     }
 
     #[tokio::test]
