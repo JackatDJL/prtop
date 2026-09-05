@@ -1,5 +1,7 @@
 //! Local Git jobs. Commands inherit the user's Git configuration and never run on the UI task.
 
+pub mod repo;
+
 use std::{
     path::{Path, PathBuf},
     time::Duration,

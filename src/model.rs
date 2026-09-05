@@ -28,6 +28,56 @@ impl ChangeRequestKind {
     }
 }
 
+/// Normalized lifecycle state. Open requests come from the dashboard listing; closed and
+/// merged states are reached through provider writes and targeted reconciliation.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub enum RequestState {
+    #[default]
+    Open,
+    Closed,
+    Merged,
+}
+impl RequestState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+        }
+    }
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Open => "",
+            Self::Closed => "✗",
+            Self::Merged => "✓",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct Label {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+impl Label {
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            color: None,
+        }
+    }
+}
+
+/// A provider-reported merge queue membership. Never synthesized by prtop.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MergeQueue {
+    #[serde(default)]
+    pub position: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ChangeRequest {
     pub id: ChangeRequestId,
@@ -48,6 +98,31 @@ pub struct ChangeRequest {
     /// Pipelines are kept separately from the compact dashboard CI summary. A change request
     /// may legitimately have several workflow runs for the same head SHA.
     pub pipelines: Vec<Pipeline>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub state: RequestState,
+    #[serde(default)]
+    pub labels: Vec<Label>,
+    #[serde(default)]
+    pub assignees: Vec<Person>,
+    #[serde(default)]
+    pub milestone: Option<String>,
+    #[serde(default)]
+    pub web_url: Option<String>,
+    #[serde(default)]
+    pub auto_merge: bool,
+    /// Provider's own merge-policy vocabulary (GitHub `mergeable_state`, GitLab
+    /// `detailed_merge_status`). Policy and technical mergeability deliberately stay separate.
+    #[serde(default)]
+    pub mergeable_state: Option<String>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    #[serde(default)]
+    pub merged_sha: Option<String>,
+    /// Present only when a provider actually reports queue membership. prtop never invents one.
+    #[serde(default)]
+    pub merge_queue: Option<MergeQueue>,
 }
 #[derive(Deserialize)]
 struct ChangeRequestWire {
@@ -70,6 +145,28 @@ struct ChangeRequestWire {
     pipelines: Vec<Pipeline>,
     #[serde(default)]
     pipeline: Option<LegacyPipeline>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    state: RequestState,
+    #[serde(default)]
+    labels: Vec<Label>,
+    #[serde(default)]
+    assignees: Vec<Person>,
+    #[serde(default)]
+    milestone: Option<String>,
+    #[serde(default)]
+    web_url: Option<String>,
+    #[serde(default)]
+    auto_merge: bool,
+    #[serde(default)]
+    mergeable_state: Option<String>,
+    #[serde(default)]
+    head_sha: Option<String>,
+    #[serde(default)]
+    merged_sha: Option<String>,
+    #[serde(default)]
+    merge_queue: Option<MergeQueue>,
 }
 impl<'de> Deserialize<'de> for ChangeRequest {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -99,6 +196,17 @@ impl<'de> Deserialize<'de> for ChangeRequest {
             comments: wire.comments,
             reviewers: wire.reviewers,
             pipelines,
+            body: wire.body,
+            state: wire.state,
+            labels: wire.labels,
+            assignees: wire.assignees,
+            milestone: wire.milestone,
+            web_url: wire.web_url,
+            auto_merge: wire.auto_merge,
+            mergeable_state: wire.mergeable_state,
+            head_sha: wire.head_sha,
+            merged_sha: wire.merged_sha,
+            merge_queue: wire.merge_queue,
         })
     }
 }
@@ -162,6 +270,28 @@ fn legacy_pipeline(legacy: LegacyPipeline, request: &ChangeRequestId) -> Pipelin
 pub struct Person {
     pub login: String,
     pub name: Option<String>,
+    /// Provider-native user id. GitLab needs it because its reviewer/assignee writes take ids.
+    #[serde(default)]
+    pub id: Option<u64>,
+}
+impl Person {
+    pub fn named(login: impl Into<String>) -> Self {
+        Self {
+            login: login.into(),
+            name: None,
+            id: None,
+        }
+    }
+    pub fn with_id(login: impl Into<String>, id: u64) -> Self {
+        Self {
+            login: login.into(),
+            name: None,
+            id: Some(id),
+        }
+    }
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.login)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Comment {
@@ -286,10 +416,40 @@ impl Mergeability {
         }
     }
 }
+
+/// Normalized merge strategies. Providers advertise which ones they accept; the UI never
+/// renders an unsupported strategy.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum MergeStrategy {
+    MergeCommit,
+    Squash,
+    Rebase,
+}
+impl MergeStrategy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MergeCommit => "Merge commit",
+            Self::Squash => "Squash",
+            Self::Rebase => "Rebase",
+        }
+    }
+    pub fn api_name(self) -> &'static str {
+        match self {
+            Self::MergeCommit => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MergeOutcome {
+    pub sha: Option<String>,
+    pub message: Option<String>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pipeline {
-    pub id: PipelineId,
-    pub name: String,
+    pub id: PipelineId,    pub name: String,
     pub ref_name: String,
     pub sha: String,
     pub status: PipelineStatus,

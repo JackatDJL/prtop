@@ -876,6 +876,7 @@ impl App {
                 author: Person {
                     login: "jack".into(),
                     name: Some("Jack".into()),
+                    id: None,
                 },
                 body: body.clone(),
                 created_at: Utc::now(),
