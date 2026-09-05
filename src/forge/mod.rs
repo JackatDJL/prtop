@@ -4,8 +4,8 @@ pub mod github;
 pub mod gitlab;
 
 use crate::model::{
-    ChangeRequest, ChangeRequestId, ChangeRequestKind, CiState, Comment, Mergeability, Person,
-    Pipeline, ReviewState, Reviewer,
+    ChangeRequest, ChangeRequestId, ChangeRequestKind, CiState, Comment, JobId, LogChunk,
+    Mergeability, Person, Pipeline, PipelineId, ReviewState, Reviewer,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -30,6 +30,16 @@ pub enum ForgeError {
     Conflict,
     #[error("operation is not implemented by this provider yet")]
     Unsupported,
+    #[error("job cannot be retried")]
+    JobNotRetryable,
+    #[error("pipeline cannot be cancelled")]
+    PipelineNotCancelable,
+    #[error("logs are unavailable")]
+    LogsUnavailable,
+    #[error("pipeline has expired")]
+    PipelineExpired,
+    #[error("artifact has expired")]
+    ArtifactExpired,
 }
 
 #[allow(dead_code)] // Constructed once app write dispatch routes through the provider registry.
@@ -49,6 +59,14 @@ pub struct ForgeCapabilities {
     pub request_reviewers: bool,
     pub edit_comments: bool,
     pub delete_comments: bool,
+    pub ci_read: bool,
+    pub ci_logs: bool,
+    pub ci_retry_job: bool,
+    pub ci_retry_pipeline: bool,
+    pub ci_cancel_job: bool,
+    pub ci_cancel_pipeline: bool,
+    pub ci_play_manual: bool,
+    pub ci_artifacts: bool,
 }
 
 #[allow(dead_code)] // Providers implement these methods as their milestone reaches the UI.
@@ -72,7 +90,28 @@ pub trait ForgeProvider: Send + Sync {
     async fn list_reviews(&self, _id: &ChangeRequestId) -> Result<Vec<Reviewer>, ForgeError> {
         Err(ForgeError::Unsupported)
     }
-    async fn get_pipeline(&self, _id: &ChangeRequestId) -> Result<Option<Pipeline>, ForgeError> {
+    async fn list_pipelines(&self, _id: &ChangeRequestId) -> Result<Vec<Pipeline>, ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
+    async fn get_pipeline(&self, _id: &PipelineId) -> Result<Pipeline, ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
+    async fn get_job_log(&self, _id: &JobId, _offset: usize) -> Result<LogChunk, ForgeError> {
+        Err(ForgeError::LogsUnavailable)
+    }
+    async fn retry_job(&self, _id: &JobId) -> Result<(), ForgeError> {
+        Err(ForgeError::JobNotRetryable)
+    }
+    async fn retry_pipeline(&self, _id: &PipelineId) -> Result<(), ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
+    async fn cancel_job(&self, _id: &JobId) -> Result<(), ForgeError> {
+        Err(ForgeError::PipelineNotCancelable)
+    }
+    async fn cancel_pipeline(&self, _id: &PipelineId) -> Result<(), ForgeError> {
+        Err(ForgeError::PipelineNotCancelable)
+    }
+    async fn play_job(&self, _id: &JobId) -> Result<(), ForgeError> {
         Err(ForgeError::Unsupported)
     }
     async fn submit_review(&self, _id: &ChangeRequestId) -> Result<(), ForgeError> {
@@ -166,7 +205,7 @@ pub(crate) fn normalized_request(
         deletions: 0,
         comments: vec![],
         reviewers: vec![],
-        pipeline: None,
+        pipelines: vec![],
     }
 }
 pub mod auth;

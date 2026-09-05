@@ -227,6 +227,10 @@ async fn run(
                 AppEvent::Refresh(result) => app.apply_refresh(result),
                 AppEvent::CommentWrite { temporary_id, result } => app.apply_comment_write(temporary_id, result),
                 AppEvent::ReviewWrite { request, state, result } => app.apply_review_write(request, state, result),
+                AppEvent::LogLoaded { job, chunk } => app.apply_log_chunk(job, chunk),
+                AppEvent::PipelinesLoaded { request, pipelines } => app.apply_pipelines(request, pipelines),
+                AppEvent::PipelineLoaded { id, pipeline } => app.apply_pipeline(id, *pipeline),
+                AppEvent::CiActionCompleted { action, result } => app.apply_ci_action(action, result),
             }
         }
     }

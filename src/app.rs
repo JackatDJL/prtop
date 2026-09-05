@@ -12,13 +12,21 @@ use std::collections::HashMap;
 use std::{sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
-pub const PALETTE_COMMANDS: [&str; 6] = [
+pub const PALETTE_COMMANDS: [&str; 14] = [
     "Add comment",
     "Approve",
     "Request changes",
     "Refresh",
     "Request reviewer",
     "Open in browser",
+    "Open pipeline",
+    "Open job logs",
+    "Refresh pipeline",
+    "Retry failed job",
+    "Retry pipeline",
+    "Cancel job",
+    "Cancel pipeline",
+    "Follow logs",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +44,22 @@ pub enum AppEvent {
     ReviewWrite {
         request: ChangeRequestId,
         state: ReviewState,
+        result: Result<(), forge::ForgeError>,
+    },
+    LogLoaded {
+        job: JobId,
+        chunk: LogChunk,
+    },
+    PipelinesLoaded {
+        request: ChangeRequestId,
+        pipelines: Result<Vec<Pipeline>, forge::ForgeError>,
+    },
+    PipelineLoaded {
+        id: PipelineId,
+        pipeline: Box<Result<Pipeline, forge::ForgeError>>,
+    },
+    CiActionCompleted {
+        action: CiAction,
         result: Result<(), forge::ForgeError>,
     },
 }
@@ -79,6 +103,8 @@ impl DetailFocus {
 pub enum View {
     Dashboard,
     ChangeRequestDetail(ChangeRequestId),
+    PipelineDetail(PipelineId),
+    JobDetail(JobId),
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Overlay {
@@ -86,6 +112,15 @@ pub enum Overlay {
     ReviewMenu { selected: usize },
     Palette { query: String, selected: usize },
     ConfirmDelete,
+    ConfirmCi { action: CiAction },
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CiAction {
+    RetryJob(JobId),
+    RetryPipeline(PipelineId),
+    CancelJob(JobId),
+    CancelPipeline(PipelineId),
+    PlayJob(JobId),
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HitRegions {
@@ -96,6 +131,8 @@ pub struct HitRegions {
     pub ci: Rect,
     pub reviewers: Rect,
     pub metadata: Rect,
+    pub jobs: Rect,
+    pub logs: Rect,
 }
 pub struct RefreshResult {
     pub requests: Vec<ChangeRequest>,
@@ -116,6 +153,12 @@ pub struct App {
     pub detail_focus: DetailFocus,
     pub comment_scroll: usize,
     pub ci_scroll: usize,
+    pub job_selected: usize,
+    pub log_scroll: usize,
+    pub follow_logs: bool,
+    pub log_query: Option<String>,
+    pub log_searching: bool,
+    pub logs: HashMap<JobId, Vec<String>>,
     pub regions: HitRegions,
     pub toast: Option<String>,
     pub overlay: Option<Overlay>,
@@ -153,6 +196,12 @@ impl App {
             detail_focus: DetailFocus::Comments,
             comment_scroll: 0,
             ci_scroll: 0,
+            job_selected: 0,
+            log_scroll: 0,
+            follow_logs: true,
+            log_query: None,
+            log_searching: false,
+            logs: HashMap::new(),
             regions: HitRegions::default(),
             toast: None,
             overlay: None,
@@ -189,7 +238,39 @@ impl App {
         match self.view {
             View::Dashboard => self.selected_request(),
             View::ChangeRequestDetail(_) => self.detail_request(),
+            View::PipelineDetail(ref id) => self
+                .requests
+                .iter()
+                .find(|request| request.pipelines.iter().any(|pipeline| pipeline.id == *id)),
+            View::JobDetail(ref id) => self.requests.iter().find(|request| {
+                request
+                    .pipelines
+                    .iter()
+                    .any(|pipeline| pipeline.id == id.pipeline)
+            }),
         }
+    }
+    pub fn pipeline_for_view(&self) -> Option<&Pipeline> {
+        match &self.view {
+            View::PipelineDetail(id) => self.pipeline(id),
+            View::JobDetail(id) => self.pipeline(&id.pipeline),
+            _ => None,
+        }
+    }
+    pub fn pipeline(&self, id: &PipelineId) -> Option<&Pipeline> {
+        self.requests
+            .iter()
+            .flat_map(|request| &request.pipelines)
+            .find(|pipeline| pipeline.id == *id)
+    }
+    pub fn job_for_view(&self) -> Option<&Job> {
+        let View::JobDetail(id) = &self.view else {
+            return None;
+        };
+        self.pipeline(&id.pipeline)?
+            .jobs
+            .iter()
+            .find(|job| job.id == *id)
     }
     #[cfg(test)]
     pub fn handle_key(&mut self, key: KeyCode) -> bool {
@@ -273,6 +354,11 @@ impl App {
                     KeyCode::Esc | KeyCode::Enter => {}
                     _ => self.overlay = Some(Overlay::ConfirmDelete),
                 },
+                Overlay::ConfirmCi { action } => match key {
+                    KeyCode::Enter | KeyCode::Esc => {}
+                    KeyCode::Char('y') => self.start_ci_action(action),
+                    _ => self.overlay = Some(Overlay::ConfirmCi { action }),
+                },
             }
             return false;
         }
@@ -291,9 +377,24 @@ impl App {
             };
             return false;
         }
+        if self.log_searching {
+            match key {
+                KeyCode::Esc | KeyCode::Enter => self.log_searching = false,
+                KeyCode::Backspace => {
+                    if let Some(query) = &mut self.log_query {
+                        query.pop();
+                    }
+                }
+                KeyCode::Char(c) => self.log_query.get_or_insert_with(String::new).push(c),
+                _ => {}
+            }
+            return false;
+        }
         match self.view.clone() {
             View::Dashboard => self.handle_dashboard_key(key),
             View::ChangeRequestDetail(id) => self.handle_detail_key(&id, key),
+            View::PipelineDetail(id) => self.handle_pipeline_key(&id, key),
+            View::JobDetail(id) => self.handle_job_key(&id, key),
         }
     }
     fn handle_dashboard_key(&mut self, key: KeyCode) -> bool {
@@ -390,6 +491,7 @@ impl App {
                 self.focus = Focus::Requests;
                 self.filtering = false;
             }
+            KeyCode::Enter if self.detail_focus == DetailFocus::Ci => self.open_pipeline(),
             KeyCode::Tab => self.detail_focus = self.detail_focus.next(),
             KeyCode::BackTab => self.detail_focus = self.detail_focus.previous(),
             KeyCode::Char('j') | KeyCode::Down => self.scroll_detail(id, 1),
@@ -425,6 +527,239 @@ impl App {
         }
         false
     }
+    fn open_pipeline(&mut self) {
+        let selected = self
+            .detail_request()
+            .and_then(|request| request.pipelines.get(self.ci_scroll))
+            .map(|pipeline| pipeline.id.clone());
+        if let Some(id) = selected {
+            self.view = View::PipelineDetail(id);
+            self.job_selected = 0;
+            self.load_pipeline();
+        } else {
+            self.toast = Some("No pipeline reported".into());
+        }
+    }
+    fn handle_pipeline_key(&mut self, id: &PipelineId, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Esc | KeyCode::Char('h') => {
+                if let Some(request) = self.request_for_view().map(|request| request.id.clone()) {
+                    self.view = View::ChangeRequestDetail(request);
+                }
+            }
+            KeyCode::Char('q') => {
+                if let Some(request) = self.request_for_view().map(|request| request.id.clone()) {
+                    self.view = View::ChangeRequestDetail(request);
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = self.pipeline(id).map_or(0, |pipeline| pipeline.jobs.len());
+                self.job_selected = (self.job_selected + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.job_selected = self.job_selected.saturating_sub(1)
+            }
+            KeyCode::Enter => {
+                if let Some(job) = self
+                    .pipeline(id)
+                    .and_then(|pipeline| pipeline.jobs.get(self.job_selected))
+                    .map(|job| job.id.clone())
+                {
+                    self.open_job(job);
+                }
+            }
+            KeyCode::Char('r') => self.load_pipeline(),
+            KeyCode::Char('R') => {
+                self.overlay = Some(Overlay::ConfirmCi {
+                    action: CiAction::RetryPipeline(id.clone()),
+                })
+            }
+            KeyCode::Char('x') => {
+                self.overlay = Some(Overlay::ConfirmCi {
+                    action: CiAction::CancelPipeline(id.clone()),
+                })
+            }
+            KeyCode::Char('p') => {
+                if let Some(job) = self
+                    .pipeline(id)
+                    .and_then(|pipeline| pipeline.jobs.get(self.job_selected))
+                    .filter(|job| job.status == PipelineStatus::Manual)
+                    .map(|job| job.id.clone())
+                {
+                    self.overlay = Some(Overlay::ConfirmCi {
+                        action: CiAction::PlayJob(job),
+                    });
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+    fn open_job(&mut self, id: JobId) {
+        self.view = View::JobDetail(id.clone());
+        self.log_scroll = 0;
+        self.follow_logs = true;
+        if self.demo {
+            self.logs.entry(id.clone()).or_insert_with(|| demo_log(&id));
+            return;
+        }
+        let Some(provider) = self.providers.get(&id.pipeline.forge).cloned() else {
+            self.toast = Some("No provider is configured for this job".into());
+            return;
+        };
+        let sender = self.events.clone();
+        let job = id.clone();
+        tokio::spawn(async move {
+            if let Ok(chunk) = provider.get_job_log(&job, 0).await {
+                let _ = sender.send(AppEvent::LogLoaded { job, chunk });
+            }
+        });
+    }
+    fn handle_job_key(&mut self, id: &JobId, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q') => {
+                self.view = View::PipelineDetail(id.pipeline.clone())
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.log_scroll = self.log_scroll.saturating_add(1);
+                self.follow_logs = false;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+                self.follow_logs = false;
+            }
+            KeyCode::PageDown => {
+                self.log_scroll = self.log_scroll.saturating_add(15);
+                self.follow_logs = false;
+            }
+            KeyCode::PageUp => {
+                self.log_scroll = self.log_scroll.saturating_sub(15);
+                self.follow_logs = false;
+            }
+            KeyCode::Char('f') => {
+                self.follow_logs = !self.follow_logs;
+                if self.follow_logs {
+                    self.log_scroll = 0;
+                }
+            }
+            KeyCode::Char('/') => {
+                self.log_searching = true;
+                self.log_query = Some(String::new());
+            }
+            KeyCode::Char('n') => self.find_log(id, false),
+            KeyCode::Char('N') => self.find_log(id, true),
+            KeyCode::Char('R') => {
+                self.overlay = Some(Overlay::ConfirmCi {
+                    action: CiAction::RetryJob(id.clone()),
+                })
+            }
+            KeyCode::Char('x') => {
+                self.overlay = Some(Overlay::ConfirmCi {
+                    action: CiAction::CancelJob(id.clone()),
+                })
+            }
+            _ => {}
+        }
+        false
+    }
+    fn find_log(&mut self, id: &JobId, previous: bool) {
+        let Some(query) = self.log_query.as_deref().filter(|query| !query.is_empty()) else {
+            return;
+        };
+        let lines = self.logs.get(id).cloned().unwrap_or_default();
+        let start = self.log_scroll.min(lines.len());
+        let mut indexes: Box<dyn Iterator<Item = usize>> = if previous {
+            Box::new((0..start).rev())
+        } else {
+            Box::new(start.saturating_add(1)..lines.len())
+        };
+        if let Some(index) =
+            indexes.find(|index| lines[*index].to_lowercase().contains(&query.to_lowercase()))
+        {
+            self.log_scroll = lines.len().saturating_sub(index + 1);
+        }
+    }
+    fn start_ci_action(&mut self, action: CiAction) {
+        if !self.demo {
+            let forge = match &action {
+                CiAction::RetryJob(id) | CiAction::CancelJob(id) | CiAction::PlayJob(id) => {
+                    &id.pipeline.forge
+                }
+                CiAction::RetryPipeline(id) | CiAction::CancelPipeline(id) => &id.forge,
+            };
+            let Some(provider) = self.providers.get(forge).cloned() else {
+                self.toast = Some("No provider is configured for this CI action".into());
+                return;
+            };
+            let description = match action {
+                CiAction::RetryJob(_) => "Retry job",
+                CiAction::RetryPipeline(_) => "Retry pipeline",
+                CiAction::CancelJob(_) => "Cancel job",
+                CiAction::CancelPipeline(_) => "Cancel pipeline",
+                CiAction::PlayJob(_) => "Start manual job",
+            };
+            let completed_action = action.clone();
+            let sender = self.events.clone();
+            tokio::spawn(async move {
+                let result = match action {
+                    CiAction::RetryJob(id) => provider.retry_job(&id).await,
+                    CiAction::RetryPipeline(id) => provider.retry_pipeline(&id).await,
+                    CiAction::CancelJob(id) => provider.cancel_job(&id).await,
+                    CiAction::CancelPipeline(id) => provider.cancel_pipeline(&id).await,
+                    CiAction::PlayJob(id) => provider.play_job(&id).await,
+                };
+                let _ = sender.send(AppEvent::CiActionCompleted {
+                    action: completed_action,
+                    result,
+                });
+            });
+            self.toast = Some(format!("{description} in progress"));
+            return;
+        }
+        match action {
+            CiAction::RetryJob(id) => {
+                self.toast = Some("Retry job requested".into());
+                self.set_job_status(&id, PipelineStatus::Running);
+            }
+            CiAction::RetryPipeline(id) => {
+                self.toast = Some("Retry pipeline requested".into());
+                self.set_pipeline_status(&id, PipelineStatus::Running);
+            }
+            CiAction::CancelJob(id) => {
+                self.toast = Some("Cancel job requested".into());
+                self.set_job_status(&id, PipelineStatus::Cancelled);
+            }
+            CiAction::CancelPipeline(id) => {
+                self.toast = Some("Cancel pipeline requested".into());
+                self.set_pipeline_status(&id, PipelineStatus::Cancelled);
+            }
+            CiAction::PlayJob(id) => {
+                self.toast = Some("Manual job started".into());
+                self.set_job_status(&id, PipelineStatus::Running);
+            }
+        }
+    }
+    fn set_pipeline_status(&mut self, id: &PipelineId, status: PipelineStatus) {
+        if let Some(pipeline) = self
+            .requests
+            .iter_mut()
+            .flat_map(|request| &mut request.pipelines)
+            .find(|pipeline| pipeline.id == *id)
+        {
+            pipeline.status = status;
+        }
+    }
+    fn set_job_status(&mut self, id: &JobId, status: PipelineStatus) {
+        if let Some(job) = self
+            .requests
+            .iter_mut()
+            .flat_map(|request| &mut request.pipelines)
+            .find(|pipeline| pipeline.id == id.pipeline)
+            .and_then(|pipeline| pipeline.jobs.iter_mut().find(|job| job.id == *id))
+        {
+            job.status = status;
+        }
+    }
     fn scroll_detail(&mut self, id: &ChangeRequestId, delta: isize) {
         match self.detail_focus {
             DetailFocus::Comments => {
@@ -440,8 +775,7 @@ impl App {
                     .requests
                     .iter()
                     .find(|request| request.id == *id)
-                    .and_then(|request| request.pipeline.as_ref())
-                    .map_or(0, |pipeline| pipeline.jobs.len().saturating_sub(8));
+                    .map_or(0, |request| request.pipelines.len().saturating_sub(8));
                 self.ci_scroll = self.ci_scroll.saturating_add_signed(delta).min(max);
             }
             DetailFocus::Description | DetailFocus::Reviewers | DetailFocus::Metadata => {}
@@ -461,8 +795,7 @@ impl App {
                     .requests
                     .iter()
                     .find(|request| request.id == *id)
-                    .and_then(|request| request.pipeline.as_ref())
-                    .map_or(0, |pipeline| pipeline.jobs.len().saturating_sub(8));
+                    .map_or(0, |request| request.pipelines.len().saturating_sub(8));
             }
             DetailFocus::Description | DetailFocus::Reviewers | DetailFocus::Metadata => {}
         }
@@ -475,13 +808,48 @@ impl App {
         }
     }
     fn open_selected(&mut self) {
-        if let Some(request) = self.selected_request() {
-            self.view = View::ChangeRequestDetail(request.id.clone());
+        if let Some(id) = self.selected_request().map(|request| request.id.clone()) {
+            self.view = View::ChangeRequestDetail(id.clone());
             self.filtering = false;
             self.detail_focus = DetailFocus::Comments;
             self.comment_scroll = 0;
             self.ci_scroll = 0;
+            if self.can(|capabilities| capabilities.ci_read) {
+                self.load_pipelines(id);
+            }
         }
+    }
+    fn load_pipelines(&self, request: ChangeRequestId) {
+        if self.demo {
+            return;
+        }
+        let Some(provider) = self.providers.get(&request.forge).cloned() else {
+            return;
+        };
+        let sender = self.events.clone();
+        tokio::spawn(async move {
+            let pipelines = provider.list_pipelines(&request).await;
+            let _ = sender.send(AppEvent::PipelinesLoaded { request, pipelines });
+        });
+    }
+    fn load_pipeline(&self) {
+        if self.demo {
+            return;
+        }
+        let Some(id) = self.pipeline_for_view().map(|pipeline| pipeline.id.clone()) else {
+            return;
+        };
+        let Some(provider) = self.providers.get(&id.forge).cloned() else {
+            return;
+        };
+        let sender = self.events.clone();
+        tokio::spawn(async move {
+            let pipeline = provider.get_pipeline(&id).await;
+            let _ = sender.send(AppEvent::PipelineLoaded {
+                id,
+                pipeline: Box::new(pipeline),
+            });
+        });
     }
     fn can(&self, predicate: impl Fn(forge::ForgeCapabilities) -> bool) -> bool {
         self.demo
@@ -626,6 +994,44 @@ impl App {
             self.handle_detail_mouse(event, &point);
             return;
         }
+        if matches!(self.view, View::PipelineDetail(_)) {
+            if matches!(event.kind, MouseEventKind::Down(_))
+                && point(self.regions.jobs)
+                && event.row > self.regions.jobs.y
+            {
+                let row = event.row.saturating_sub(self.regions.jobs.y + 1) as usize;
+                let pipeline = self.pipeline_for_view();
+                if row < pipeline.map_or(0, |pipeline| pipeline.jobs.len()) {
+                    if row == self.job_selected {
+                        if let Some(id) = pipeline
+                            .and_then(|pipeline| pipeline.jobs.get(row))
+                            .map(|job| job.id.clone())
+                        {
+                            self.open_job(id);
+                        }
+                    } else {
+                        self.job_selected = row;
+                    }
+                }
+            }
+            return;
+        }
+        if matches!(self.view, View::JobDetail(_)) {
+            if point(self.regions.logs) {
+                match event.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.log_scroll = self.log_scroll.saturating_sub(3);
+                        self.follow_logs = false;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.log_scroll = self.log_scroll.saturating_add(3);
+                        self.follow_logs = false;
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         match event.kind {
             MouseEventKind::Down(_) if point(self.regions.requests) => {
                 self.focus = Focus::Requests;
@@ -762,6 +1168,83 @@ impl App {
             Err(error) => self.toast = Some(format!("Review failed: {error}")),
         }
     }
+    pub fn apply_log_chunk(&mut self, job: JobId, chunk: LogChunk) {
+        const MAX_LOG_LINES: usize = 30_000;
+        let lines = self.logs.entry(job).or_default();
+        lines.extend(chunk.text.lines().map(str::to_owned));
+        if lines.len() > MAX_LOG_LINES {
+            let removed = lines.len() - MAX_LOG_LINES;
+            lines.drain(..removed);
+            lines.insert(0, "[ older log lines omitted ]".into());
+        }
+        if self.follow_logs {
+            self.log_scroll = 0;
+        }
+    }
+    pub fn apply_pipelines(
+        &mut self,
+        request: ChangeRequestId,
+        result: Result<Vec<Pipeline>, forge::ForgeError>,
+    ) {
+        match result {
+            Ok(pipelines) => {
+                if let Some(item) = self.requests.iter_mut().find(|item| item.id == request) {
+                    item.ci = pipelines
+                        .iter()
+                        .map(|pipeline| pipeline.status.ci_state())
+                        .find(|status| *status == CiState::Failed || *status == CiState::Running)
+                        .unwrap_or_else(|| {
+                            pipelines
+                                .first()
+                                .map(|pipeline| pipeline.status.ci_state())
+                                .unwrap_or(CiState::None)
+                        });
+                    item.pipelines = pipelines;
+                }
+            }
+            Err(error) => self.toast = Some(format!("CI refresh failed: {error}")),
+        }
+    }
+    pub fn apply_pipeline(&mut self, id: PipelineId, result: Result<Pipeline, forge::ForgeError>) {
+        match result {
+            Ok(pipeline) => {
+                if let Some(current) = self
+                    .requests
+                    .iter_mut()
+                    .flat_map(|request| &mut request.pipelines)
+                    .find(|current| current.id == id)
+                {
+                    *current = pipeline;
+                }
+            }
+            Err(error) => self.toast = Some(format!("Pipeline refresh failed: {error}")),
+        }
+    }
+    pub fn apply_ci_action(&mut self, _action: CiAction, result: Result<(), forge::ForgeError>) {
+        match result {
+            Ok(()) => {
+                self.toast = Some("CI action completed. Refreshing pipeline.".into());
+                self.load_pipeline();
+            }
+            Err(error) => self.toast = Some(format!("CI action failed: {error}")),
+        }
+    }
+}
+
+fn demo_log(id: &JobId) -> Vec<String> {
+    let mut lines = vec![
+        format!("==> job {}", id.value),
+        "12:31:04 Running integration tests...".into(),
+        "12:31:07 PASS transfer_web".into(),
+    ];
+    if id.value.ends_with("-1") {
+        lines.push("12:31:12 FAIL transfer_mobile".into());
+        lines.push("assertion failed: expected connected".into());
+    }
+    lines.extend(
+        (0..250).map(|index| format!("12:32:{:02} test output line {}", index % 60, index + 1)),
+    );
+    lines
 }
 
 fn providers(config: &Config) -> HashMap<String, Arc<dyn ForgeProvider>> {
@@ -887,6 +1370,95 @@ mod tests {
 
         assert_eq!(app.comment_scroll, 0);
         assert_eq!(app.ci_scroll, 1);
+    }
+
+    #[tokio::test]
+    async fn ci_navigation_returns_one_level_at_a_time() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.open_selected();
+        app.detail_focus = DetailFocus::Ci;
+        app.handle_key(KeyCode::Enter);
+        assert!(matches!(app.view, View::PipelineDetail(_)));
+        app.handle_key(KeyCode::Enter);
+        assert!(matches!(app.view, View::JobDetail(_)));
+        app.handle_key(KeyCode::Esc);
+        assert!(matches!(app.view, View::PipelineDetail(_)));
+        app.handle_key(KeyCode::Esc);
+        assert!(matches!(app.view, View::ChangeRequestDetail(_)));
+    }
+
+    #[tokio::test]
+    async fn job_log_scroll_does_not_change_selected_job() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.open_selected();
+        app.detail_focus = DetailFocus::Ci;
+        app.handle_key(KeyCode::Enter);
+        app.handle_key(KeyCode::Enter);
+        app.handle_key(KeyCode::Down);
+        assert_eq!(app.job_selected, 0);
+        assert!(app.log_scroll > 0);
+        assert!(!app.follow_logs);
+    }
+
+    #[tokio::test]
+    async fn ci_confirmation_defaults_to_safe_cancel() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.open_selected();
+        app.detail_focus = DetailFocus::Ci;
+        app.handle_key(KeyCode::Enter);
+        app.handle_key(KeyCode::Char('x'));
+        assert!(matches!(app.overlay, Some(Overlay::ConfirmCi { .. })));
+        app.handle_key(KeyCode::Enter);
+        assert!(app.overlay.is_none());
+    }
+
+    #[tokio::test]
+    async fn ci_action_error_is_shown_to_the_user() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.requests[0].pipelines[0].id.clone();
+        app.apply_ci_action(
+            CiAction::RetryPipeline(id),
+            Err(forge::ForgeError::PermissionDenied),
+        );
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("CI action failed: permission denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_pipeline_border_does_not_select_a_job() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.open_selected();
+        app.detail_focus = DetailFocus::Ci;
+        app.handle_key(KeyCode::Enter);
+        app.job_selected = 1;
+        app.set_regions(HitRegions {
+            jobs: Rect::new(0, 10, 80, 10),
+            ..HitRegions::default()
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.job_selected, 1);
     }
 
     #[tokio::test]
