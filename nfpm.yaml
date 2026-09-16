@@ -1,0 +1,16 @@
+# nFPM consumes the binary emitted by dist. CI substitutes ${VERSION} from the release tag
+# and ${BINARY} from the target-specific dist artifact; no version is duplicated here.
+name: prtop
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: prtop contributors
+description: A multi-forge pull request and merge request terminal UI
+license: MIT OR Apache-2.0
+contents:
+  - src: ${BINARY}
+    dst: /usr/bin/prtop
+  - src: README.md
+    dst: /usr/share/doc/prtop/README.md

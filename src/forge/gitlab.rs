@@ -6,7 +6,7 @@ use crate::{
     },
     model::{
         ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Job, JobId, Label, LogChunk,
-        MergeQueue, Person, Pipeline, PipelineId, PipelineStage, PipelineStatus, RequestState,
+        Person, Pipeline, PipelineId, PipelineStage, PipelineStatus, RequestState,
         ReviewState, Reviewer,
     },
 };

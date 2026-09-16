@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: ["Cargo.toml", "Cargo.lock", "nfpm.yaml", ".github/workflows/release.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Validate release plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-dist
+        run: cargo install cargo-dist --locked
+      - name: Validate package metadata and release plan
+        run: cargo dist plan
+
+# Publishing intentionally remains disabled until the project selects its release host,
+# npm trusted-publishing setup, Homebrew tap repository/token, and package-repository host.
+# When enabled, use the generated cargo-dist release workflow rather than duplicate upload
+# or installer logic here.

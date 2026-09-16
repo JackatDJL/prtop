@@ -763,8 +763,9 @@ impl CreateWorkflow {
                         _ => {}
                     }
                 }
-                _ => {}
-            },
+                    _ => {}
+                }
+            }
         }
         false
     }

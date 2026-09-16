@@ -234,7 +234,7 @@ impl ForgeProvider for ForgejoProvider {
             .await
             .map_err(network)?;
         let row: Row = ensure(response).await?.json().await.map_err(network)?;
-        let mut created = normalize(&self.name, repository, row);
+        let created = normalize(&self.name, repository, row);
         // Best-effort metadata after creation; the targeted refresh reconciles provider truth.
         if !input.labels.is_empty() {
             if let Ok(ids) = self.label_ids(&token, repository, &input.labels).await {

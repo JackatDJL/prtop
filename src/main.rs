@@ -4,9 +4,11 @@ mod config;
 mod forge;
 mod git;
 mod model;
+mod picker;
 mod scope;
 mod ssh;
 mod ui;
+mod write;
 
 use std::{io, time::Duration};
 

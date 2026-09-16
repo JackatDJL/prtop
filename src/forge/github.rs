@@ -5,8 +5,8 @@ use crate::{
         RepositoryInfo, RequestPatch, ReviewAction, auth, normalized_request,
     },
     model::{
-        ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Job, JobId, Label, MergeQueue,
-        Person, Pipeline, PipelineId, PipelineStatus, RequestState, ReviewState, Reviewer,
+        ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Job, JobId, Label, Person,
+        Pipeline, PipelineId, PipelineStatus, RequestState,
     },
 };
 use async_trait::async_trait;
@@ -236,7 +236,7 @@ impl ForgeProvider for GitHubProvider {
             .await
             .map_err(network)?;
         let row: Row = ensure(response).await?.json().await.map_err(network)?;
-        let mut created = normalize(&self.name, repository, row);
+        let created = normalize(&self.name, repository, row);
         // Metadata attached after creation is best-effort: the PR exists either way and the
         // targeted refresh reconciles the provider truth.
         if !input.reviewers.is_empty() {

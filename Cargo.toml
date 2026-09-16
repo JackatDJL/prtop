@@ -4,6 +4,30 @@ version = "0.1.0"
 edition = "2024"
 description = "A multi-forge pull request and merge request terminal UI"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/JackatDJL/prtop"
+homepage = "https://github.com/JackatDJL/prtop"
+readme = "README.md"
+keywords = ["git", "github", "gitlab", "forgejo", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.metadata.dist]
+# The release tag/Cargo package version is the only version source. dist derives archive,
+# installer, npm and Homebrew versions from it.
+dist = true
+ci = "github"
+installers = ["shell", "powershell", "npm", "homebrew"]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+pr-run-mode = "plan"
+tap = "JackatDJL/homebrew-tap"
+install-path = "CARGO_HOME/bin"
 
 [dependencies]
 anyhow = "1.0"
