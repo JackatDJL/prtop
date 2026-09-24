@@ -1,12 +1,14 @@
 //! In-place editing of a change request's title, body, and metadata. Every write is
 //! capability-gated and runs asynchronously; a Pending write blocks resubmission.
 
-use crate::app::{App, AppEvent, ConfirmAction, ConfirmDialog, LifecycleAction, MetaKind, Overlay};
+use crate::app::{App, ConfirmAction, ConfirmDialog, LifecycleAction, Overlay};
 use crate::editor::TextArea;
-use crate::forge::{ForgeCapabilities, ForgeError, RequestPatch};
+#[cfg(test)]
+use crate::forge::ForgeError;
+use crate::forge::{ForgeCapabilities, RequestPatch};
 use crate::model::{ChangeRequest, ChangeRequestId, Person, RequestState};
-use crate::picker::{PickerItem, PickerKind, PickerSession};
-use crate::write::{OpId, WriteState};
+use crate::picker::{PickerKind, PickerSession};
+use crate::write::OpId;
 use ratatui::layout::Rect;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,7 +80,8 @@ impl EditSession {
         push(
             "Edit title",
             EditAction::Title,
-            (!caps.edit_title).then(|| "This forge has not advertised this write capability".into()),
+            (!caps.edit_title)
+                .then(|| "This forge has not advertised this write capability".into()),
         );
         push(
             "Edit description",
@@ -94,7 +97,8 @@ impl EditSession {
         push(
             "Edit reviewers",
             EditAction::Reviewers,
-            (!caps.request_reviewers).then(|| "This forge does not support reviewer requests".into()),
+            (!caps.request_reviewers)
+                .then(|| "This forge does not support reviewer requests".into()),
         );
         push(
             "Edit assignees",
@@ -131,7 +135,8 @@ impl EditSession {
             push(
                 "Reopen",
                 EditAction::Reopen,
-                (!caps.reopen).then(|| "This forge has not advertised this write capability".into()),
+                (!caps.reopen)
+                    .then(|| "This forge has not advertised this write capability".into()),
             );
         }
         push(
@@ -141,38 +146,46 @@ impl EditSession {
                 .then(|| "This forge has not advertised this write capability".into()),
         );
         items
+            .into_iter()
+            .filter(|item| item.reason.is_none())
+            .collect()
     }
     pub fn current_item(&self, request: &ChangeRequest) -> Option<EditMenuItem> {
-        self.menu_items(request)
-            .get(self.menu_selected)
-            .cloned()
+        self.menu_items(request).get(self.menu_selected).cloned()
     }
     pub fn menu_len(&self, request: &ChangeRequest) -> usize {
         self.menu_items(request).len()
     }
 
     /// Returns true when the session should close.
-    pub fn handle_key(&mut self, app: &mut App, key: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers) -> bool {
+    pub fn handle_key(
+        &mut self,
+        app: &mut App,
+        key: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
         use crossterm::event::KeyCode::*;
         use crossterm::event::KeyModifiers;
-        if self.pending.is_some() && !matches!(key, Esc) {
+        if self.pending.is_some() {
             return false;
         }
         if let Some(EditField::Title(area)) = &mut self.active {
             match key {
                 Esc => self.active = None,
                 Enter if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(EditField::Title(area)) = self.active.take() {
-                        app.start_update(
-                            self.id.clone(),
-                            RequestPatch {
-                                title: Some(area.text().trim().to_owned()),
-                                ..RequestPatch::default()
-                            },
-                            LifecycleAction::Title,
-                        );
-                        self.pending = app.last_op.map(|op| (op, "Updating title".into()));
-                    }
+                    let title = match &self.active {
+                        Some(EditField::Title(area)) => area.text().trim().to_owned(),
+                        _ => String::new(),
+                    };
+                    app.start_update(
+                        self.id.clone(),
+                        RequestPatch {
+                            title: Some(title),
+                            ..RequestPatch::default()
+                        },
+                        LifecycleAction::Title,
+                    );
+                    self.pending = app.last_op.map(|op| (op, "Updating title".into()));
                 }
                 Enter => {}
                 Backspace => area.backspace(),
@@ -189,17 +202,19 @@ impl EditSession {
             match key {
                 Esc => self.active = None,
                 Enter if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(EditField::Body(area)) = self.active.take() {
-                        app.start_update(
-                            self.id.clone(),
-                            RequestPatch {
-                                body: Some(area.text()),
-                                ..RequestPatch::default()
-                            },
-                            LifecycleAction::Body,
-                        );
-                        self.pending = app.last_op.map(|op| (op, "Updating description".into()));
-                    }
+                    let body = match &self.active {
+                        Some(EditField::Body(area)) => area.text(),
+                        _ => String::new(),
+                    };
+                    app.start_update(
+                        self.id.clone(),
+                        RequestPatch {
+                            body: Some(body),
+                            ..RequestPatch::default()
+                        },
+                        LifecycleAction::Body,
+                    );
+                    self.pending = app.last_op.map(|op| (op, "Updating description".into()));
                 }
                 Enter => {
                     if let Some(EditField::Body(area)) = &mut self.active {
@@ -258,6 +273,11 @@ impl EditSession {
                     session.query.pop();
                     session.clamp();
                 }
+                Char(' ') if session.multi => {
+                    if let Some(id) = session.selected_item().map(|item| item.id.clone()) {
+                        session.toggle_checked(&id);
+                    }
+                }
                 Char(c) => {
                     session.query.push(c);
                     session.clamp();
@@ -265,28 +285,25 @@ impl EditSession {
                         let token = OpId::next();
                         session.token = token;
                         session.loading = true;
+                        let query = session.query.clone();
+                        let kind = session.kind;
                         self.active = Some(EditField::Picker(session));
                         app.spawn_picker_search(
-                            session.kind,
+                            kind,
                             token,
                             &self.id.forge,
                             &self.id.repository,
-                            &session.query,
+                            &query,
                         );
                         return false;
                     }
                 }
-                Up | Char('k') => session.move_up(),
-                Down | Char('j') => session.move_down(),
-                Char(' ') if session.multi => {
-                    if let Some(item) = session.selected_item() {
-                        session.toggle_checked(&item.id);
-                    }
-                }
+                Up => session.move_up(),
+                Down => session.move_down(),
                 Enter if modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.commit_picker(app, &session, true);
+                    self.commit_picker(app, &mut session, true);
                 }
-                Enter => self.commit_picker(app, &session, false),
+                Enter => self.commit_picker(app, &mut session, false),
                 _ => {}
             }
             if let Some(EditField::Picker(current)) = &mut self.active {
@@ -321,8 +338,11 @@ impl EditSession {
         false
     }
 
-    fn dispatch(&mut self, app: &mut App, action: EditAction) {
-        let Some(request) = app.detail_request().or_else(|| app.request_for_view()).cloned()
+    pub(crate) fn dispatch(&mut self, app: &mut App, action: EditAction) {
+        let Some(request) = app
+            .detail_request()
+            .or_else(|| app.request_for_view())
+            .cloned()
         else {
             return;
         };
@@ -337,7 +357,11 @@ impl EditSession {
             }
             EditAction::Labels => {
                 let mut session = PickerSession::new(PickerKind::Label, OpId::next());
-                session.checked = request.labels.iter().map(|label| label.name.clone()).collect();
+                session.checked = request
+                    .labels
+                    .iter()
+                    .map(|label| label.name.clone())
+                    .collect();
                 self.active = Some(EditField::Picker(session));
                 self.load_picker(app, PickerKind::Label, "");
             }
@@ -355,15 +379,20 @@ impl EditSession {
             }
             EditAction::Assignees => {
                 let mut session = PickerSession::new(PickerKind::Assignee, OpId::next());
-                session.checked = request.assignees.iter().map(|person| person.login.clone()).collect();
+                session.checked = request
+                    .assignees
+                    .iter()
+                    .map(|person| person.login.clone())
+                    .collect();
                 self.active = Some(EditField::Picker(session));
                 self.load_picker(app, PickerKind::Assignee, "");
             }
             EditAction::Milestone => {
-                self.active = Some(EditField::Picker(PickerSession::new(
-                    PickerKind::Milestone,
-                    OpId::next(),
-                )));
+                let mut session = PickerSession::new(PickerKind::Milestone, OpId::next());
+                if let Some(milestone) = &request.milestone {
+                    session.checked.push(milestone.clone());
+                }
+                self.active = Some(EditField::Picker(session));
                 self.load_picker(app, PickerKind::Milestone, "");
             }
             EditAction::Draft => {
@@ -400,6 +429,7 @@ impl EditSession {
                     danger: false,
                     selected: 0,
                     action: ConfirmAction::CloseRequest(self.id.clone()),
+                    button_hits: vec![],
                 }));
             }
             EditAction::Reopen => {
@@ -428,6 +458,7 @@ impl EditSession {
                         id: self.id.clone(),
                         branch: request.source_branch.clone(),
                     },
+                    button_hits: vec![],
                 }));
             }
         }
@@ -439,7 +470,7 @@ impl EditSession {
         };
         app.spawn_picker_search(kind, token, &self.id.forge, &self.id.repository, query);
     }
-    fn commit_picker(&mut self, app: &mut App, session: &PickerSession, apply_multi: bool) {
+    fn commit_picker(&mut self, app: &mut App, session: &mut PickerSession, apply_multi: bool) {
         match session.kind {
             PickerKind::Reviewer => {
                 if apply_multi {
@@ -461,7 +492,18 @@ impl EditSession {
                     let add: Vec<Person> = requested
                         .iter()
                         .filter(|login| !current.contains(login))
-                        .map(|login| Person::named(login.clone()))
+                        .map(|login| {
+                            let id = session
+                                .items
+                                .iter()
+                                .find(|item| item.id == **login)
+                                .and_then(|item| item.detail.as_deref())
+                                .and_then(|id| id.parse().ok());
+                            match id {
+                                Some(id) => Person::with_id(login.clone(), id),
+                                None => Person::named(login.clone()),
+                            }
+                        })
                         .collect();
                     let remove: Vec<String> = current
                         .iter()
@@ -474,29 +516,29 @@ impl EditSession {
                     }
                     app.start_reviewers(self.id.clone(), add, remove);
                     self.pending = app.last_op.map(|op| (op, "Updating reviewers".into()));
-                    self.active = None;
-                } else if let Some(item) = session.selected_item() {
-                    session.toggle_checked(&item.id);
+                    self.active = Some(EditField::Picker(session.clone()));
+                } else if let Some(id) = session.selected_item().map(|item| item.id.clone()) {
+                    session.toggle_checked(&id);
                 }
             }
             PickerKind::Label => {
                 if apply_multi {
-                    let checked = session.take_checked();
+                    let checked = session.checked.clone();
                     app.start_labels(self.id.clone(), checked);
                     self.pending = app.last_op.map(|op| (op, "Updating labels".into()));
-                    self.active = None;
-                } else if let Some(item) = session.selected_item() {
-                    session.toggle_checked(&item.id);
+                    self.active = Some(EditField::Picker(session.clone()));
+                } else if let Some(id) = session.selected_item().map(|item| item.id.clone()) {
+                    session.toggle_checked(&id);
                 }
             }
             PickerKind::Assignee => {
                 if apply_multi {
-                    let checked = session.take_checked();
+                    let checked = session.checked.clone();
                     app.start_assignees(self.id.clone(), checked);
                     self.pending = app.last_op.map(|op| (op, "Updating assignees".into()));
-                    self.active = None;
-                } else if let Some(item) = session.selected_item() {
-                    session.toggle_checked(&item.id);
+                    self.active = Some(EditField::Picker(session.clone()));
+                } else if let Some(id) = session.selected_item().map(|item| item.id.clone()) {
+                    session.toggle_checked(&id);
                 }
             }
             PickerKind::Milestone => {
@@ -513,13 +555,28 @@ impl EditSession {
                     app.start_milestone(self.id.clone(), next);
                     self.pending = app.last_op.map(|op| (op, "Updating milestone".into()));
                 }
-                self.active = None;
+                self.active = Some(EditField::Picker(session.clone()));
             }
             PickerKind::TargetBranch => self.active = None,
         }
     }
     pub fn handle_mouse(&mut self, app: &mut App, column: u16, row: u16) {
+        if self.pending.is_some() {
+            return;
+        }
         let position = ratatui::layout::Position { x: column, y: row };
+        if let Some(EditField::Picker(mut session)) = self.active.clone() {
+            for (rect, index) in self.button_hits.clone() {
+                if rect.contains(position) {
+                    if index == 0 {
+                        self.active = None;
+                    } else {
+                        self.commit_picker(app, &mut session, true);
+                    }
+                    return;
+                }
+            }
+        }
         for (rect, index) in self.item_hits.clone() {
             if rect.contains(position) {
                 self.menu_selected = index;
@@ -553,12 +610,12 @@ impl EditSession {
         if let Some(area) = self.mouse_area
             && area.contains(position)
         {
-            let relative = row.saturating_sub(area.y + 1) as usize;
+            let relative = row.saturating_sub(area.y) as usize;
             if let Some(EditField::Picker(session)) = &self.active {
                 let mut session = session.clone();
                 if relative < session.visible_count() {
                     if relative == session.selected {
-                        self.commit_picker(app, &session, false);
+                        self.commit_picker(app, &mut session, false);
                     } else {
                         session.select_row(relative);
                         if let Some(EditField::Picker(current)) = &mut self.active {
@@ -586,21 +643,21 @@ pub(crate) fn apply_metadata_payload(request: &mut ChangeRequest, payload: &Meta
     if payload.milestone_set {
         request.milestone = payload.milestone.clone();
     }
+    if payload.reviewers_set {
+        request.reviewers = payload.reviewers.clone();
+    }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct MetaPayload {
     pub labels: Vec<crate::model::Label>,
     pub labels_set: bool,
     pub assignees: Vec<Person>,
     pub assignees_set: bool,
+    pub reviewers: Vec<crate::model::Reviewer>,
+    pub reviewers_set: bool,
     pub milestone: Option<String>,
     pub milestone_set: bool,
-}
-
-#[allow(dead_code)] // Referenced by provider error mapping in the demo path.
-fn ensure_demo_payload() -> Result<MetaPayload, ForgeError> {
-    Ok(MetaPayload::default())
 }
 
 #[cfg(test)]
@@ -608,14 +665,12 @@ mod tests {
     use super::*;
     use crate::create::full_caps;
     use crate::forge::demo;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn open_edit_menu() -> (App, ChangeRequestId) {
         let mut app = App::test_app();
         let id = app.requests[0].id.clone();
-        app.overlay = Some(Overlay::Edit(EditSession::new(
-            id.clone(),
-            full_caps(),
-        )));
+        app.overlay = Some(Overlay::Edit(EditSession::new(id.clone(), full_caps())));
         (app, id)
     }
 
@@ -630,15 +685,12 @@ mod tests {
             ..ForgeCapabilities::default()
         };
         let session = EditSession::new(request.id.clone(), caps);
-        let names: Vec<&str> = session
-            .menu_items(&request)
-            .iter()
-            .map(|item| item.name.as_str())
-            .collect();
-        assert!(names.contains(&"Edit title"));
-        assert!(names.contains(&"Edit labels"));
-        assert!(!names.contains(&"Mark as draft"));
-        assert!(!names.contains(&"Edit reviewers"));
+        let items = session.menu_items(&request);
+        let names: Vec<String> = items.into_iter().map(|item| item.name).collect();
+        assert!(names.iter().any(|name| name == "Edit title"));
+        assert!(names.iter().any(|name| name == "Edit labels"));
+        assert!(!names.iter().any(|name| name == "Mark as draft"));
+        assert!(!names.iter().any(|name| name == "Edit reviewers"));
         let draft_only = ForgeCapabilities {
             edit_title: true,
             draft_transition: true,
@@ -646,27 +698,24 @@ mod tests {
             ..ForgeCapabilities::default()
         };
         let session = EditSession::new(request.id.clone(), draft_only);
-        let names: Vec<&str> = session
-            .menu_items(&request)
-            .iter()
-            .map(|item| item.name.as_str())
-            .collect();
-        assert!(names.contains(&"Mark as draft"));
-        assert!(names.contains(&"Close"));
-        assert!(!names.contains(&"Edit labels"));
+        let items = session.menu_items(&request);
+        let names: Vec<String> = items.into_iter().map(|item| item.name).collect();
+        assert!(names.iter().any(|name| name == "Mark as draft"));
+        assert!(names.iter().any(|name| name == "Close"));
+        assert!(!names.iter().any(|name| name == "Edit labels"));
     }
 
     #[test]
     fn close_requires_confirmation_with_keep_open_default() {
         let (mut app, id) = open_edit_menu();
         app.selected = 0;
-        app.handle_key(crate::crossterm::event::KeyCode::Enter);
+        app.handle_key(KeyCode::Enter);
         // The first menu entry is "Edit title"; navigate to Close.
         app.overlay = Some(Overlay::Edit(EditSession::new(id.clone(), full_caps())));
         if let Some(Overlay::Edit(session)) = &mut app.overlay {
             session.menu_selected = 7;
         }
-        app.handle_key(crate::crossterm::event::KeyCode::Enter);
+        app.handle_key(KeyCode::Enter);
         match &app.overlay {
             Some(Overlay::Confirm(dialog)) => {
                 assert!(matches!(dialog.action, ConfirmAction::CloseRequest(_)));
@@ -676,13 +725,13 @@ mod tests {
             other => panic!("expected a confirm dialog, got {other:?}"),
         }
         // Enter on the safe default closes the dialog without writing.
-        app.handle_key(crate::crossterm::event::KeyCode::Enter);
+        app.handle_key(KeyCode::Enter);
         assert!(app.overlay.is_none());
         assert!(app.in_flight.is_empty());
     }
 
-    #[test]
-    fn title_editing_submits_through_the_provider() {
+    #[tokio::test]
+    async fn title_editing_submits_through_the_provider() {
         let (mut app, id) = open_edit_menu();
         app.selected = 0;
         app.demo = false;
@@ -690,26 +739,22 @@ mod tests {
             id.forge.clone(),
             std::sync::Arc::new(RecordingProvider::default()),
         );
-        if let Some(Overlay::Edit(session)) = &mut app.overlay {
-            session.dispatch(&mut app, EditAction::Title);
-        }
-        if let Some(Overlay::Edit(session)) = &mut app.overlay {
-            if let Some(EditField::Title(area)) = &mut session.active {
-                for c in "Renamed".chars() {
-                    area.insert_char(c);
-                }
+        let Some(Overlay::Edit(mut session)) = app.overlay.take() else {
+            panic!("expected edit overlay");
+        };
+        session.dispatch(&mut app, EditAction::Title);
+        if let Some(EditField::Title(area)) = &mut session.active {
+            for c in "Renamed".chars() {
+                area.insert_char(c);
             }
-            session.handle_key(
-                &mut app,
-                crate::crossterm::event::KeyCode::Enter,
-                crate::crossterm::event::KeyModifiers::CONTROL,
-            );
         }
+        session.handle_key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+        app.overlay = Some(Overlay::Edit(session));
         assert!(app.in_flight.contains_key(&(id, "update")));
     }
 
-    #[test]
-    fn pending_write_blocks_second_submission() {
+    #[tokio::test]
+    async fn pending_write_blocks_second_submission() {
         let (mut app, id) = open_edit_menu();
         app.demo = false;
         app.providers.insert(
@@ -753,17 +798,19 @@ mod tests {
         assert_eq!(request.review, before);
     }
 
-    #[test]
-    fn edit_menu_dispatches_labels_picker_load() {
+    #[tokio::test]
+    async fn edit_menu_dispatches_labels_picker_load() {
         let (mut app, id) = open_edit_menu();
         app.demo = false;
         app.providers.insert(
             id.forge.clone(),
             std::sync::Arc::new(RecordingProvider::default()),
         );
-        if let Some(Overlay::Edit(session)) = &mut app.overlay {
-            session.dispatch(&mut app, EditAction::Labels);
-        }
+        let Some(Overlay::Edit(mut session)) = app.overlay.take() else {
+            panic!("expected edit overlay");
+        };
+        session.dispatch(&mut app, EditAction::Labels);
+        app.overlay = Some(Overlay::Edit(session));
         match &app.overlay {
             Some(Overlay::Edit(session)) => {
                 assert!(matches!(session.active, Some(EditField::Picker(_))));
@@ -775,16 +822,18 @@ mod tests {
 
 /// A provider that records calls without network access, used to assert dispatch wiring.
 #[derive(Default)]
+#[cfg(test)]
 pub struct RecordingProvider {
     calls: std::sync::atomic::AtomicUsize,
 }
+#[cfg(test)]
 #[async_trait::async_trait]
 impl crate::forge::ForgeProvider for RecordingProvider {
     fn name(&self) -> &str {
         "recording"
     }
     fn capabilities(&self) -> ForgeCapabilities {
-        full_caps()
+        crate::create::full_caps()
     }
     async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, ForgeError> {
         Ok(vec![])
@@ -794,7 +843,8 @@ impl crate::forge::ForgeProvider for RecordingProvider {
         _id: &ChangeRequestId,
         _patch: &RequestPatch,
     ) -> Result<ChangeRequest, ForgeError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Err(ForgeError::Unavailable("offline test".into()))
     }
     async fn set_labels(
@@ -802,7 +852,8 @@ impl crate::forge::ForgeProvider for RecordingProvider {
         _id: &ChangeRequestId,
         _names: &[String],
     ) -> Result<Vec<crate::model::Label>, ForgeError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Err(ForgeError::Unavailable("offline test".into()))
     }
     async fn set_assignees(
@@ -810,7 +861,8 @@ impl crate::forge::ForgeProvider for RecordingProvider {
         _id: &ChangeRequestId,
         _logins: &[String],
     ) -> Result<Vec<Person>, ForgeError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Err(ForgeError::Unavailable("offline test".into()))
     }
     async fn set_milestone(
@@ -818,7 +870,8 @@ impl crate::forge::ForgeProvider for RecordingProvider {
         _id: &ChangeRequestId,
         _milestone: Option<&str>,
     ) -> Result<Option<String>, ForgeError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Err(ForgeError::Unavailable("offline test".into()))
     }
     async fn request_reviewer(
@@ -826,7 +879,8 @@ impl crate::forge::ForgeProvider for RecordingProvider {
         _id: &ChangeRequestId,
         _reviewer: &Person,
     ) -> Result<(), ForgeError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Err(ForgeError::Unavailable("offline test".into()))
     }
 }

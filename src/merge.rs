@@ -1,9 +1,12 @@
 //! Merge preflight, strategy selection, and confirmations. Strategy availability comes from
 //! provider capabilities; policy warnings never silently turn into a merge.
 
-use crate::app::{App, AppEvent, Overlay};
+use crate::app::App;
 use crate::forge::ForgeCapabilities;
-use crate::model::{ChangeRequest, ChangeRequestId, CiState, MergeOutcome, MergeStrategy, Mergeability, RequestState, ReviewState};
+use crate::model::{
+    ChangeRequest, ChangeRequestId, CiState, MergeOutcome, MergeStrategy, Mergeability,
+    RequestState, ReviewState,
+};
 use crate::write::{OpId, WriteState};
 use ratatui::layout::Rect;
 
@@ -45,11 +48,16 @@ pub struct MergeSession {
     pub strategy: usize,
     pub checks: Vec<MergeCheck>,
     pub warnings: Vec<String>,
+    pub technically_mergeable: bool,
+    pub technical_mergeability: Mergeability,
+    pub policy_satisfied: bool,
+    pub loading: bool,
+    pub preflight_error: Option<String>,
     pub stage: MergeStage,
     pub write: WriteState<MergeOutcome>,
     pub submit_op: Option<OpId>,
     pub button_selected: usize,
-    pub strategy_hits: Vec<Rect>,
+    pub strategy_hits: Vec<(Rect, usize)>,
     pub button_hits: Vec<(Rect, usize)>,
 }
 
@@ -92,10 +100,33 @@ impl MergeSession {
             .iter()
             .filter(|reviewer| reviewer.state == ReviewState::Approved)
             .count();
-        if approvals > 0 {
-            record(CheckStatus::Ok, format!("{approvals} approval(s)"));
-        } else {
-            record(CheckStatus::Warn, "no approvals yet".into());
+        let approvals_satisfied = request
+            .approvals_satisfied
+            .or_else(|| request.approvals_left.map(|left| left == 0));
+        match approvals_satisfied {
+            Some(true) => {
+                let detail = match (request.approvals_required, request.approvals_left) {
+                    (Some(0), _) => "no approvals required".into(),
+                    (Some(required), _) => format!("{required} required approval(s) satisfied"),
+                    _ if approvals > 0 => {
+                        format!("{approvals} approval(s); provider reports requirements satisfied")
+                    }
+                    _ => "provider reports approval requirements satisfied".into(),
+                };
+                record(CheckStatus::Ok, detail);
+            }
+            Some(false) => {
+                let detail = request.approvals_left.map_or_else(
+                    || "approval requirements not satisfied".to_owned(),
+                    |left| format!("{left} approval(s) still required"),
+                );
+                record(CheckStatus::Warn, detail);
+            }
+            None if approvals > 0 => record(
+                CheckStatus::Warn,
+                format!("{approvals} approval(s); approval requirement is unknown"),
+            ),
+            None => record(CheckStatus::Warn, "approval requirement is unknown".into()),
         }
         let blockers: Vec<String> = request
             .reviewers
@@ -114,11 +145,13 @@ impl MergeSession {
         match request.mergeability {
             Mergeability::Mergeable => record(CheckStatus::Ok, "no merge conflicts".into()),
             Mergeability::Conflicting => record(CheckStatus::Fail, "merge conflicts".into()),
-            Mergeability::Blocked => record(
+            Mergeability::Blocked => {
+                record(CheckStatus::Warn, "provider reports a policy block".into())
+            }
+            Mergeability::Unknown => record(
                 CheckStatus::Warn,
-                "provider reports a policy block".into(),
+                "technical mergeability is unknown".into(),
             ),
-            Mergeability::Unknown => record(CheckStatus::Info, "mergeability unknown".into()),
         }
         match request.mergeable_state.as_deref() {
             Some("behind") => record(
@@ -129,14 +162,48 @@ impl MergeSession {
                 CheckStatus::Warn,
                 "branch protection blocks this merge".into(),
             ),
-            Some("clean") => {}
-            Some("draft") => {}
-            Some("unstable") => record(
-                CheckStatus::Warn,
-                "required checks are not passing".into(),
+            Some("clean" | "mergeable") => record(
+                CheckStatus::Ok,
+                format!(
+                    "provider policy status: {}",
+                    request.mergeable_state.as_deref().unwrap_or_default()
+                ),
             ),
-            Some("dirty") => {}
-            _ => record(CheckStatus::Info, "branch currency unknown".into()),
+            Some("draft_status" | "draft") => {
+                record(CheckStatus::Warn, "provider reports draft status".into())
+            }
+            Some("unstable" | "ci_still_running" | "ci_must_pass") => record(
+                CheckStatus::Warn,
+                format!(
+                    "provider policy status: {}",
+                    request.mergeable_state.as_deref().unwrap_or_default()
+                ),
+            ),
+            Some("not_approved" | "approvals_syncing") => record(
+                CheckStatus::Warn,
+                format!(
+                    "provider policy status: {}",
+                    request.mergeable_state.as_deref().unwrap_or_default()
+                ),
+            ),
+            Some("discussions_not_resolved" | "need_rebase" | "conflict" | "cannot_be_merged") => {
+                record(
+                    CheckStatus::Warn,
+                    format!(
+                        "provider policy status: {}",
+                        request.mergeable_state.as_deref().unwrap_or_default()
+                    ),
+                )
+            }
+            Some("dirty") => record(CheckStatus::Fail, "provider reports merge conflicts".into()),
+            Some(status) => record(
+                CheckStatus::Info,
+                format!("provider policy status: {status}"),
+            ),
+            None => record(
+                CheckStatus::Info,
+                "branch freshness and provider policy are unknown".into(),
+            ),
         }
         if request.draft {
             record(CheckStatus::Warn, "still a draft".into());
@@ -154,12 +221,43 @@ impl MergeSession {
                 .unwrap_or_else(|| "queued".into());
             record(CheckStatus::Info, format!("merge queue: {position}"));
         }
+        let technical_mergeability = request.mergeability;
+        let technically_mergeable = request.mergeability == Mergeability::Mergeable
+            && request.mergeable_state.as_deref() != Some("dirty");
+        let policy_satisfied = matches!(request.ci, CiState::Passed | CiState::None)
+            && approvals_satisfied == Some(true)
+            && blockers.is_empty()
+            && !request.draft
+            && request.mergeability == Mergeability::Mergeable
+            && !matches!(
+                request.mergeable_state.as_deref(),
+                Some(
+                    "blocked"
+                        | "blocked_behind_merge"
+                        | "behind"
+                        | "unstable"
+                        | "ci_still_running"
+                        | "ci_must_pass"
+                        | "not_approved"
+                        | "approvals_syncing"
+                        | "discussions_not_resolved"
+                        | "need_rebase"
+                        | "conflict"
+                        | "cannot_be_merged"
+                        | "dirty"
+                )
+            );
         Some(Self {
             id: request.id.clone(),
             strategies,
             strategy: 0,
             checks,
             warnings,
+            technically_mergeable,
+            technical_mergeability,
+            policy_satisfied,
+            loading: false,
+            preflight_error: None,
             stage: MergeStage::Preflight,
             write: WriteState::Idle,
             submit_op: None,
@@ -172,9 +270,23 @@ impl MergeSession {
         self.strategies[self.strategy.min(self.strategies.len() - 1)]
     }
     /// Returns true when the session should close.
-    pub fn handle_key(&mut self, app: &mut App, key: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers) -> bool {
+    pub fn handle_key(
+        &mut self,
+        app: &mut App,
+        key: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
         use crossterm::event::{KeyCode::*, KeyModifiers};
         if self.write.is_pending() {
+            return false;
+        }
+        if self.loading {
+            return key == Esc;
+        }
+        if self.preflight_error.is_some() && key == Char('r') {
+            self.preflight_error = None;
+            self.loading = true;
+            app.load_merge_preflight(self.id.clone());
             return false;
         }
         match self.stage {
@@ -185,19 +297,22 @@ impl MergeSession {
                     self.strategy = (self.strategy + 1).min(self.strategies.len() - 1)
                 }
                 Left | Char('h') => self.button_selected = self.button_selected.saturating_sub(1),
-                Right | Char('l') => self.button_selected = self.button_selected.min(1),
+                Right | Char('l') => self.button_selected = (self.button_selected + 1).min(1),
+                Enter if self.preflight_error.is_some() => {
+                    self.preflight_error = None;
+                    self.loading = true;
+                    app.load_merge_preflight(self.id.clone());
+                }
                 Enter if modifiers.contains(KeyModifiers::CONTROL) => self.begin_merge(app),
-                Enter => {
-                    if self.button_selected == 1 {
-                        self.begin_merge(app);
-                    }
+                Enter if self.button_selected == 1 => {
+                    self.begin_merge(app);
                 }
                 _ => {}
             },
             MergeStage::Confirm | MergeStage::ConfirmUnsafe => match key {
                 Esc => self.stage = MergeStage::Preflight,
                 Left | Char('h') => self.button_selected = self.button_selected.saturating_sub(1),
-                Right | Char('l') => self.button_selected = self.button_selected.min(1),
+                Right | Char('l') => self.button_selected = (self.button_selected + 1).min(1),
                 Enter if modifiers.contains(KeyModifiers::CONTROL) => {
                     if self.button_selected == 1 {
                         self.submit(app);
@@ -218,6 +333,14 @@ impl MergeSession {
         false
     }
     pub fn begin_merge(&mut self, app: &mut App) {
+        if self.loading || self.preflight_error.is_some() {
+            app.toast = Some("Merge preflight must complete before merging".into());
+            return;
+        }
+        if !self.technically_mergeable {
+            app.toast = Some("The provider reports merge conflicts".into());
+            return;
+        }
         if self.warnings.is_empty() {
             self.stage = MergeStage::Confirm;
         } else {
@@ -226,19 +349,22 @@ impl MergeSession {
         self.button_selected = 0;
     }
     fn submit(&mut self, app: &mut App) {
+        if self.write.is_pending() {
+            return;
+        }
         let op = OpId::next();
         self.write = WriteState::Pending;
         self.submit_op = Some(op);
         let strategy = self.selected_strategy();
         app.start_merge(self.id.clone(), strategy, op);
     }
-    pub fn apply(&mut self, op: OpId, result: Result<MergeOutcome, crate::forge::ForgeError>) {
+    pub fn apply(&mut self, op: OpId, result: Result<MergeOutcome, String>) {
         if self.submit_op != Some(op) {
             return;
         }
         self.write = match result {
             Ok(outcome) => WriteState::Success(outcome),
-            Err(error) => WriteState::Failed(error.to_string()),
+            Err(error) => WriteState::Failed(error),
         };
         self.stage = MergeStage::Preflight;
         self.submit_op = None;
@@ -249,12 +375,22 @@ impl MergeSession {
             _ => None,
         }
     }
-    pub fn handle_mouse(&mut self, app: &mut App, column: u16, row: u16) {
+    pub fn handle_mouse(&mut self, app: &mut App, column: u16, row: u16) -> bool {
+        if self.write.is_pending() {
+            return false;
+        }
+        if self.loading {
+            let position = ratatui::layout::Position { x: column, y: row };
+            return self
+                .button_hits
+                .iter()
+                .any(|(rect, index)| *index == 0 && rect.contains(position));
+        }
         let position = ratatui::layout::Position { x: column, y: row };
         for (rect, index) in self.strategy_hits.clone() {
             if rect.contains(position) {
                 self.strategy = index.min(self.strategies.len() - 1);
-                return;
+                return false;
             }
         }
         for (rect, index) in self.button_hits.clone() {
@@ -262,16 +398,25 @@ impl MergeSession {
                 self.button_selected = index;
                 if self.stage == MergeStage::Preflight {
                     if index == 1 {
-                        self.begin_merge(app);
+                        if self.preflight_error.is_some() {
+                            self.preflight_error = None;
+                            self.loading = true;
+                            app.load_merge_preflight(self.id.clone());
+                        } else {
+                            self.begin_merge(app);
+                        }
+                    } else {
+                        return true;
                     }
                 } else if index == 1 {
                     self.submit(app);
                 } else {
                     self.stage = MergeStage::Preflight;
                 }
-                return;
+                return false;
             }
         }
+        false
     }
 }
 
@@ -279,6 +424,7 @@ impl MergeSession {
 mod tests {
     use super::*;
     use crate::create::full_caps;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn request() -> ChangeRequest {
         let mut request = crate::forge::demo::change_requests().remove(0);
@@ -294,10 +440,12 @@ mod tests {
     fn preflight_collects_clean_checks_for_a_mergeable_request() {
         let session = MergeSession::build(&request(), &full_caps()).unwrap();
         assert!(session.warnings.is_empty());
-        assert!(session
-            .checks
-            .iter()
-            .any(|check| check.label == "CI passed" && check.status == CheckStatus::Ok));
+        assert!(
+            session
+                .checks
+                .iter()
+                .any(|check| check.label == "CI passed" && check.status == CheckStatus::Ok)
+        );
     }
 
     #[test]
@@ -309,14 +457,35 @@ mod tests {
             state: ReviewState::ChangesRequested,
         }];
         let session = MergeSession::build(&item, &full_caps()).unwrap();
-        assert!(session
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("CI is failing")));
-        assert!(session
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("bob requested changes")));
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("CI is failing"))
+        );
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("bob requested changes"))
+        );
+    }
+
+    #[test]
+    fn clean_technical_mergeability_does_not_claim_unknown_approval_policy_is_satisfied() {
+        let mut item = request();
+        item.approvals_required = None;
+        item.approvals_left = None;
+        item.approvals_satisfied = None;
+        let session = MergeSession::build(&item, &full_caps()).unwrap();
+        assert!(session.technically_mergeable);
+        assert!(!session.policy_satisfied);
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("approval requirement is unknown") })
+        );
     }
 
     #[test]
@@ -324,7 +493,11 @@ mod tests {
         let session = MergeSession::build(&request(), &full_caps()).unwrap();
         assert_eq!(
             session.strategies,
-            vec![MergeStrategy::Squash, MergeStrategy::MergeCommit, MergeStrategy::Rebase]
+            vec![
+                MergeStrategy::Squash,
+                MergeStrategy::MergeCommit,
+                MergeStrategy::Rebase
+            ]
         );
         let mut caps = full_caps();
         caps.squash_merge = false;
@@ -342,17 +515,17 @@ mod tests {
         assert!(MergeSession::build(&item, &full_caps()).is_none());
     }
 
-    #[test]
-    fn warnings_require_an_explicit_merge_anyway_confirmation() {
+    #[tokio::test]
+    async fn warnings_require_an_explicit_merge_anyway_confirmation() {
         let mut app = App::test_app();
         let mut item = request();
         item.ci = CiState::Running;
         let mut session = MergeSession::build(&item, &full_caps()).unwrap();
-        session.begin_merge(&app);
+        session.begin_merge(&mut app);
         assert_eq!(session.stage, MergeStage::ConfirmUnsafe);
         // Default button is Cancel.
         assert_eq!(session.button_selected, 0);
-        session.handle_key(&app, crate::crossterm::event::KeyCode::Enter, KeyModifiers::NONE);
+        session.handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(!session.write.is_pending());
 
         // Confirming the unsafe path arms the write.
@@ -369,10 +542,10 @@ mod tests {
     fn clean_merge_goes_straight_to_confirmation_with_cancel_default() {
         let mut app = App::test_app();
         let mut session = MergeSession::build(&request(), &full_caps()).unwrap();
-        session.begin_merge(&app);
+        session.begin_merge(&mut app);
         assert_eq!(session.stage, MergeStage::Confirm);
         assert_eq!(session.button_selected, 0);
-        session.handle_key(&app, crate::crossterm::event::KeyCode::Enter, KeyModifiers::NONE);
+        session.handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(!session.write.is_pending());
     }
 

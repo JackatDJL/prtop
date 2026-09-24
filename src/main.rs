@@ -1,12 +1,18 @@
 mod app;
 mod cache;
 mod config;
+mod create;
+mod edit;
+mod editor;
 mod forge;
 mod git;
+mod merge;
 mod model;
+mod picker;
 mod scope;
 mod ssh;
 mod ui;
+mod write;
 
 use std::{io, time::Duration};
 
@@ -231,6 +237,20 @@ async fn run(
                 AppEvent::PipelinesLoaded { request, pipelines } => app.apply_pipelines(request, pipelines),
                 AppEvent::PipelineLoaded { id, pipeline } => app.apply_pipeline(id, *pipeline),
                 AppEvent::CiActionCompleted { action, result } => app.apply_ci_action(action, result),
+                AppEvent::GitPreflightCompleted { op, result } => app.apply_git_preflight(op, result),
+                AppEvent::ProjectGitLoaded(result) => app.apply_project_git(result),
+                AppEvent::MergePreflightLoaded { id, result } => app.apply_merge_preflight(id, result),
+                AppEvent::GitBranchesLoaded { token, branches } => app.apply_git_branches(token, branches),
+                AppEvent::RepositoryInfoLoaded { forge, repository, result } => app.apply_repository_info(forge, repository, result),
+                AppEvent::PushCompleted { op, branch, result } => app.apply_push(op, branch, result),
+                AppEvent::PickerLoaded { token, result } => app.apply_picker(token, result),
+                AppEvent::CreateCompleted { op, result } => app.apply_create(op, result),
+                AppEvent::RequestWriteCompleted { id, op, action, result } => app.apply_request_write(id, op, action, result),
+                AppEvent::MetadataWriteCompleted { id, op, kind, result } => app.apply_metadata_write(id, op, kind, result),
+                AppEvent::MergeCompleted { id, op, result } => app.apply_merge(id, op, result),
+                AppEvent::AutoMergeCompleted { id, op, enabled, result } => app.apply_auto_merge(id, op, enabled, result),
+                AppEvent::TargetedRequestLoaded { id, result } => app.apply_targeted_request(id, result),
+                AppEvent::BranchCleanupCompleted { id, message, result } => app.apply_branch_cleanup(id, message, result),
             }
         }
     }

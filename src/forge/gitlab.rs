@@ -1,13 +1,14 @@
 use crate::{
     config::ProjectConfig,
     forge::{
-        ForgeCapabilities, ForgeError, ForgeProvider, MergeOutcome, MergeStrategy, Milestone,
-        NewChangeRequest, RepositoryInfo, RequestPatch, ReviewAction, auth, normalized_request,
+        CreateResult, ForgeCapabilities, ForgeError, ForgeProvider, MergeOutcome, MergeStrategy,
+        Milestone, NewChangeRequest, RepositoryInfo, RequestPatch, ReviewAction, auth,
+        normalized_request,
     },
     model::{
         ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Job, JobId, Label, LogChunk,
-        MergeQueue, Person, Pipeline, PipelineId, PipelineStage, PipelineStatus, RequestState,
-        ReviewState, Reviewer,
+        Person, Pipeline, PipelineId, PipelineStage, PipelineStatus, RequestState, ReviewState,
+        Reviewer,
     },
 };
 use async_trait::async_trait;
@@ -56,11 +57,7 @@ impl GitLabProvider {
     fn api(&self, path: &str) -> String {
         format!("https://{}/api/v4/{path}", self.host)
     }
-    async fn get_mr(
-        &self,
-        token: &str,
-        id: &ChangeRequestId,
-    ) -> Result<ChangeRequest, ForgeError> {
+    async fn get_mr(&self, token: &str, id: &ChangeRequestId) -> Result<ChangeRequest, ForgeError> {
         let response = reqwest::Client::new()
             .get(self.api(&format!(
                 "projects/{}/merge_requests/{}",
@@ -73,6 +70,23 @@ impl GitLabProvider {
             .map_err(network)?;
         let row: Row = ensure(response).await?.json().await.map_err(network)?;
         Ok(normalize(&self.name, &id.repository, row))
+    }
+    async fn get_approvals(
+        &self,
+        token: &str,
+        id: &ChangeRequestId,
+    ) -> Result<ApprovalResponse, ForgeError> {
+        let response = reqwest::Client::new()
+            .get(self.api(&format!(
+                "projects/{}/merge_requests/{}/approvals",
+                Self::project(id),
+                id.number
+            )))
+            .header("PRIVATE-TOKEN", token)
+            .send()
+            .await
+            .map_err(network)?;
+        ensure(response).await?.json().await.map_err(network)
     }
     async fn user_ids(
         &self,
@@ -106,7 +120,9 @@ impl GitLabProvider {
         title: &str,
     ) -> Result<u64, ForgeError> {
         let response = reqwest::Client::new()
-            .get(self.api(&format!("projects/{project}/milestones?state=active&per_page=100")))
+            .get(self.api(&format!(
+                "projects/{project}/milestones?state=active&per_page=100"
+            )))
             .header("PRIVATE-TOKEN", token)
             .send()
             .await
@@ -141,6 +157,7 @@ impl ForgeProvider for GitLabProvider {
             ci_play_manual: true,
             ci_artifacts: true,
             create_change_request: true,
+            create_draft: true,
             edit_title: true,
             edit_description: true,
             labels: true,
@@ -186,7 +203,27 @@ impl ForgeProvider for GitLabProvider {
     }
     async fn get_change_request(&self, id: &ChangeRequestId) -> Result<ChangeRequest, ForgeError> {
         let token = self.credential().await?;
-        self.get_mr(&token, id).await
+        let mut request = self.get_mr(&token, id).await?;
+        let approvals = self.get_approvals(&token, id).await?;
+        request.approvals_required = approvals.approvals_required;
+        request.approvals_left = approvals.approvals_left;
+        request.approvals_satisfied = approvals.approved;
+        crate::forge::apply_review_states(
+            &mut request,
+            approvals
+                .approved_by
+                .into_iter()
+                .map(|approval| Reviewer {
+                    person: Person {
+                        login: approval.user.username,
+                        name: approval.user.name,
+                        id: Some(approval.user.id),
+                    },
+                    state: ReviewState::Approved,
+                })
+                .collect(),
+        );
+        Ok(request)
     }
     async fn get_repository(&self, repository: &str) -> Result<RepositoryInfo, ForgeError> {
         let token = self.credential().await?;
@@ -199,15 +236,29 @@ impl ForgeProvider for GitLabProvider {
             .await
             .map_err(network)?;
         let row: ProjectRow = ensure(response).await?.json().await.map_err(network)?;
+        let merge_method = row.merge_method;
+        let squash_option = row.squash_option;
+        let allows_merge_commit = merge_method.as_deref() == Some("merge");
+        let allows_rebase = matches!(merge_method.as_deref(), Some("rebase_merge" | "ff"));
+        let allows_squash = matches!(
+            squash_option.as_deref(),
+            Some("always" | "default_on" | "default_off")
+        );
         Ok(RepositoryInfo {
             default_branch: row.default_branch,
+            allow_merge_commit: Some(allows_merge_commit),
+            allow_squash_merge: Some(allows_squash),
+            allow_rebase_merge: Some(allows_rebase),
+            merge_method,
+            squash_option,
+            ..RepositoryInfo::default()
         })
     }
     async fn create_change_request(
         &self,
         input: &NewChangeRequest,
         repository: &str,
-    ) -> Result<ChangeRequest, ForgeError> {
+    ) -> Result<CreateResult, ForgeError> {
         let token = self.credential().await?;
         let encoded =
             url::form_urlencoded::byte_serialize(repository.as_bytes()).collect::<String>();
@@ -221,26 +272,41 @@ impl ForgeProvider for GitLabProvider {
             },
             "description": input.body,
         });
+        let mut metadata_warnings = Vec::new();
         if !input.reviewers.is_empty() {
-            let ids = self
-                .user_ids(&token, &encoded, &input.reviewers)
-                .await
-                .unwrap_or_default();
-            body["reviewer_ids"] = serde_json::json!(ids);
+            match self.user_ids(&token, &encoded, &input.reviewers).await {
+                Ok(ids) => {
+                    if ids.len() != input.reviewers.len() {
+                        metadata_warnings
+                            .push("some reviewers were not found; edit request metadata".into());
+                    }
+                    body["reviewer_ids"] = serde_json::json!(ids);
+                }
+                Err(_) => metadata_warnings
+                    .push("reviewers were not applied; edit request metadata".into()),
+            }
         }
         if !input.assignees.is_empty() {
-            let ids = self
-                .user_ids(&token, &encoded, &input.assignees)
-                .await
-                .unwrap_or_default();
-            body["assignee_ids"] = serde_json::json!(ids);
+            match self.user_ids(&token, &encoded, &input.assignees).await {
+                Ok(ids) => {
+                    if ids.len() != input.assignees.len() {
+                        metadata_warnings
+                            .push("some assignees were not found; edit request metadata".into());
+                    }
+                    body["assignee_ids"] = serde_json::json!(ids);
+                }
+                Err(_) => metadata_warnings
+                    .push("assignees were not applied; edit request metadata".into()),
+            }
         }
         if !input.labels.is_empty() {
             body["labels"] = serde_json::json!(input.labels.join(","));
         }
         if let Some(milestone) = &input.milestone {
-            if let Ok(id) = self.milestone_id(&token, &encoded, milestone).await {
-                body["milestone_id"] = serde_json::json!(id);
+            match self.milestone_id(&token, &encoded, milestone).await {
+                Ok(id) => body["milestone_id"] = serde_json::json!(id),
+                Err(_) => metadata_warnings
+                    .push("milestone was not applied; edit request metadata".into()),
             }
         }
         let response = reqwest::Client::new()
@@ -251,7 +317,10 @@ impl ForgeProvider for GitLabProvider {
             .await
             .map_err(network)?;
         let row: Row = ensure(response).await?.json().await.map_err(network)?;
-        Ok(normalize(&self.name, repository, row))
+        Ok(CreateResult {
+            request: normalize(&self.name, repository, row),
+            metadata_warnings,
+        })
     }
     async fn update_change_request(
         &self,
@@ -426,8 +495,8 @@ impl ForgeProvider for GitLabProvider {
         let updated = self.update_change_request(id, &patch).await?;
         Ok(updated.milestone)
     }
-    /// GitLab auto-merge is "merge when pipeline succeeds" on the merge endpoint; disabling
-    /// uses its dedicated cancel endpoint.
+    /// GitLab auto-merge uses the merge endpoint's `auto_merge` flag and a separate cancel
+    /// endpoint. The project's configured merge method determines non-squash semantics.
     async fn set_auto_merge(
         &self,
         id: &ChangeRequestId,
@@ -435,22 +504,32 @@ impl ForgeProvider for GitLabProvider {
         strategy: MergeStrategy,
     ) -> Result<bool, ForgeError> {
         let token = self.credential().await?;
-        let path = if enable {
-            format!("projects/{}/merge_requests/{}/merge", Self::project(id), id.number)
+        let (method, path) = if enable {
+            (
+                reqwest::Method::PUT,
+                format!(
+                    "projects/{}/merge_requests/{}/merge",
+                    Self::project(id),
+                    id.number
+                ),
+            )
         } else {
-            format!(
-                "projects/{}/merge_requests/{}/cancel_merge_when_pipeline_succeeds",
-                Self::project(id),
-                id.number
+            (
+                reqwest::Method::POST,
+                format!(
+                    "projects/{}/merge_requests/{}/cancel_merge_when_pipeline_succeeds",
+                    Self::project(id),
+                    id.number
+                ),
             )
         };
         let mut request = reqwest::Client::new()
-            .put(self.api(&path))
+            .request(method, self.api(&path))
             .header("PRIVATE-TOKEN", &token);
         if enable {
             request = request.json(&serde_json::json!({
-                "merge_when_pipeline_succeeds": true,
-                "merge_method": strategy.api_name(),
+                "auto_merge": true,
+                "squash": strategy == MergeStrategy::Squash,
             }));
         }
         let response = request.send().await.map_err(network)?;
@@ -470,7 +549,9 @@ impl ForgeProvider for GitLabProvider {
                 id.number
             )))
             .header("PRIVATE-TOKEN", &token)
-            .json(&serde_json::json!({"merge_method": strategy.api_name()}))
+            .json(&serde_json::json!({
+                "squash": strategy == MergeStrategy::Squash,
+            }))
             .send()
             .await
             .map_err(network)?;
@@ -581,6 +662,22 @@ impl ForgeProvider for GitLabProvider {
             ReviewAction::RequestChanges => Err(ForgeError::Unsupported),
         }
     }
+    async fn list_reviews(&self, id: &ChangeRequestId) -> Result<Vec<Reviewer>, ForgeError> {
+        let token = self.credential().await?;
+        let approvals = self.get_approvals(&token, id).await?;
+        Ok(approvals
+            .approved_by
+            .into_iter()
+            .map(|approval| Reviewer {
+                person: Person {
+                    login: approval.user.username,
+                    name: approval.user.name,
+                    id: Some(approval.user.id),
+                },
+                state: ReviewState::Approved,
+            })
+            .collect())
+    }
     async fn search_reviewers(
         &self,
         _: &ChangeRequestId,
@@ -616,7 +713,11 @@ impl ForgeProvider for GitLabProvider {
             ForgeError::Validation("GitLab reviewers must be selected from search".into())
         })?;
         let current = self.get_mr(token.as_str(), id).await?;
-        let mut ids: Vec<u64> = current.reviewers.iter().filter_map(|r| r.person.id).collect();
+        let mut ids: Vec<u64> = current
+            .reviewers
+            .iter()
+            .filter_map(|r| r.person.id)
+            .collect();
         if !ids.contains(&reviewer_id) {
             ids.push(reviewer_id);
         }
@@ -877,6 +978,21 @@ struct User {
     name: Option<String>,
 }
 #[derive(Deserialize)]
+struct ApprovalResponse {
+    #[serde(default)]
+    approved_by: Vec<ApprovalUser>,
+    #[serde(default)]
+    approvals_required: Option<u32>,
+    #[serde(default)]
+    approvals_left: Option<u32>,
+    #[serde(default)]
+    approved: Option<bool>,
+}
+#[derive(Deserialize)]
+struct ApprovalUser {
+    user: User,
+}
+#[derive(Deserialize)]
 struct Note {
     id: u64,
     body: String,
@@ -932,6 +1048,10 @@ struct MilestoneRow {
 struct ProjectRow {
     #[serde(default)]
     default_branch: Option<String>,
+    #[serde(default)]
+    merge_method: Option<String>,
+    #[serde(default)]
+    squash_option: Option<String>,
 }
 fn gitlab_status(value: &str) -> PipelineStatus {
     match value {
@@ -1051,7 +1171,10 @@ fn normalize(forge: &str, repo: &str, row: Row) -> ChangeRequest {
             id: Some(user.id),
         })
         .collect();
-    request.milestone = row.milestone.as_ref().map(|milestone| milestone.title.clone());
+    request.milestone = row
+        .milestone
+        .as_ref()
+        .map(|milestone| milestone.title.clone());
     request.web_url = row.web_url;
     request.auto_merge = row.merge_when_pipeline_succeeds;
     request.mergeable_state = row.detailed_merge_status;

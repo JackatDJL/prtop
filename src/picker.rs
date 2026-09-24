@@ -22,7 +22,7 @@ impl PickerKind {
         }
     }
     pub fn multi(self) -> bool {
-        matches!(self, Self::Assignee | Self::Label)
+        matches!(self, Self::Reviewer | Self::Assignee | Self::Label)
     }
 }
 
@@ -112,9 +112,6 @@ impl PickerSession {
     pub fn is_checked(&self, id: &str) -> bool {
         self.checked.iter().any(|checked| checked == id)
     }
-    pub fn take_checked(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.checked)
-    }
     pub fn apply_items(&mut self, token: OpId, items: Vec<PickerItem>) {
         if token == self.token {
             self.items = items;
@@ -175,7 +172,7 @@ mod tests {
         session.toggle_checked("main");
         session.toggle_checked("develop");
         session.toggle_checked("main");
-        assert_eq!(session.take_checked(), vec!["develop"]);
+        assert_eq!(session.checked, vec!["develop"]);
     }
 
     #[test]

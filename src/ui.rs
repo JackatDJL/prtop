@@ -1,5 +1,7 @@
 pub mod theme;
-use crate::app::{App, DetailFocus, HitRegions, Overlay, PALETTE_COMMANDS, View};
+use crate::app::{
+    App, BranchCleanupChoice, DetailFocus, HitRegions, Overlay, PALETTE_COMMANDS, View,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -27,9 +29,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if let Some(message) = &app.toast {
             toast(frame, message, theme);
         }
-        if let Some(overlay) = &app.overlay {
-            overlay_view(frame, overlay, theme);
-        }
+        draw_overlay(frame, app, theme);
         return;
     }
     let outer = Layout::default()
@@ -87,7 +87,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .join("  |  ");
     frame.render_widget(
         Paragraph::new(format!(
-            " / filter  r refresh  Enter detail  ? keys  q quit   {health}"
+            " n create  : commands  / filter  r refresh  Enter detail  ? keys  q quit   {health}"
         ))
         .style(Style::default().fg(theme.muted)),
         outer[2],
@@ -98,9 +98,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(message) = &app.toast {
         toast(frame, message, theme);
     }
-    if let Some(overlay) = &app.overlay {
-        overlay_view(frame, overlay, theme);
-    }
+    draw_overlay(frame, app, theme);
 }
 fn draw_full_detail(frame: &mut Frame, app: &mut App, theme: Theme) {
     let outer = Layout::default()
@@ -170,7 +168,7 @@ fn draw_full_detail(frame: &mut Frame, app: &mut App, theme: Theme) {
     });
     draw_detail(frame, detail, app, theme);
     frame.render_widget(
-        Paragraph::new(" ↑↓ scroll  PgUp/PgDn fast  Tab panel  c comment  R review  Esc back")
+        Paragraph::new(" ↑↓ scroll  PgUp/PgDn fast  Tab panel  e edit  M merge  : commands  c comment  R review  Esc back")
             .style(Style::default().fg(theme.muted)),
         outer[2],
     );
@@ -194,7 +192,650 @@ fn toast(frame: &mut Frame, message: &str, theme: Theme) {
         area,
     );
 }
-fn overlay_view(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
+fn draw_overlay(frame: &mut Frame, app: &mut App, theme: Theme) {
+    let commands = app.palette_commands();
+    let request = app.request_for_view().cloned();
+    app.palette_hits.clear();
+    let hits = &mut app.palette_hits;
+    if let Some(overlay) = app.overlay.as_mut() {
+        overlay_view(frame, overlay, &commands, request.as_ref(), hits, theme);
+    }
+}
+
+fn overlay_view(
+    frame: &mut Frame,
+    overlay: &mut Overlay,
+    commands: &[&str],
+    request: Option<&crate::model::ChangeRequest>,
+    palette_hits: &mut Vec<(Rect, usize)>,
+    theme: Theme,
+) {
+    match overlay {
+        Overlay::Create(session) => draw_create(frame, session, theme),
+        Overlay::Edit(session) => draw_edit(frame, session, request, theme),
+        Overlay::Merge(session) => draw_merge(frame, session, theme),
+        Overlay::Confirm(dialog) => draw_confirm(frame, dialog, theme),
+        Overlay::BranchCleanup(session) => draw_cleanup(frame, session, theme),
+        Overlay::Palette { query, selected } => {
+            let area = centered(frame.area(), 64, 60);
+            frame.render_widget(Clear, area);
+            let matching: Vec<_> = commands
+                .iter()
+                .filter(|item| item.to_lowercase().contains(&query.to_lowercase()))
+                .collect();
+            let mut lines = vec![Line::styled(
+                format!("{query}_"),
+                Style::default().fg(theme.primary),
+            )];
+            lines.extend(matching.iter().enumerate().map(|(index, command)| {
+                Line::from(format!(
+                    "{} {command}",
+                    if index == *selected { ">" } else { " " }
+                ))
+            }));
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Command palette "),
+                ),
+                area,
+            );
+            palette_hits.extend((0..matching.len()).map(|index| {
+                (
+                    Rect::new(
+                        area.x + 1,
+                        area.y + index as u16 + 2,
+                        area.width.saturating_sub(2),
+                        1,
+                    ),
+                    index,
+                )
+            }));
+        }
+        _ => overlay_legacy(frame, overlay, theme),
+    }
+}
+
+fn draw_create(frame: &mut Frame, session: &mut crate::create::CreateWorkflow, theme: Theme) {
+    let area = centered(frame.area(), 88, 82);
+    frame.render_widget(Clear, area);
+    session.field_hits.clear();
+    session.button_hits.clear();
+    session.mouse_area = None;
+    let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(4));
+    let mut lines = Vec::new();
+    match session.stage {
+        crate::create::CreateStage::Preflight => {
+            lines.extend(session.summary_lines().into_iter().map(Line::from));
+            if session.preflight_loading {
+                lines.push(Line::from("Git preflight running…"));
+            }
+            if let Some(error) = &session.preflight_error {
+                lines.push(Line::styled(
+                    format!("Preflight failed: {error}"),
+                    Style::default().fg(theme.danger),
+                ));
+            }
+            if session.push_needed() {
+                let branch = session
+                    .preflight
+                    .as_ref()
+                    .map(|state| state.branch.as_str())
+                    .unwrap_or("unknown");
+                if session.remote_branch_exists == Some(false) {
+                    lines.push(Line::from(format!(
+                        "Branch {branch} does not exist on the remote."
+                    )));
+                } else if let Some(count) =
+                    session.preflight.as_ref().and_then(|state| state.unpushed)
+                {
+                    lines.push(Line::from(format!(
+                        "{count} source commit(s) are not pushed."
+                    )));
+                }
+                lines.push(Line::from(
+                    "Push & Continue runs git push -u; force push is never used.",
+                ));
+            }
+            if session.preflight_error.is_some() {
+                lines.push(Line::from("Press r to retry Git preflight."));
+            }
+            if let Some(error) = &session.push_error {
+                lines.push(Line::styled(
+                    format!("Push failed: {error}"),
+                    Style::default().fg(theme.danger),
+                ));
+            }
+        }
+        crate::create::CreateStage::Fields => {
+            lines.push(Line::from("Source branch: current checkout"));
+            for (index, field) in session.fields().iter().enumerate() {
+                lines.push(Line::from(format!(
+                    "{} {:<14} {}",
+                    if index == session.field { ">" } else { " " },
+                    field.label(),
+                    session.field_summary(*field)
+                )));
+                session.field_hits.push((
+                    Rect::new(
+                        body.x + 1,
+                        body.y + index as u16 + 2,
+                        body.width.saturating_sub(2),
+                        1,
+                    ),
+                    index,
+                ));
+            }
+            if let Some(editor) = &session.editor {
+                lines.push(Line::from(""));
+                match editor {
+                    crate::create::CreateEditor::Title(area) => {
+                        lines.push(Line::styled(
+                            format!("Title: {}_", area.text()),
+                            Style::default().fg(theme.primary),
+                        ));
+                        lines.push(Line::from(
+                            "Enter moves to the next field · Ctrl+Enter previews",
+                        ));
+                    }
+                    crate::create::CreateEditor::Description => {
+                        lines.extend(
+                            session
+                                .body
+                                .text()
+                                .lines()
+                                .map(|line| Line::from(line.to_owned())),
+                        );
+                        lines.push(Line::from(
+                            "Description · Ctrl+Enter previews · Esc keeps text",
+                        ));
+                    }
+                    crate::create::CreateEditor::Target(picker)
+                    | crate::create::CreateEditor::Reviewers(picker)
+                    | crate::create::CreateEditor::Labels(picker)
+                    | crate::create::CreateEditor::Assignees(picker)
+                    | crate::create::CreateEditor::Milestone(picker) => {
+                        lines.push(Line::styled(
+                            format!("{}: {}_", picker.kind.title(), picker.query),
+                            Style::default().fg(theme.primary),
+                        ));
+                        lines.push(Line::from(picker.status_line()));
+                        let top = body.y + lines.len() as u16 + 1;
+                        for (index, item) in picker.filtered().iter().enumerate().take(12) {
+                            lines.push(Line::from(format!(
+                                "{} {}{}",
+                                if index == picker.selected { ">" } else { " " },
+                                if picker.is_checked(&item.id) {
+                                    "[x] "
+                                } else {
+                                    "[ ] "
+                                },
+                                item.label
+                            )));
+                        }
+                        if picker.multi {
+                            lines.push(Line::from("Space toggles · Ctrl+Enter applies"));
+                        }
+                        session.mouse_area = Some(Rect::new(
+                            body.x + 1,
+                            top,
+                            body.width.saturating_sub(2),
+                            picker.visible_count().min(12) as u16,
+                        ));
+                    }
+                }
+            }
+        }
+        crate::create::CreateStage::Preview => {
+            lines.extend([
+                Line::styled(
+                    &session.title,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Line::from(format!(
+                    "{} → {}",
+                    session
+                        .preflight
+                        .as_ref()
+                        .map(|state| state.branch.as_str())
+                        .unwrap_or("?"),
+                    session.target
+                )),
+                Line::from(""),
+            ]);
+            lines.extend(
+                session
+                    .body
+                    .text()
+                    .lines()
+                    .map(|line| Line::from(line.to_owned())),
+            );
+            for field in [
+                crate::create::Field::Draft,
+                crate::create::Field::Reviewers,
+                crate::create::Field::Labels,
+                crate::create::Field::Assignees,
+                crate::create::Field::Milestone,
+            ] {
+                lines.push(Line::from(format!(
+                    "{}: {}",
+                    field.label(),
+                    session.field_summary(field)
+                )));
+            }
+            if let Some(error) = session.failure_message() {
+                lines.push(Line::styled(
+                    format!("Create failed: {error}"),
+                    Style::default().fg(theme.danger),
+                ));
+            }
+            if session.submit.is_pending() {
+                lines.push(Line::from("Creating request…"));
+            }
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default().borders(Borders::ALL).title(format!(
+                " Create {} · {}/{} ",
+                session.kind.number_prefix(),
+                session.host,
+                session.repository
+            )),
+        ),
+        body,
+    );
+    let buttons = if session.stage == crate::create::CreateStage::Fields
+        && session.editor.as_ref().is_some_and(|editor| {
+            matches!(
+                editor,
+                crate::create::CreateEditor::Target(_)
+                    | crate::create::CreateEditor::Reviewers(_)
+                    | crate::create::CreateEditor::Labels(_)
+                    | crate::create::CreateEditor::Assignees(_)
+                    | crate::create::CreateEditor::Milestone(_)
+            )
+        }) {
+        vec![
+            (crate::create::Button::Cancel, "Cancel picker"),
+            (crate::create::Button::Continue, "Apply selection"),
+        ]
+    } else {
+        match session.stage {
+            crate::create::CreateStage::Preflight if session.push_needed() => vec![
+                (crate::create::Button::Cancel, "Cancel"),
+                (crate::create::Button::PushAndContinue, "Push & Continue"),
+            ],
+            crate::create::CreateStage::Preflight => vec![
+                (crate::create::Button::Cancel, "Cancel"),
+                (crate::create::Button::Continue, "Continue"),
+            ],
+            crate::create::CreateStage::Fields => vec![
+                (crate::create::Button::Cancel, "Cancel"),
+                (crate::create::Button::Continue, "Preview"),
+            ],
+            crate::create::CreateStage::Preview => vec![
+                (crate::create::Button::Cancel, "Back to fields"),
+                (crate::create::Button::Create, "Create"),
+            ],
+        }
+    };
+    let raw = buttons
+        .iter()
+        .map(|(button, label)| (*label, *button as usize))
+        .collect::<Vec<_>>();
+    session.button_hits = button_rects(frame, area, &raw, session.button_selected, theme)
+        .into_iter()
+        .enumerate()
+        .map(|(index, rect)| (rect, buttons[index].0))
+        .collect();
+}
+
+fn draw_edit(
+    frame: &mut Frame,
+    session: &mut crate::edit::EditSession,
+    request: Option<&crate::model::ChangeRequest>,
+    theme: Theme,
+) {
+    let area = centered(frame.area(), 76, 72);
+    frame.render_widget(Clear, area);
+    session.item_hits.clear();
+    session.mouse_area = None;
+    session.button_hits.clear();
+    let mut picker_buttons = false;
+    let mut lines = Vec::new();
+    if let Some(crate::edit::EditField::Title(editor)) = &session.active {
+        lines.extend([
+            Line::styled(
+                format!("Title: {}_", editor.text()),
+                Style::default().fg(theme.primary),
+            ),
+            Line::from("Ctrl+Enter submits · Esc cancels"),
+        ]);
+    } else if let Some(crate::edit::EditField::Body(editor)) = &session.active {
+        lines.extend(
+            editor
+                .text()
+                .lines()
+                .map(|line| Line::from(line.to_owned())),
+        );
+        lines.push(Line::from("Description · Ctrl+Enter submits · Esc cancels"));
+    } else if let Some(crate::edit::EditField::Picker(picker)) = &session.active {
+        lines.extend([
+            Line::styled(
+                format!("{}: {}_", picker.kind.title(), picker.query),
+                Style::default().fg(theme.primary),
+            ),
+            Line::from(picker.status_line()),
+        ]);
+        if picker.multi {
+            lines.push(Line::from("Space toggles · Apply selection below"));
+        }
+        let top = area.y + if picker.multi { 4 } else { 3 };
+        for (index, item) in picker.filtered().iter().enumerate().take(14) {
+            lines.push(Line::from(format!(
+                "{} {}{}",
+                if index == picker.selected { ">" } else { " " },
+                if picker.is_checked(&item.id) {
+                    "[x] "
+                } else {
+                    "[ ] "
+                },
+                item.label
+            )));
+        }
+        session.mouse_area = Some(Rect::new(
+            area.x + 2,
+            top,
+            area.width.saturating_sub(4),
+            picker.visible_count().min(14) as u16,
+        ));
+        if picker.multi || picker.kind == crate::picker::PickerKind::Milestone {
+            picker_buttons = true;
+        }
+    } else if let Some(request) = request {
+        for (index, item) in session.menu_items(request).iter().enumerate() {
+            lines.push(Line::from(format!(
+                "{} {}",
+                if index == session.menu_selected {
+                    ">"
+                } else {
+                    " "
+                },
+                item.name
+            )));
+            session.item_hits.push((
+                Rect::new(
+                    area.x + 2,
+                    area.y + index as u16 + 1,
+                    area.width.saturating_sub(4),
+                    1,
+                ),
+                index,
+            ));
+        }
+        lines.push(Line::from("↑↓ select · Enter open · Esc close"));
+    } else {
+        lines.push(Line::from("Request is no longer available"));
+    }
+    if let Some(label) = session.pending_label() {
+        lines.push(Line::from(format!("{label}…")));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Edit change request "),
+        ),
+        area,
+    );
+    if picker_buttons {
+        session.button_hits = button_rects(
+            frame,
+            area,
+            &[("Cancel", 0), ("Apply selection", 1)],
+            0,
+            theme,
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(index, rect)| (rect, index))
+        .collect();
+    }
+}
+
+fn draw_merge(frame: &mut Frame, session: &mut crate::merge::MergeSession, theme: Theme) {
+    let area = centered(frame.area(), 78, 78);
+    frame.render_widget(Clear, area);
+    session.strategy_hits.clear();
+    let technical = match session.technical_mergeability {
+        crate::model::Mergeability::Mergeable if session.technically_mergeable => "mergeable",
+        crate::model::Mergeability::Conflicting => "conflicts block merge",
+        _ => "not confirmed by provider",
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!("Technical mergeability: {technical}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::from(format!(
+            "Policy requirements from provider status: {}",
+            if session.policy_satisfied {
+                "satisfied"
+            } else {
+                "warnings remain"
+            }
+        )),
+        Line::from(""),
+    ];
+    if session.loading {
+        lines.push(Line::from("Refreshing provider merge state…"));
+    } else if let Some(error) = &session.preflight_error {
+        lines.push(Line::styled(
+            format!("Preflight failed: {error} · r retries"),
+            Style::default().fg(theme.danger),
+        ));
+    } else {
+        for check in &session.checks {
+            lines.push(Line::from(format!(
+                "{} {}",
+                check.status.glyph(),
+                check.label
+            )));
+        }
+        lines.extend([
+            Line::from(""),
+            Line::styled(
+                "Merge strategy",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        let strategy_top = area.y + lines.len() as u16 + 1;
+        for (index, strategy) in session.strategies.iter().enumerate() {
+            lines.push(Line::from(format!(
+                "{} {}",
+                if index == session.strategy {
+                    "●"
+                } else {
+                    "○"
+                },
+                strategy.label()
+            )));
+            session.strategy_hits.push((
+                Rect::new(
+                    area.x + 2,
+                    strategy_top + index as u16,
+                    area.width.saturating_sub(4),
+                    1,
+                ),
+                index,
+            ));
+        }
+    }
+    if let Some(error) = session.failure() {
+        lines.push(Line::styled(
+            format!("Merge failed: {error}"),
+            Style::default().fg(theme.danger),
+        ));
+    }
+    if session.write.is_pending() {
+        lines.push(Line::from("Merge request pending…"));
+    }
+    match session.stage {
+        crate::merge::MergeStage::Preflight => {}
+        crate::merge::MergeStage::Confirm => lines.push(Line::styled(
+            "Ready. Select Merge to submit.",
+            Style::default().fg(theme.success),
+        )),
+        crate::merge::MergeStage::ConfirmUnsafe => lines.push(Line::styled(
+            "Warnings remain. Confirm again to merge anyway.",
+            Style::default().fg(theme.danger),
+        )),
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Merge preflight "),
+        ),
+        area,
+    );
+    let right = match session.stage {
+        crate::merge::MergeStage::Preflight if session.loading => "Loading…",
+        crate::merge::MergeStage::Preflight if session.preflight_error.is_some() => {
+            "Retry preflight"
+        }
+        crate::merge::MergeStage::Preflight => {
+            if session.technically_mergeable {
+                "Review merge"
+            } else {
+                "Merge blocked"
+            }
+        }
+        _ => "Merge",
+    };
+    session.button_hits = button_rects(
+        frame,
+        area,
+        &[("Cancel", 0), (right, 1)],
+        session.button_selected,
+        theme,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(index, rect)| (rect, index))
+    .collect();
+}
+
+fn draw_confirm(frame: &mut Frame, dialog: &mut crate::app::ConfirmDialog, theme: Theme) {
+    let area = centered(frame.area(), 58, 38);
+    frame.render_widget(Clear, area);
+    let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(4));
+    frame.render_widget(
+        Paragraph::new(format!("{}\n\n{}", dialog.title, dialog.body))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Confirm action "),
+            ),
+        body,
+    );
+    dialog.button_hits = button_rects(
+        frame,
+        area,
+        &[(dialog.cancel.as_str(), 0), (dialog.confirm.as_str(), 1)],
+        dialog.selected,
+        theme,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(index, rect)| (rect, index))
+    .collect();
+}
+
+fn draw_cleanup(frame: &mut Frame, session: &mut crate::app::BranchCleanupSession, _theme: Theme) {
+    let area = centered(frame.area(), 68, 48);
+    frame.render_widget(Clear, area);
+    let mut lines = vec![
+        Line::styled(
+            format!("Merged {}", session.id.display(session.kind)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::from(format!("Source branch: {}", session.branch)),
+        Line::from(""),
+    ];
+    for (index, choice) in session.choices.iter().enumerate() {
+        let label = match choice {
+            BranchCleanupChoice::KeepBranches => "Keep branches",
+            BranchCleanupChoice::DeleteRemote => "Delete remote source branch",
+            BranchCleanupChoice::DeleteLocal => "Delete local source branch",
+            BranchCleanupChoice::DeleteBoth => "Delete local and remote branches",
+        };
+        lines.push(Line::from(format!(
+            "{} {label}",
+            if index == session.selected { ">" } else { " " }
+        )));
+    }
+    if session.pending {
+        lines.push(Line::from("Deleting source branch…"));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Branch cleanup "),
+        ),
+        area,
+    );
+    session.button_hits = session
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            (
+                Rect::new(
+                    area.x + 2,
+                    area.y + 4 + index as u16,
+                    area.width.saturating_sub(4),
+                    1,
+                ),
+                index,
+            )
+        })
+        .collect();
+}
+
+fn button_rects<T: Copy>(
+    frame: &mut Frame,
+    area: Rect,
+    buttons: &[(&str, T)],
+    selected: usize,
+    theme: Theme,
+) -> Vec<Rect> {
+    let y = area.bottom().saturating_sub(3);
+    let mut x = area.x + 2;
+    let mut hits = Vec::new();
+    for (index, (label, _)) in buttons.iter().enumerate() {
+        let width = (label.len() as u16 + 4).min(frame.area().right().saturating_sub(x));
+        let rect = Rect::new(x, y, width, 1);
+        let style = if index == selected {
+            Style::default()
+                .fg(theme.selection_fg)
+                .bg(theme.selection_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(format!("[ {label} ]")).style(style), rect);
+        hits.push(rect);
+        x = x.saturating_add(width + 2);
+    }
+    hits
+}
+
+fn overlay_legacy(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
     let area = centered(frame.area(), 62, 42);
     frame.render_widget(Clear, area);
     let (title, body) = match overlay {
@@ -250,6 +891,7 @@ fn overlay_view(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
                 }
             ),
         ),
+        _ => ("", String::new()),
     };
     frame.render_widget(
         Paragraph::new(body).wrap(Wrap { trim: false }).block(
@@ -263,6 +905,45 @@ fn overlay_view(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
 }
 fn draw_list(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let visible = app.visible();
+    if visible.is_empty() && app.repo_context.repository.is_some() {
+        let mut lines = vec![
+            Line::styled(
+                "No open pull requests or merge requests.",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from(format!(
+                "{} / {}",
+                app.repo_context.host.as_deref().unwrap_or("forge"),
+                app.repo_context.repository.as_deref().unwrap_or_default()
+            )),
+        ];
+        if let Some(state) = &app.project_git {
+            lines.push(Line::from(format!("Current branch: {}", state.branch)));
+            lines.push(Line::from(format!(
+                "{} commits ahead of {}",
+                state
+                    .ahead
+                    .map_or_else(|| "?".into(), |count| count.to_string()),
+                app.repo_context
+                    .default_branch
+                    .as_deref()
+                    .unwrap_or("target")
+            )));
+        } else {
+            lines.push(Line::from("Checking the current Git branch…"));
+        }
+        if app.can_create_current_project() {
+            lines.push(Line::styled(
+                "[n] Create pull request",
+                Style::default().fg(theme.primary),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" project ")),
+            area,
+        );
+        return;
+    }
     let items: Vec<ListItem> = visible
         .iter()
         .enumerate()
@@ -361,10 +1042,12 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let description = vec![
         Line::styled(&pr.title, Style::default().add_modifier(Modifier::BOLD)),
         Line::from(format!(
-            "{} · {} → {}",
+            "{} · {} → {} · {} {}",
             pr.id.display(pr.kind),
             pr.source_branch,
-            pr.target_branch
+            pr.target_branch,
+            pr.state.glyph(),
+            pr.state.label()
         )),
         Line::from(format!(
             "+{} / -{} · {}",
@@ -385,6 +1068,14 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         format!("latest {} of {}", comments.len(), pr.comments.len()),
         Style::default().fg(theme.secondary),
     )];
+    if let Some(activity) = app.activity.get(&pr.id) {
+        comment_lines.extend(activity.iter().rev().map(|event| {
+            Line::styled(
+                format!("prtop activity · {event}"),
+                Style::default().fg(theme.secondary),
+            )
+        }));
+    }
     comment_lines.extend(comments);
     frame.render_widget(
         Paragraph::new(comment_lines)
@@ -515,9 +1206,7 @@ fn draw_pipeline(frame: &mut Frame, app: &mut App, theme: Theme) {
     if let Some(message) = &app.toast {
         toast(frame, message, theme);
     }
-    if let Some(overlay) = &app.overlay {
-        overlay_view(frame, overlay, theme);
-    }
+    draw_overlay(frame, app, theme);
 }
 fn draw_job(frame: &mut Frame, app: &mut App, theme: Theme) {
     let outer = Layout::default()
@@ -592,9 +1281,7 @@ fn draw_job(frame: &mut Frame, app: &mut App, theme: Theme) {
     if let Some(message) = &app.toast {
         toast(frame, message, theme);
     }
-    if let Some(overlay) = &app.overlay {
-        overlay_view(frame, overlay, theme);
-    }
+    draw_overlay(frame, app, theme);
 }
 fn panel_block(title: &str, active: bool, theme: Theme) -> Block<'_> {
     Block::default()

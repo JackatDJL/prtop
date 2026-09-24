@@ -25,6 +25,7 @@ pub fn capabilities_for(forge: &str) -> ForgeCapabilities {
         ci_play_manual: true,
         ci_artifacts: true,
         create_change_request: true,
+        create_draft: true,
         edit_title: true,
         edit_description: true,
         labels: true,
@@ -58,7 +59,12 @@ pub fn capabilities_for(forge: &str) -> ForgeCapabilities {
 pub fn demo_providers() -> Vec<(String, Arc<dyn ForgeProvider>)> {
     DEMO_FORGES
         .iter()
-        .map(|name| ((*name).to_owned(), Arc::new(DemoProvider::new(name)) as Arc<dyn ForgeProvider>))
+        .map(|name| {
+            (
+                (*name).to_owned(),
+                Arc::new(DemoProvider::new(name)) as Arc<dyn ForgeProvider>,
+            )
+        })
         .collect()
 }
 
@@ -90,9 +96,18 @@ impl ForgeProvider for DemoProvider {
             .find(|request| request.id == *id)
             .ok_or(ForgeError::NotFound)
     }
-    async fn get_repository(&self, _repository: &str) -> Result<crate::forge::RepositoryInfo, ForgeError> {
+    async fn get_repository(
+        &self,
+        _repository: &str,
+    ) -> Result<crate::forge::RepositoryInfo, ForgeError> {
         Ok(crate::forge::RepositoryInfo {
             default_branch: Some("main".into()),
+            allow_merge_commit: Some(self.name != "codeberg"),
+            allow_squash_merge: Some(self.name != "volt-gitlab"),
+            allow_rebase_merge: Some(self.name != "volt-gitlab"),
+            allow_auto_merge: Some(self.name != "codeberg"),
+            merge_method: (self.name == "volt-gitlab").then(|| "merge".into()),
+            squash_option: Some("default_on".into()),
         })
     }
 }
@@ -144,8 +159,16 @@ pub fn created_request(
         pipelines: vec![],
         body: (!input.body.is_empty()).then(|| input.body.clone()),
         state: RequestState::Open,
-        labels: input.labels.iter().map(|name| Label::named(name.clone())).collect(),
-        assignees: input.assignees.iter().map(|login| Person::named(login.clone())).collect(),
+        labels: input
+            .labels
+            .iter()
+            .map(|name| Label::named(name.clone()))
+            .collect(),
+        assignees: input
+            .assignees
+            .iter()
+            .map(|login| Person::named(login.clone()))
+            .collect(),
         milestone: input.milestone.clone(),
         web_url: Some(format!("{prefix}/{repository}/requests/{number}")),
         auto_merge: false,
@@ -153,6 +176,9 @@ pub fn created_request(
         head_sha: None,
         merged_sha: None,
         merge_queue: None,
+        approvals_required: Some(1),
+        approvals_left: Some(1),
+        approvals_satisfied: Some(false),
     }
 }
 
@@ -177,10 +203,7 @@ pub fn picker_items(kind: crate::picker::PickerKind) -> Vec<crate::picker::Picke
             PickerItem::simple("enhancement"),
             PickerItem::simple("documentation"),
         ],
-        PickerKind::Milestone => vec![
-            PickerItem::simple("v1.2"),
-            PickerItem::simple("v1.3"),
-        ],
+        PickerKind::Milestone => vec![PickerItem::simple("v1.2"), PickerItem::simple("v1.3")],
     }
 }
 
@@ -353,6 +376,9 @@ fn request(
             position: Some(3),
             name: Some("default".into()),
         }),
+        approvals_required: Some(1),
+        approvals_left: Some(u32::from(number != 184)),
+        approvals_satisfied: Some(number == 184),
     }
 }
 

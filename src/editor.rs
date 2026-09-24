@@ -9,11 +9,10 @@ pub struct TextArea {
 }
 impl TextArea {
     pub fn from_str(text: &str) -> Self {
-        Self {
-            lines: text.split('\n').map(str::to_owned).collect(),
-            row: 0,
-            col: 0,
-        }
+        let lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+        let row = lines.len().saturating_sub(1);
+        let col = lines[row].len();
+        Self { lines, row, col }
     }
     pub fn empty() -> Self {
         Self::from_str("")
@@ -26,9 +25,6 @@ impl TextArea {
     }
     pub fn line(&self, row: usize) -> &str {
         self.lines.get(row).map(String::as_str).unwrap_or("")
-    }
-    pub fn lines(&self) -> usize {
-        self.lines.len()
     }
     pub fn insert_char(&mut self, c: char) {
         let line = &mut self.lines[self.row];
@@ -62,8 +58,7 @@ impl TextArea {
     }
     pub fn left(&mut self) {
         if self.col > 0 {
-            self.col = self
-                .line(self.row)[..self.col]
+            self.col = self.line(self.row)[..self.col]
                 .chars()
                 .next_back()
                 .map(|c| self.col - c.len_utf8())
@@ -87,12 +82,12 @@ impl TextArea {
     }
     pub fn up(&mut self) {
         self.row = self.row.saturating_sub(1);
-        self.col = self.col.min(self.lines[self.row].len());
+        self.col = self.lines[self.row].len();
     }
     pub fn down(&mut self) {
         if self.row + 1 < self.lines.len() {
             self.row += 1;
-            self.col = self.col.min(self.lines[self.row].len());
+            self.col = self.lines[self.row].len();
         }
     }
     pub fn home(&mut self) {

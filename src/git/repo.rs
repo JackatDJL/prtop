@@ -25,6 +25,7 @@ pub struct BranchState {
     pub remote_branch_exists: Option<bool>,
     pub ahead: Option<usize>,
     pub behind: Option<usize>,
+    pub unpushed: Option<usize>,
     pub dirty: bool,
 }
 
@@ -37,12 +38,17 @@ pub enum PushError {
 /// `git push -u <remote> <branch>`. Force variants are deliberately unconstructible here;
 /// force pushes belong to the stacked-branch milestone with explicit confirmation.
 pub fn push_args(remote: &str, branch: &str) -> Vec<String> {
-    vec!["push".into(), "--set-upstream".into(), remote.into(), branch.into()]
+    vec![
+        "push".into(),
+        "--set-upstream".into(),
+        remote.into(),
+        branch.into(),
+    ]
 }
 
-pub fn repo_root(path: &Path) -> Option<PathBuf> {
+pub async fn repo_root(path: &Path) -> Option<PathBuf> {
     let GitResult::Completed { stdout, .. } =
-        git::run(path, &["rev-parse", "--show-toplevel"], FAST)
+        git::run(path, &["rev-parse", "--show-toplevel"], FAST).await
     else {
         return None;
     };
@@ -50,9 +56,9 @@ pub fn repo_root(path: &Path) -> Option<PathBuf> {
     (!root.is_empty()).then(|| PathBuf::from(root))
 }
 
-pub fn current_branch(root: &Path) -> Option<String> {
+pub async fn current_branch(root: &Path) -> Option<String> {
     let GitResult::Completed { stdout, .. } =
-        git::run(root, &["rev-parse", "--abbrev-ref", "HEAD"], FAST)
+        git::run(root, &["rev-parse", "--abbrev-ref", "HEAD"], FAST).await
     else {
         return None;
     };
@@ -60,9 +66,9 @@ pub fn current_branch(root: &Path) -> Option<String> {
     (!branch.is_empty() && branch != "HEAD").then_some(branch)
 }
 
-pub fn remote_url(root: &Path, remote: &str) -> Option<String> {
+pub async fn remote_url(root: &Path, remote: &str) -> Option<String> {
     let GitResult::Completed { stdout, .. } =
-        git::run(root, &["remote", "get-url", remote], FAST)
+        git::run(root, &["remote", "get-url", remote], FAST).await
     else {
         return None;
     };
@@ -71,15 +77,13 @@ pub fn remote_url(root: &Path, remote: &str) -> Option<String> {
 }
 
 /// The provider default branch when git's remote HEAD ref is set.
-pub fn default_branch(root: &Path, remote: &str) -> Option<String> {
+pub async fn default_branch(root: &Path, remote: &str) -> Option<String> {
     let GitResult::Completed { stdout, .. } = git::run(
         root,
-        &[
-            "symbolic-ref",
-            &format!("refs/remotes/{remote}/HEAD"),
-        ],
+        &["symbolic-ref", &format!("refs/remotes/{remote}/HEAD")],
         FAST,
     )
+    .await
     else {
         return None;
     };
@@ -89,8 +93,8 @@ pub fn default_branch(root: &Path, remote: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub fn probe(path: &Path) -> Result<RepoContext, String> {
-    let Some(root) = repo_root(path) else {
+pub async fn probe(path: &Path) -> Result<RepoContext, String> {
+    let Some(root) = repo_root(path).await else {
         return Err("not inside a git repository".into());
     };
     let mut context = RepoContext {
@@ -98,22 +102,22 @@ pub fn probe(path: &Path) -> Result<RepoContext, String> {
         remote: "origin".into(),
         ..RepoContext::default()
     };
-    if let Some(url) = remote_url(path, "origin")
+    if let Some(url) = remote_url(path, "origin").await
         && let Some((host, repository)) = parse_remote(&url)
     {
         context.host = Some(host);
         context.repository = Some(repository);
     }
     if let Some(root) = &context.root {
-        context.default_branch = default_branch(root, &context.remote);
+        context.default_branch = default_branch(root, &context.remote).await;
     }
     Ok(context)
 }
 
 /// Commits ahead of / behind a base ref using remote-tracking refs. Stale refs are a known
 /// limitation, surfaced to the user as "local refs" in the preflight summary.
-pub fn branch_state(root: &Path, base: &str, remote: &str) -> BranchState {
-    let branch = current_branch(root).unwrap_or_default();
+pub async fn branch_state(root: &Path, base: &str, remote: &str) -> BranchState {
+    let branch = current_branch(root).await.unwrap_or_default();
     let mut state = BranchState {
         branch: branch.clone(),
         ..BranchState::default()
@@ -121,14 +125,16 @@ pub fn branch_state(root: &Path, base: &str, remote: &str) -> BranchState {
     if branch.is_empty() {
         return state;
     }
-    let GitResult::Completed { stdout, .. } = git::run(
+    let upstream = match git::run(
         root,
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
         FAST,
-    ) else {
-        return state;
+    )
+    .await
+    {
+        GitResult::Completed { stdout, .. } => stdout.trim().to_owned(),
+        GitResult::Failed { .. } | GitResult::TimedOut => String::new(),
     };
-    let upstream = stdout.trim().to_owned();
     state.upstream = (!upstream.is_empty()).then_some(upstream);
     state.remote_branch_exists = match git::run(
         root,
@@ -139,13 +145,15 @@ pub fn branch_state(root: &Path, base: &str, remote: &str) -> BranchState {
             &format!("refs/remotes/{remote}/{branch}"),
         ],
         FAST,
-    ) {
+    )
+    .await
+    {
         GitResult::Completed { .. } => Some(true),
         GitResult::Failed { .. } => Some(false),
         GitResult::TimedOut => None,
     };
     let GitResult::Completed { stdout: status, .. } =
-        git::run(root, &["status", "--porcelain"], FAST)
+        git::run(root, &["status", "--porcelain"], FAST).await
     else {
         return state;
     };
@@ -160,13 +168,32 @@ pub fn branch_state(root: &Path, base: &str, remote: &str) -> BranchState {
             &format!("{base_ref}...HEAD"),
         ],
         FAST,
-    ) else {
+    )
+    .await
+    else {
         return state;
     };
-    let mut numbers = counts.trim().split_whitespace().map(str::to_owned);
+    let mut numbers = counts.split_whitespace().map(str::to_owned);
     if let (Some(behind), Some(ahead)) = (numbers.next(), numbers.next()) {
         state.behind = behind.parse().ok();
         state.ahead = ahead.parse().ok();
+    }
+    let unpushed_ref = state
+        .upstream
+        .clone()
+        .unwrap_or_else(|| format!("{remote}/{branch}"));
+    if state.remote_branch_exists == Some(true) || state.upstream.is_some() {
+        if let GitResult::Completed { stdout, .. } = git::run(
+            root,
+            &["rev-list", "--count", &format!("{unpushed_ref}..HEAD")],
+            FAST,
+        )
+        .await
+        {
+            state.unpushed = stdout.trim().parse().ok();
+        }
+    } else {
+        state.unpushed = state.ahead;
     }
     state
 }
@@ -205,17 +232,19 @@ pub async fn delete_local_branch(root: &Path, branch: &str) -> Result<(), PushEr
 
 /// Local and remote-tracking branch names for the target picker, without duplicates or the
 /// current checkout noise of `git branch -a`.
-pub fn branches(root: &Path, remote: &str) -> Vec<String> {
+pub async fn branches(root: &Path, remote: &str) -> Vec<String> {
     let GitResult::Completed { stdout, .. } = git::run(
         root,
         &[
             "for-each-ref",
-            &format!("--format=%(refname:short)"),
+            "--format=%(refname:short)",
             "refs/heads",
             &format!("refs/remotes/{remote}"),
         ],
         FAST,
-    ) else {
+    )
+    .await
+    else {
         return vec![];
     };
     let mut names: Vec<String> = stdout
@@ -235,17 +264,19 @@ pub fn branches(root: &Path, remote: &str) -> Vec<String> {
 }
 
 /// Single-commit subjects between the base and HEAD, oldest first.
-pub fn commit_subjects(root: &Path, base: &str, remote: &str, limit: usize) -> Vec<String> {
+pub async fn commit_subjects(root: &Path, base: &str, remote: &str, limit: usize) -> Vec<String> {
     let GitResult::Completed { stdout, .. } = git::run(
         root,
         &[
             "log",
-            &format!("--format=%s"),
+            "--format=%s",
             &format!("{remote}/{base}..HEAD"),
             &format!("-{limit}"),
         ],
         FAST,
-    ) else {
+    )
+    .await
+    else {
         return vec![];
     };
     stdout
@@ -278,17 +309,17 @@ pub fn find_template(root: &Path, kind: crate::model::ChangeRequestKind) -> Opti
         if full.is_file() {
             return std::fs::read_to_string(&full).ok();
         }
-        if full.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&full) {
-                let mut names: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-                    .collect();
-                names.sort();
-                if let Some(first) = names.first() {
-                    return std::fs::read_to_string(first).ok();
-                }
+        if full.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&full)
+        {
+            let mut names: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+                .collect();
+            names.sort();
+            if let Some(first) = names.first() {
+                return std::fs::read_to_string(first).ok();
             }
         }
     }
@@ -301,21 +332,19 @@ pub fn title_from(branch: &str, subjects: &[String], commits_ahead: usize) -> St
     if commits_ahead == 1 && subjects.len() == 1 {
         return subjects[0].clone();
     }
-    branch
+    let title = branch
         .rsplit('/')
         .next()
         .unwrap_or(branch)
         .replace(['-', '_'], " ")
         .split_whitespace()
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    let mut chars = title.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -326,14 +355,21 @@ mod tests {
     #[test]
     fn push_never_carries_force_flags() {
         let args = push_args("origin", "feature/reader");
-        assert_eq!(args, vec!["push", "--set-upstream", "origin", "feature/reader"]);
+        assert_eq!(
+            args,
+            vec!["push", "--set-upstream", "origin", "feature/reader"]
+        );
         assert!(args.iter().all(|arg| !arg.contains("force")));
     }
 
     #[test]
     fn titles_prefer_a_single_commit_subject() {
         assert_eq!(
-            title_from("feature/fix-droplet-reader", &["Fix droplet reader".into()], 1),
+            title_from(
+                "feature/fix-droplet-reader",
+                &["Fix droplet reader".into()],
+                1
+            ),
             "Fix droplet reader"
         );
     }
@@ -370,9 +406,10 @@ mod tests {
     #[test]
     fn template_detection_reads_the_first_gitlab_template() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".gitlab/merge_request_templates")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".gitlab/merge_request_templates")).unwrap();
         std::fs::write(
-            dir.path().join(".gitlab/merge_request_templates/Default.md"),
+            dir.path()
+                .join(".gitlab/merge_request_templates/Default.md"),
             "## What\n",
         )
         .unwrap();

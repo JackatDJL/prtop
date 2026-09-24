@@ -5,14 +5,13 @@ pub mod gitlab;
 
 use crate::model::{
     ChangeRequest, ChangeRequestId, ChangeRequestKind, CiState, Comment, JobId, Label, LogChunk,
-    Mergeability, MergeOutcome, MergeStrategy, Person, Pipeline, PipelineId, RequestState,
+    MergeOutcome, MergeStrategy, Mergeability, Person, Pipeline, PipelineId, RequestState,
     ReviewState, Reviewer,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-#[allow(dead_code)] // The contract deliberately precedes the later write-operation milestones.
 #[derive(Debug, Error)]
 pub enum ForgeError {
     #[error("authentication required for {0}")]
@@ -37,13 +36,8 @@ pub enum ForgeError {
     PipelineNotCancelable,
     #[error("logs are unavailable")]
     LogsUnavailable,
-    #[error("pipeline has expired")]
-    PipelineExpired,
-    #[error("artifact has expired")]
-    ArtifactExpired,
 }
 
-#[allow(dead_code)] // Constructed once app write dispatch routes through the provider registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReviewAction {
     Approve,
@@ -70,6 +64,7 @@ pub struct ForgeCapabilities {
     pub ci_artifacts: bool,
     // Milestone 4: change-request lifecycle and metadata.
     pub create_change_request: bool,
+    pub create_draft: bool,
     pub edit_title: bool,
     pub edit_description: bool,
     pub labels: bool,
@@ -101,6 +96,15 @@ pub struct NewChangeRequest {
     pub milestone: Option<String>,
 }
 
+/// The provider may create the request successfully while one or more follow-up metadata
+/// writes fail. In that case the request is still reconciled and the UI tells the user which
+/// fields need attention, avoiding a duplicate-create retry.
+#[derive(Clone, Debug)]
+pub struct CreateResult {
+    pub request: ChangeRequest,
+    pub metadata_warnings: Vec<String>,
+}
+
 /// Metadata edits on an existing change request. Absent fields are left untouched.
 #[derive(Clone, Debug, Default)]
 pub struct RequestPatch {
@@ -119,6 +123,42 @@ pub struct RequestPatch {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RepositoryInfo {
     pub default_branch: Option<String>,
+    /// GitHub repository strategy flags. `None` means the provider did not report the setting.
+    pub allow_merge_commit: Option<bool>,
+    pub allow_squash_merge: Option<bool>,
+    pub allow_rebase_merge: Option<bool>,
+    pub allow_auto_merge: Option<bool>,
+    /// GitLab project merge policy values.
+    pub merge_method: Option<String>,
+    pub squash_option: Option<String>,
+}
+impl RepositoryInfo {
+    pub fn filter_capabilities(&self, caps: &mut ForgeCapabilities) {
+        if let Some(allowed) = self.allow_merge_commit {
+            caps.merge_commit &= allowed;
+        }
+        if let Some(allowed) = self.allow_squash_merge {
+            caps.squash_merge &= allowed;
+        }
+        if let Some(allowed) = self.allow_rebase_merge {
+            caps.rebase_merge &= allowed;
+        }
+        if let Some(allowed) = self.allow_auto_merge {
+            caps.auto_merge &= allowed;
+        }
+        if let Some(method) = self.merge_method.as_deref() {
+            caps.merge_commit &= method == "merge";
+            caps.rebase_merge &= matches!(method, "rebase_merge" | "ff");
+        }
+        match self.squash_option.as_deref() {
+            Some("never") => caps.squash_merge = false,
+            Some("always") => {
+                caps.merge_commit = false;
+                caps.rebase_merge = false;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -126,7 +166,6 @@ pub struct Milestone {
     pub name: String,
 }
 
-#[allow(dead_code)] // Providers implement these methods as their milestone reaches the UI.
 #[async_trait]
 pub trait ForgeProvider: Send + Sync {
     fn name(&self) -> &str;
@@ -137,6 +176,14 @@ pub trait ForgeProvider: Send + Sync {
     async fn get_change_request(&self, _id: &ChangeRequestId) -> Result<ChangeRequest, ForgeError> {
         Err(ForgeError::Unsupported)
     }
+    /// Fresh request data for merge checks. Providers can add policy signals unavailable from
+    /// their ordinary detail response; the default uses the regular normalized request.
+    async fn get_change_request_for_merge(
+        &self,
+        id: &ChangeRequestId,
+    ) -> Result<ChangeRequest, ForgeError> {
+        self.get_change_request(id).await
+    }
     async fn get_repository(&self, _repository: &str) -> Result<RepositoryInfo, ForgeError> {
         Err(ForgeError::Unsupported)
     }
@@ -144,7 +191,7 @@ pub trait ForgeProvider: Send + Sync {
         &self,
         _input: &NewChangeRequest,
         _repository: &str,
-    ) -> Result<ChangeRequest, ForgeError> {
+    ) -> Result<CreateResult, ForgeError> {
         Err(ForgeError::Unsupported)
     }
     async fn update_change_request(
@@ -154,10 +201,7 @@ pub trait ForgeProvider: Send + Sync {
     ) -> Result<ChangeRequest, ForgeError> {
         Err(ForgeError::Unsupported)
     }
-    async fn list_labels(
-        &self,
-        _repository: &str,
-    ) -> Result<Vec<Label>, ForgeError> {
+    async fn list_labels(&self, _repository: &str) -> Result<Vec<Label>, ForgeError> {
         Err(ForgeError::Unsupported)
     }
     async fn set_labels(
@@ -181,10 +225,7 @@ pub trait ForgeProvider: Send + Sync {
     ) -> Result<Vec<Person>, ForgeError> {
         Err(ForgeError::Unsupported)
     }
-    async fn list_milestones(
-        &self,
-        _repository: &str,
-    ) -> Result<Vec<Milestone>, ForgeError> {
+    async fn list_milestones(&self, _repository: &str) -> Result<Vec<Milestone>, ForgeError> {
         Err(ForgeError::Unsupported)
     }
     async fn set_milestone(
@@ -210,13 +251,6 @@ pub trait ForgeProvider: Send + Sync {
         Err(ForgeError::Unsupported)
     }
     async fn delete_branch(&self, _repository: &str, _branch: &str) -> Result<(), ForgeError> {
-        Err(ForgeError::Unsupported)
-    }
-    async fn list_comments(
-        &self,
-        _id: &ChangeRequestId,
-        _page: u32,
-    ) -> Result<Vec<Comment>, ForgeError> {
         Err(ForgeError::Unsupported)
     }
     async fn list_reviews(&self, _id: &ChangeRequestId) -> Result<Vec<Reviewer>, ForgeError> {
@@ -246,12 +280,10 @@ pub trait ForgeProvider: Send + Sync {
     async fn play_job(&self, _id: &JobId) -> Result<(), ForgeError> {
         Err(ForgeError::Unsupported)
     }
-    async fn submit_review(&self, _id: &ChangeRequestId) -> Result<(), ForgeError> {
-        Err(ForgeError::Unsupported)
-    }
     async fn create_comment(&self, _id: &ChangeRequestId, _body: &str) -> Result<(), ForgeError> {
         Err(ForgeError::Unsupported)
     }
+    #[allow(dead_code)] // Provider adapters expose these endpoints; comment editing is outside M4.
     async fn edit_comment(
         &self,
         _id: &ChangeRequestId,
@@ -260,6 +292,7 @@ pub trait ForgeProvider: Send + Sync {
     ) -> Result<Comment, ForgeError> {
         Err(ForgeError::Unsupported)
     }
+    #[allow(dead_code)] // Provider adapters expose these endpoints; comment editing is outside M4.
     async fn delete_comment(
         &self,
         _id: &ChangeRequestId,
@@ -296,9 +329,32 @@ pub trait ForgeProvider: Send + Sync {
     ) -> Result<(), ForgeError> {
         Err(ForgeError::Unsupported)
     }
-    async fn merge(&self, _id: &ChangeRequestId) -> Result<(), ForgeError> {
-        Err(ForgeError::Unsupported)
+}
+
+pub(crate) fn apply_review_states(request: &mut ChangeRequest, updates: Vec<Reviewer>) {
+    for update in updates {
+        request
+            .reviewers
+            .retain(|reviewer| reviewer.person.login != update.person.login);
+        if update.state != ReviewState::None {
+            request.reviewers.push(update);
+        }
     }
+    request.review = if request
+        .reviewers
+        .iter()
+        .any(|reviewer| reviewer.state == ReviewState::ChangesRequested)
+    {
+        ReviewState::ChangesRequested
+    } else if request
+        .reviewers
+        .iter()
+        .any(|reviewer| reviewer.state == ReviewState::Approved)
+    {
+        ReviewState::Approved
+    } else {
+        ReviewState::None
+    };
 }
 
 #[allow(clippy::too_many_arguments)] // Kept private while adapters share the normalized mapping.
@@ -350,6 +406,56 @@ pub(crate) fn normalized_request(
         head_sha: None,
         merged_sha: None,
         merge_queue: None,
+        approvals_required: None,
+        approvals_left: None,
+        approvals_satisfied: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_strategy_flags_and_project_policy_gate_merge_actions() {
+        let mut caps = ForgeCapabilities {
+            merge: true,
+            merge_commit: true,
+            squash_merge: true,
+            rebase_merge: true,
+            auto_merge: true,
+            ..ForgeCapabilities::default()
+        };
+        RepositoryInfo {
+            allow_merge_commit: Some(false),
+            allow_squash_merge: Some(true),
+            allow_rebase_merge: Some(false),
+            allow_auto_merge: Some(false),
+            ..RepositoryInfo::default()
+        }
+        .filter_capabilities(&mut caps);
+        assert!(caps.merge);
+        assert!(!caps.merge_commit);
+        assert!(caps.squash_merge);
+        assert!(!caps.rebase_merge);
+        assert!(!caps.auto_merge);
+
+        let mut gitlab = ForgeCapabilities {
+            merge: true,
+            merge_commit: true,
+            squash_merge: true,
+            rebase_merge: true,
+            ..ForgeCapabilities::default()
+        };
+        RepositoryInfo {
+            merge_method: Some("merge".into()),
+            squash_option: Some("never".into()),
+            ..RepositoryInfo::default()
+        }
+        .filter_capabilities(&mut gitlab);
+        assert!(gitlab.merge_commit);
+        assert!(!gitlab.squash_merge);
+        assert!(!gitlab.rebase_merge);
     }
 }
 pub mod auth;
