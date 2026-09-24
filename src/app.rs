@@ -12,7 +12,9 @@ use crate::{
 };
 use anyhow::Result;
 use chrono::Utc;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use std::collections::HashMap;
 use std::{sync::Arc, time::Instant};
@@ -59,8 +61,9 @@ pub enum Scope {
 pub enum AppEvent {
     Refresh(RefreshResult),
     CommentWrite {
-        temporary_id: String,
-        result: Result<(), forge::ForgeError>,
+        request: ChangeRequestId,
+        correlation_id: OpId,
+        result: Result<Comment, forge::ForgeError>,
     },
     ReviewWrite {
         request: ChangeRequestId,
@@ -74,6 +77,18 @@ pub enum AppEvent {
     PipelinesLoaded {
         request: ChangeRequestId,
         pipelines: Result<Vec<Pipeline>, forge::ForgeError>,
+    },
+    DetailRequestLoaded {
+        request: ChangeRequestId,
+        result: Result<ChangeRequest, forge::ForgeError>,
+    },
+    CommentsLoaded {
+        request: ChangeRequestId,
+        result: Result<Vec<Comment>, forge::ForgeError>,
+    },
+    ReviewsLoaded {
+        request: ChangeRequestId,
+        result: Result<Vec<Reviewer>, forge::ForgeError>,
     },
     PipelineLoaded {
         id: PipelineId,
@@ -237,11 +252,22 @@ pub enum View {
 }
 #[derive(Clone, Debug)]
 pub enum Overlay {
-    Composer { body: String },
-    ReviewMenu { selected: usize },
-    Palette { query: String, selected: usize },
+    Composer {
+        body: String,
+        error: Option<String>,
+        button_hits: Vec<(Rect, usize)>,
+    },
+    ReviewMenu {
+        selected: usize,
+    },
+    Palette {
+        query: String,
+        selected: usize,
+    },
     ConfirmDelete,
-    ConfirmCi { action: CiAction },
+    ConfirmCi {
+        action: CiAction,
+    },
     Create(Box<CreateWorkflow>),
     Edit(EditSession),
     Merge(MergeSession),
@@ -295,6 +321,34 @@ pub struct RefreshResult {
     pub health: Vec<(String, String)>,
     pub from_cache: bool,
 }
+
+#[derive(Clone, Debug)]
+pub struct DetailResources {
+    pub request: LoadState<()>,
+    pub comments: LoadState<Vec<Comment>>,
+    pub reviews: LoadState<Vec<Reviewer>>,
+    pub ci: LoadState<Vec<Pipeline>>,
+    refreshed_at: Option<Instant>,
+}
+
+impl Default for DetailResources {
+    fn default() -> Self {
+        Self {
+            request: LoadState::NotLoaded,
+            comments: LoadState::NotLoaded,
+            reviews: LoadState::NotLoaded,
+            ci: LoadState::NotLoaded,
+            refreshed_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingComment {
+    request: ChangeRequestId,
+    correlation_id: OpId,
+    body: String,
+}
 pub struct App {
     pub requests: Vec<ChangeRequest>,
     pub selected: usize,
@@ -316,12 +370,13 @@ pub struct App {
     pub log_searching: bool,
     pub logs: HashMap<JobId, Vec<String>>,
     pub regions: HitRegions,
-    pub toast: Option<String>,
+    toast: Option<String>,
     pub overlay: Option<Overlay>,
     pub repo_context: RepoContext,
     pub project_git: Option<BranchState>,
     pub palette_hits: Vec<(Rect, usize)>,
     pub activity: HashMap<ChangeRequestId, Vec<String>>,
+    pub detail_resources: HashMap<ChangeRequestId, DetailResources>,
     repository_info: HashMap<(String, String), forge::RepositoryInfo>,
     repository_info_loading: std::collections::HashSet<(String, String)>,
     repository_info_failed: std::collections::HashSet<(String, String)>,
@@ -332,6 +387,7 @@ pub struct App {
     pub(crate) providers: HashMap<String, Arc<dyn ForgeProvider>>,
     pub(crate) last_op: Option<OpId>,
     pub(crate) in_flight: HashMap<(ChangeRequestId, &'static str), OpId>,
+    pending_comment: Option<PendingComment>,
 }
 
 impl App {
@@ -367,7 +423,7 @@ impl App {
         } else {
             providers(&config)
         };
-        let app = Self {
+        let mut app = Self {
             requests,
             selected: 0,
             filter: String::new(),
@@ -394,6 +450,7 @@ impl App {
             project_git: None,
             palette_hits: vec![],
             activity: HashMap::new(),
+            detail_resources: HashMap::new(),
             repository_info: HashMap::new(),
             repository_info_loading: std::collections::HashSet::new(),
             repository_info_failed: std::collections::HashSet::new(),
@@ -404,7 +461,11 @@ impl App {
             providers,
             last_op: None,
             in_flight: HashMap::new(),
+            pending_comment: None,
         };
+        if demo {
+            app.hydrate_demo_resources();
+        }
         if !demo && let Some(root) = app.repo_context.root.clone() {
             let target = app.repo_context.default_branch.clone().unwrap_or_default();
             let remote = app.repo_context.remote.clone();
@@ -458,6 +519,7 @@ impl App {
             project_git: None,
             palette_hits: vec![],
             activity: HashMap::new(),
+            detail_resources: HashMap::new(),
             repository_info: HashMap::new(),
             repository_info_loading: std::collections::HashSet::new(),
             repository_info_failed: std::collections::HashSet::new(),
@@ -468,7 +530,18 @@ impl App {
             events,
             last_op: None,
             in_flight: HashMap::new(),
+            pending_comment: None,
         }
+    }
+    pub fn toast(&self) -> Option<&str> {
+        self.toast.as_deref()
+    }
+    pub fn comment_submission_pending(&self) -> bool {
+        self.pending_comment.is_some()
+    }
+    pub fn set_toast(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.toast = (!message.trim().is_empty()).then_some(message);
     }
     pub fn visible(&self) -> Vec<&ChangeRequest> {
         self.requests
@@ -491,6 +564,23 @@ impl App {
             return None;
         };
         self.requests.iter().find(|request| request.id == *id)
+    }
+    pub fn detail_resources_for(&self, id: &ChangeRequestId) -> Option<&DetailResources> {
+        self.detail_resources.get(id)
+    }
+    fn hydrate_demo_resources(&mut self) {
+        for request in self.requests.iter().cloned() {
+            self.detail_resources.insert(
+                request.id.clone(),
+                DetailResources {
+                    request: LoadState::Loaded(()),
+                    comments: LoadState::Loaded(request.comments),
+                    reviews: LoadState::Loaded(request.reviewers),
+                    ci: LoadState::Loaded(request.pipelines),
+                    refreshed_at: Some(Instant::now()),
+                },
+            );
+        }
     }
     pub fn request_for_view(&self) -> Option<&ChangeRequest> {
         match self.view {
@@ -535,28 +625,74 @@ impl App {
         self.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE))
     }
     pub fn handle_key_event(&mut self, event: KeyEvent) -> bool {
+        if event.kind != KeyEventKind::Press {
+            return false;
+        }
         let key = event.code;
         if let Some(overlay) = self.overlay.take() {
             match overlay {
-                Overlay::Composer { mut body } => match key {
-                    KeyCode::Esc => self.toast = Some("Comment discarded".into()),
-                    KeyCode::Backspace => {
-                        body.pop();
-                        self.overlay = Some(Overlay::Composer { body });
+                Overlay::Composer {
+                    mut body,
+                    mut error,
+                    button_hits,
+                } => {
+                    let pending = self.pending_comment.is_some();
+                    match key {
+                        KeyCode::Esc if !pending => {}
+                        KeyCode::Esc => {
+                            self.overlay = Some(Overlay::Composer {
+                                body,
+                                error,
+                                button_hits,
+                            })
+                        }
+                        KeyCode::Backspace if !pending => {
+                            body.pop();
+                            error = None;
+                            self.overlay = Some(Overlay::Composer {
+                                body,
+                                error,
+                                button_hits,
+                            });
+                        }
+                        KeyCode::Enter if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if pending {
+                                self.overlay = Some(Overlay::Composer {
+                                    body,
+                                    error,
+                                    button_hits,
+                                });
+                            } else {
+                                self.submit_comment(body);
+                            }
+                        }
+                        KeyCode::Enter if !pending => {
+                            body.push('\n');
+                            error = None;
+                            self.overlay = Some(Overlay::Composer {
+                                body,
+                                error,
+                                button_hits,
+                            });
+                        }
+                        KeyCode::Char(c) if !pending => {
+                            body.push(c);
+                            error = None;
+                            self.overlay = Some(Overlay::Composer {
+                                body,
+                                error,
+                                button_hits,
+                            });
+                        }
+                        _ => {
+                            self.overlay = Some(Overlay::Composer {
+                                body,
+                                error,
+                                button_hits,
+                            })
+                        }
                     }
-                    KeyCode::Enter if event.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.submit_comment(body)
-                    }
-                    KeyCode::Enter => {
-                        body.push('\n');
-                        self.overlay = Some(Overlay::Composer { body });
-                    }
-                    KeyCode::Char(c) => {
-                        body.push(c);
-                        self.overlay = Some(Overlay::Composer { body });
-                    }
-                    _ => self.overlay = Some(Overlay::Composer { body }),
-                },
+                }
                 Overlay::ReviewMenu { mut selected } => match key {
                     KeyCode::Esc => {}
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -570,11 +706,7 @@ impl App {
                     KeyCode::Enter => match selected {
                         0 => self.apply_review(ReviewState::Approved),
                         1 => self.apply_review(ReviewState::ChangesRequested),
-                        _ => {
-                            self.overlay = Some(Overlay::Composer {
-                                body: String::new(),
-                            })
-                        }
+                        _ => self.open_comment_composer(),
                     },
                     _ => self.overlay = Some(Overlay::ReviewMenu { selected }),
                 },
@@ -605,9 +737,9 @@ impl App {
                 },
                 Overlay::ConfirmDelete => match key {
                     KeyCode::Char('d') => {
-                        self.toast = Some(
-                            "Delete is capability-gated and not available in this build".into(),
-                        )
+                        self.set_toast(
+                            "Delete is capability-gated and not available in this build",
+                        );
                     }
                     KeyCode::Esc | KeyCode::Enter => {}
                     _ => self.overlay = Some(Overlay::ConfirmDelete),
@@ -700,6 +832,13 @@ impl App {
             View::JobDetail(id) => self.handle_job_key(&id, key),
         }
     }
+    fn open_comment_composer(&mut self) {
+        self.overlay = Some(Overlay::Composer {
+            body: String::new(),
+            error: None,
+            button_hits: vec![],
+        });
+    }
     fn handle_dashboard_key(&mut self, key: KeyCode) -> bool {
         match key {
             KeyCode::Char('q') => return true,
@@ -758,9 +897,7 @@ impl App {
                 }
             }
             KeyCode::Char('c') if self.can(|capabilities| capabilities.comments) => {
-                self.overlay = Some(Overlay::Composer {
-                    body: String::new(),
-                })
+                self.open_comment_composer()
             }
             KeyCode::Char('a') if self.can(|capabilities| capabilities.approve) => {
                 self.apply_review(ReviewState::Approved)
@@ -772,7 +909,7 @@ impl App {
                 self.overlay = Some(Overlay::ReviewMenu { selected: 0 })
             }
             KeyCode::Char('c') | KeyCode::Char('R') | KeyCode::Char('a') | KeyCode::Char('x') => {
-                self.toast = Some("This forge has not advertised this write capability".into())
+                self.set_toast("This forge has not advertised this write capability");
             }
             KeyCode::Char(':') => {
                 self.overlay = Some(Overlay::Palette {
@@ -795,6 +932,7 @@ impl App {
                 self.focus = Focus::Requests;
                 self.filtering = false;
             }
+            KeyCode::Char('r') => self.hydrate_detail(id.clone(), true),
             KeyCode::Enter if self.detail_focus == DetailFocus::Ci => self.open_pipeline(),
             KeyCode::Tab => self.detail_focus = self.detail_focus.next(),
             KeyCode::BackTab => self.detail_focus = self.detail_focus.previous(),
@@ -805,9 +943,7 @@ impl App {
             KeyCode::Home => self.home_detail(id),
             KeyCode::End => self.end_detail(),
             KeyCode::Char('c') if self.can(|capabilities| capabilities.comments) => {
-                self.overlay = Some(Overlay::Composer {
-                    body: String::new(),
-                })
+                self.open_comment_composer()
             }
             KeyCode::Char('e') => self.open_edit(),
             KeyCode::Char('M') => self.open_merge(),
@@ -821,7 +957,7 @@ impl App {
                 self.apply_review(ReviewState::ChangesRequested)
             }
             KeyCode::Char('c') | KeyCode::Char('R') | KeyCode::Char('a') | KeyCode::Char('x') => {
-                self.toast = Some("This forge has not advertised this write capability".into())
+                self.set_toast("This forge has not advertised this write capability");
             }
             KeyCode::Char(':') => {
                 self.overlay = Some(Overlay::Palette {
@@ -843,7 +979,7 @@ impl App {
             self.job_selected = 0;
             self.load_pipeline();
         } else {
-            self.toast = Some("No pipeline reported".into());
+            self.set_toast("No pipeline reported");
         }
     }
     fn handle_pipeline_key(&mut self, id: &PipelineId, key: KeyCode) -> bool {
@@ -910,7 +1046,7 @@ impl App {
             return;
         }
         let Some(provider) = self.providers.get(&id.pipeline.forge).cloned() else {
-            self.toast = Some("No provider is configured for this job".into());
+            self.set_toast("No provider is configured for this job");
             return;
         };
         let sender = self.events.clone();
@@ -994,7 +1130,7 @@ impl App {
                 CiAction::RetryPipeline(id) | CiAction::CancelPipeline(id) => &id.forge,
             };
             let Some(provider) = self.providers.get(forge).cloned() else {
-                self.toast = Some("No provider is configured for this CI action".into());
+                self.set_toast("No provider is configured for this CI action");
                 return;
             };
             let description = match action {
@@ -1019,28 +1155,28 @@ impl App {
                     result,
                 });
             });
-            self.toast = Some(format!("{description} in progress"));
+            self.set_toast(format!("{description} in progress"));
             return;
         }
         match action {
             CiAction::RetryJob(id) => {
-                self.toast = Some("Retry job requested".into());
+                self.set_toast("Retry job requested");
                 self.set_job_status(&id, PipelineStatus::Running);
             }
             CiAction::RetryPipeline(id) => {
-                self.toast = Some("Retry pipeline requested".into());
+                self.set_toast("Retry pipeline requested");
                 self.set_pipeline_status(&id, PipelineStatus::Running);
             }
             CiAction::CancelJob(id) => {
-                self.toast = Some("Cancel job requested".into());
+                self.set_toast("Cancel job requested");
                 self.set_job_status(&id, PipelineStatus::Cancelled);
             }
             CiAction::CancelPipeline(id) => {
-                self.toast = Some("Cancel pipeline requested".into());
+                self.set_toast("Cancel pipeline requested");
                 self.set_pipeline_status(&id, PipelineStatus::Cancelled);
             }
             CiAction::PlayJob(id) => {
-                self.toast = Some("Manual job started".into());
+                self.set_toast("Manual job started");
                 self.set_job_status(&id, PipelineStatus::Running);
             }
         }
@@ -1121,23 +1257,97 @@ impl App {
             self.comment_scroll = 0;
             self.ci_scroll = 0;
             self.load_repository_info(id.forge.clone(), id.repository.clone());
-            if self.can(|capabilities| capabilities.ci_read) {
-                self.load_pipelines(id);
-            }
+            self.hydrate_detail(id, false);
         }
     }
-    fn load_pipelines(&self, request: ChangeRequestId) {
+    fn hydrate_detail(&mut self, request: ChangeRequestId, force: bool) {
         if self.demo {
+            if let Some(item) = self
+                .requests
+                .iter()
+                .find(|item| item.id == request)
+                .cloned()
+            {
+                let resources = self.detail_resources.entry(request).or_default();
+                resources.request = LoadState::Loaded(());
+                resources.comments = LoadState::Loaded(item.comments.clone());
+                resources.reviews = LoadState::Loaded(item.reviewers.clone());
+                resources.ci = LoadState::Loaded(item.pipelines.clone());
+                resources.refreshed_at = Some(Instant::now());
+            }
             return;
         }
+        let stale = self
+            .detail_resources
+            .get(&request)
+            .and_then(|resources| resources.refreshed_at)
+            .is_none_or(|time| time.elapsed() >= std::time::Duration::from_secs(60));
         let Some(provider) = self.providers.get(&request.forge).cloned() else {
+            let resources = self.detail_resources.entry(request).or_default();
+            resources.request = LoadState::Failed("no provider is configured".into());
+            resources.comments = LoadState::Failed("no provider is configured".into());
+            resources.reviews = LoadState::Failed("no provider is configured".into());
+            resources.ci = LoadState::Failed("no provider is configured".into());
             return;
         };
+        let resources = self.detail_resources.entry(request.clone()).or_default();
+        resources.refreshed_at = Some(Instant::now());
+        let load_request = begin_load(&mut resources.request, force, stale);
+        let load_comments = begin_load(&mut resources.comments, force, stale);
+        let load_reviews = begin_load(&mut resources.reviews, force, stale);
+        let can_read_ci = provider.capabilities().ci_read;
+        let load_ci = if can_read_ci {
+            begin_load(&mut resources.ci, force, stale)
+        } else {
+            resources.ci = LoadState::Unsupported;
+            false
+        };
         let sender = self.events.clone();
-        tokio::spawn(async move {
-            let pipelines = provider.list_pipelines(&request).await;
-            let _ = sender.send(AppEvent::PipelinesLoaded { request, pipelines });
-        });
+        if load_request {
+            let provider = provider.clone();
+            let sender = sender.clone();
+            let id = request.clone();
+            tokio::spawn(async move {
+                let result = provider.get_change_request(&id).await;
+                let _ = sender.send(AppEvent::DetailRequestLoaded {
+                    request: id,
+                    result,
+                });
+            });
+        }
+        if load_comments {
+            let provider = provider.clone();
+            let sender = sender.clone();
+            let id = request.clone();
+            tokio::spawn(async move {
+                let result = provider.list_comments(&id).await;
+                let _ = sender.send(AppEvent::CommentsLoaded {
+                    request: id,
+                    result,
+                });
+            });
+        }
+        if load_reviews {
+            let provider = provider.clone();
+            let sender = sender.clone();
+            let id = request.clone();
+            tokio::spawn(async move {
+                let result = provider.list_reviews(&id).await;
+                let _ = sender.send(AppEvent::ReviewsLoaded {
+                    request: id,
+                    result,
+                });
+            });
+        }
+        if load_ci {
+            tokio::spawn(async move {
+                let result = provider.list_pipelines(&request).await;
+                let _ = sender.send(AppEvent::PipelinesLoaded {
+                    request,
+                    pipelines: result,
+                });
+            });
+        }
     }
     fn load_pipeline(&self) {
         if self.demo {
@@ -1228,16 +1438,16 @@ impl App {
     }
     fn open_create(&mut self) {
         let Some((forge, host, repository, kind)) = self.project_forge() else {
-            self.toast = Some("Create requires a configured Git repository and forge".into());
+            self.set_toast("Create requires a configured Git repository and forge");
             return;
         };
         let Some(provider) = self.providers.get(&forge) else {
-            self.toast = Some("No provider is configured for this project".into());
+            self.set_toast("No provider is configured for this project");
             return;
         };
         let caps = provider.capabilities();
         if !caps.create_change_request {
-            self.toast = Some("This forge does not support creating change requests".into());
+            self.set_toast("This forge does not support creating change requests");
             return;
         }
         let mut context = self.repo_context.clone();
@@ -1264,7 +1474,7 @@ impl App {
         let Some(provider) = self.providers.get(&forge).cloned() else {
             self.repository_info_loading.remove(&key);
             self.repository_info_failed.insert(key);
-            self.toast = Some("No provider is configured for this repository".into());
+            self.set_toast("No provider is configured for this repository");
             return;
         };
         let events = self.events.clone();
@@ -1326,7 +1536,7 @@ impl App {
                 self.load_merge_preflight(request.id.clone());
             }
         } else {
-            self.toast = Some("Merge is not supported or this request is not open".into());
+            self.set_toast("Merge is not supported or this request is not open");
         }
     }
     pub(crate) fn load_merge_preflight(&self, id: ChangeRequestId) {
@@ -1554,19 +1764,19 @@ impl App {
             }
         });
         if !permitted {
-            self.toast = Some("This forge has not advertised this write capability".into());
+            self.set_toast("This forge has not advertised this write capability");
             return;
         }
         let Some(op) = self.claim(&id, "update") else {
             return;
         };
-        self.toast = Some(match action {
-            LifecycleAction::Title => "Updating title".into(),
-            LifecycleAction::Body => "Updating description".into(),
-            LifecycleAction::Draft => "Marking draft".into(),
-            LifecycleAction::Ready => "Marking ready for review".into(),
-            LifecycleAction::Close => "Closing request".into(),
-            LifecycleAction::Reopen => "Reopening request".into(),
+        self.set_toast(match action {
+            LifecycleAction::Title => "Updating title",
+            LifecycleAction::Body => "Updating description",
+            LifecycleAction::Draft => "Marking draft",
+            LifecycleAction::Ready => "Marking ready for review",
+            LifecycleAction::Close => "Closing request",
+            LifecycleAction::Reopen => "Reopening request",
         });
         let sender = self.events.clone();
         if self.demo {
@@ -1604,7 +1814,7 @@ impl App {
         }
         let Some(provider) = self.providers.get(&id.forge).cloned() else {
             self.in_flight.remove(&(id.clone(), "update"));
-            self.toast = Some("No provider is configured for this request".into());
+            self.set_toast("No provider is configured for this request");
             return;
         };
         tokio::spawn(async move {
@@ -1658,7 +1868,7 @@ impl App {
             }
         });
         if !cap_ok {
-            self.toast = Some("This forge has not advertised this write capability".into());
+            self.set_toast("This forge has not advertised this write capability");
             return;
         }
         let key = match kind {
@@ -1670,7 +1880,7 @@ impl App {
         let Some(op) = self.claim(&id, key) else {
             return;
         };
-        self.toast = Some("Saving change request metadata".into());
+        self.set_toast("Saving change request metadata");
         let sender = self.events.clone();
         if self.demo {
             let result = self
@@ -1744,7 +1954,7 @@ impl App {
         }
         let Some(provider) = self.providers.get(&id.forge).cloned() else {
             self.in_flight.remove(&(id.clone(), key));
-            self.toast = Some("No provider is configured for this request".into());
+            self.set_toast("No provider is configured for this request");
             return;
         };
         tokio::spawn(async move {
@@ -1839,7 +2049,7 @@ impl App {
         }
         let Some(provider) = self.providers.get(&id.forge).cloned() else {
             self.in_flight.remove(&(id.clone(), "merge"));
-            self.toast = Some("No provider is configured for this request".into());
+            self.set_toast("No provider is configured for this request");
             return;
         };
         tokio::spawn(async move {
@@ -1849,12 +2059,12 @@ impl App {
     }
     fn start_auto_merge(&mut self, id: ChangeRequestId, enabled: bool) {
         let Some(provider) = self.providers.get(&id.forge).cloned() else {
-            self.toast = Some("No provider is configured for this request".into());
+            self.set_toast("No provider is configured for this request");
             return;
         };
         let caps = self.capabilities_for(&id);
         if !caps.auto_merge {
-            self.toast = Some("Auto-merge is not supported by this forge".into());
+            self.set_toast("Auto-merge is not supported by this forge");
             return;
         }
         let strategy = [
@@ -1865,17 +2075,14 @@ impl App {
         .into_iter()
         .find_map(|(strategy, supported)| supported.then_some(strategy));
         let Some(strategy) = strategy else {
-            self.toast = Some("No supported strategy is available for auto-merge".into());
+            self.set_toast("No supported strategy is available for auto-merge");
             return;
         };
-        self.toast = Some(
-            if enabled {
-                "Enabling auto-merge"
-            } else {
-                "Disabling auto-merge"
-            }
-            .into(),
-        );
+        self.set_toast(if enabled {
+            "Enabling auto-merge"
+        } else {
+            "Disabling auto-merge"
+        });
         let Some(op) = self.claim(&id, "auto-merge") else {
             return;
         };
@@ -1919,11 +2126,11 @@ impl App {
     }
     fn start_branch_delete(&mut self, id: ChangeRequestId, branch: String) {
         let Some(provider) = self.providers.get(&id.forge).cloned() else {
-            self.toast = Some("No provider is configured for this request".into());
+            self.set_toast("No provider is configured for this request");
             return;
         };
         if !provider.capabilities().delete_source_branch {
-            self.toast = Some("Source branch deletion is not supported".into());
+            self.set_toast("Source branch deletion is not supported");
             return;
         }
         let sender = self.events.clone();
@@ -1947,7 +2154,7 @@ impl App {
         }
         session.pending = true;
         self.overlay = Some(Overlay::BranchCleanup(session.clone()));
-        self.toast = Some("Deleting source branch".into());
+        self.set_toast("Deleting source branch");
         let id = session.id.clone();
         let branch = session.branch.clone();
         let root = session.root.clone();
@@ -2038,7 +2245,7 @@ impl App {
     pub fn apply_project_git(&mut self, result: Result<BranchState, String>) {
         match result {
             Ok(state) => self.project_git = Some(state),
-            Err(error) => self.toast = Some(format!("Git status unavailable: {error}")),
+            Err(error) => self.set_toast(format!("Git status unavailable: {error}")),
         }
     }
     pub fn apply_repository_info(
@@ -2109,7 +2316,7 @@ impl App {
                 self.repository_info_loading.remove(&key);
                 self.repository_info_failed.insert(key);
                 if matches!(self.overlay, Some(Overlay::Create(_))) {
-                    self.toast = Some(format!(
+                    self.set_toast(format!(
                         "Repository settings unavailable: {}",
                         error_summary(&error)
                     ));
@@ -2152,14 +2359,14 @@ impl App {
                     self.overlay = Some(Overlay::Merge(refreshed));
                 } else {
                     self.overlay = None;
-                    self.toast = Some(
+                    self.set_toast(
                         if self
                             .repository_info_failed
                             .contains(&(id.forge.clone(), id.repository.clone()))
                         {
-                            "Repository merge policy could not be verified".into()
+                            "Repository merge policy could not be verified"
                         } else {
-                            "This request is no longer open or the repository allows no merge strategy".into()
+                            "This request is no longer open or the repository allows no merge strategy"
                         },
                     );
                 }
@@ -2245,7 +2452,7 @@ impl App {
         };
         let Some(created) = created else {
             if let Some(failure) = failure {
-                self.toast = Some(format!("Create failed: {failure}"));
+                self.set_toast(format!("Create failed: {failure}"));
             }
             return;
         };
@@ -2253,7 +2460,7 @@ impl App {
         self.reconcile_request(created.clone());
         self.overlay = None;
         self.view = View::ChangeRequestDetail(id.clone());
-        self.toast = Some(if metadata_warnings.is_empty() {
+        self.set_toast(if metadata_warnings.is_empty() {
             format!("Created {}", id.display(created.kind))
         } else {
             format!(
@@ -2302,22 +2509,19 @@ impl App {
                     current.updated_at = updated.updated_at;
                 }
                 self.finish_edit_write(op, true);
-                self.toast = Some(
-                    match action {
-                        LifecycleAction::Title => "Title updated",
-                        LifecycleAction::Body => "Description updated",
-                        LifecycleAction::Draft => "Marked as draft",
-                        LifecycleAction::Ready => "Marked ready for review",
-                        LifecycleAction::Close => "Request closed",
-                        LifecycleAction::Reopen => "Request reopened",
-                    }
-                    .into(),
-                );
+                self.set_toast(match action {
+                    LifecycleAction::Title => "Title updated",
+                    LifecycleAction::Body => "Description updated",
+                    LifecycleAction::Draft => "Marked as draft",
+                    LifecycleAction::Ready => "Marked ready for review",
+                    LifecycleAction::Close => "Request closed",
+                    LifecycleAction::Reopen => "Request reopened",
+                });
                 self.load_request(id);
             }
             Err(error) => {
                 self.finish_edit_write(op, false);
-                self.toast = Some(format!("Update failed: {}", error_summary(&error)));
+                self.set_toast(format!("Update failed: {}", error_summary(&error)));
             }
         }
     }
@@ -2357,12 +2561,12 @@ impl App {
                     edit::apply_metadata_payload(request, &payload);
                 }
                 self.finish_edit_write(op, true);
-                self.toast = Some("Change request metadata updated".into());
+                self.set_toast("Change request metadata updated");
                 self.load_request(id);
             }
             Err(error) => {
                 self.finish_edit_write(op, false);
-                self.toast = Some(format!("Metadata update failed: {}", error_summary(&error)));
+                self.set_toast(format!("Metadata update failed: {}", error_summary(&error)));
             }
         }
     }
@@ -2423,7 +2627,7 @@ impl App {
                                 button_hits: vec![],
                             }
                         });
-                self.toast = Some("Request merged".into());
+                self.set_toast("Request merged");
                 self.load_request(id.clone());
                 if let Some(cleanup) = cleanup {
                     self.overlay = Some(Overlay::BranchCleanup(cleanup));
@@ -2436,7 +2640,7 @@ impl App {
                 if let Some(Overlay::Merge(session)) = &mut self.overlay {
                     session.apply(op, Err(message.clone()));
                 }
-                self.toast = Some(format!("Merge failed: {message}"));
+                self.set_toast(format!("Merge failed: {message}"));
             }
         }
     }
@@ -2456,18 +2660,15 @@ impl App {
                 if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
                     request.auto_merge = value;
                 }
-                self.toast = Some(
-                    if enabled {
-                        "Auto-merge enabled"
-                    } else {
-                        "Auto-merge disabled"
-                    }
-                    .into(),
-                );
+                self.set_toast(if enabled {
+                    "Auto-merge enabled"
+                } else {
+                    "Auto-merge disabled"
+                });
                 self.load_request(id);
             }
             Err(error) => {
-                self.toast = Some(format!("Auto-merge failed: {}", error_summary(&error)))
+                self.set_toast(format!("Auto-merge failed: {}", error_summary(&error)));
             }
         }
     }
@@ -2478,10 +2679,10 @@ impl App {
     ) {
         match result {
             Ok(request) => self.reconcile_request(request),
-            Err(error) => self.toast = Some(format!("Refresh failed: {}", error_summary(&error))),
+            Err(error) => self.set_toast(format!("Refresh failed: {}", error_summary(&error))),
         }
         if self.view == View::ChangeRequestDetail(id.clone()) {
-            self.load_pipelines(id);
+            self.hydrate_detail(id, true);
         }
     }
     pub fn apply_branch_cleanup(
@@ -2493,65 +2694,116 @@ impl App {
         match result {
             Ok(()) => {
                 self.activity.entry(id).or_default().push(message.clone());
-                self.toast = Some(message);
+                self.set_toast(message);
             }
-            Err(error) => self.toast = Some(format!("Branch cleanup failed: {error}")),
+            Err(error) => self.set_toast(format!("Branch cleanup failed: {error}")),
         }
         if matches!(self.overlay, Some(Overlay::BranchCleanup(_))) {
             self.overlay = None;
         }
     }
     fn submit_comment(&mut self, body: String) {
+        if self.pending_comment.is_some() {
+            return;
+        }
         if body.trim().is_empty() {
-            self.toast = Some("Comment is empty".into());
+            self.set_toast("Comment is empty");
+            self.set_composer_error(body, "Comment is empty".into());
             return;
         }
         let Some(request) = self.request_for_view().map(|item| item.id.clone()) else {
             return;
         };
-        let temporary_id = format!(
-            "pending-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        if let Some(pr) = self.requests.iter_mut().find(|pr| pr.id == request) {
-            pr.comments.push(Comment {
-                id: temporary_id.clone(),
+        let correlation_id = OpId::next();
+        if self.demo {
+            let comment = Comment {
+                id: format!("demo-{}", correlation_id.0),
                 author: Person {
                     login: "jack".into(),
                     name: Some("Jack".into()),
                     id: None,
                 },
-                body: body.clone(),
+                body,
                 created_at: Utc::now(),
                 updated_at: None,
                 can_edit: true,
                 can_delete: true,
                 url: None,
                 resolved: None,
-            });
-        }
-        self.comment_scroll = 0;
-        if self.demo {
-            self.toast = Some("Comment posted".into());
+            };
+            self.append_confirmed_comment(&request, comment);
+            self.overlay = None;
+            self.set_toast("✓ Comment posted");
             return;
         }
         let Some(provider) = self.providers.get(&request.forge).cloned() else {
-            self.toast = Some("No provider is configured for this request".into());
+            self.set_toast("No provider is configured for this request");
+            self.set_composer_error(body, "No provider is configured for this request".into());
             return;
         };
+        self.pending_comment = Some(PendingComment {
+            request: request.clone(),
+            correlation_id,
+            body: body.clone(),
+        });
+        self.overlay = Some(Overlay::Composer {
+            body: body.clone(),
+            error: None,
+            button_hits: vec![],
+        });
         let sender = self.events.clone();
         tokio::spawn(async move {
             let result = provider.create_comment(&request, &body).await;
             let _ = sender.send(AppEvent::CommentWrite {
-                temporary_id,
+                request,
+                correlation_id,
                 result,
             });
         });
-        self.toast = Some("Sending comment".into());
+        self.set_toast("Posting comment…");
+    }
+    fn set_composer_error(&mut self, body: String, error: String) {
+        match &mut self.overlay {
+            Some(Overlay::Composer {
+                body: current,
+                error: current_error,
+                ..
+            }) => {
+                *current = body;
+                *current_error = Some(error);
+            }
+            _ => {
+                self.overlay = Some(Overlay::Composer {
+                    body,
+                    error: Some(error),
+                    button_hits: vec![],
+                });
+            }
+        }
+    }
+    fn append_confirmed_comment(&mut self, id: &ChangeRequestId, comment: Comment) {
+        let Some(request) = self.requests.iter_mut().find(|request| request.id == *id) else {
+            return;
+        };
+        if let Some(existing) = request
+            .comments
+            .iter_mut()
+            .find(|item| item.id == comment.id)
+        {
+            *existing = comment;
+        } else {
+            request.comments.push(comment);
+        }
+        request.comments.sort_by_key(|left| left.created_at);
+        let comments = request.comments.clone();
+        let resources = self.detail_resources.entry(id.clone()).or_default();
+        resources.comments = LoadState::Loaded(comments);
+        resources.refreshed_at = Some(Instant::now());
+        self.comment_scroll = 0;
     }
     fn apply_review(&mut self, state: ReviewState) {
         if !self.can_review_action(state) {
-            self.toast = Some("This forge has not advertised this write capability".into());
+            self.set_toast("This forge has not advertised this write capability");
             return;
         }
         let Some(request) = self.request_for_view().map(|item| item.id.clone()) else {
@@ -2561,18 +2813,15 @@ impl App {
             if let Some(pr) = self.requests.iter_mut().find(|pr| pr.id == request) {
                 pr.review = state;
             }
-            self.toast = Some(
-                match state {
-                    ReviewState::Approved => "Review approved",
-                    ReviewState::ChangesRequested => "Changes requested",
-                    _ => "Review submitted",
-                }
-                .into(),
-            );
+            self.set_toast(match state {
+                ReviewState::Approved => "Review approved",
+                ReviewState::ChangesRequested => "Changes requested",
+                _ => "Review submitted",
+            });
             return;
         }
         let Some(provider) = self.providers.get(&request.forge).cloned() else {
-            self.toast = Some("No provider is configured for this request".into());
+            self.set_toast("No provider is configured for this request");
             return;
         };
         let action = match state {
@@ -2589,7 +2838,7 @@ impl App {
                 result,
             });
         });
-        self.toast = Some("Submitting review".into());
+        self.set_toast("Submitting review");
     }
     fn can_review_action(&self, state: ReviewState) -> bool {
         match state {
@@ -2734,17 +2983,13 @@ impl App {
                     self.start_auto_merge(id, false);
                 }
             }
-            Some("Add comment") => {
-                self.overlay = Some(Overlay::Composer {
-                    body: String::new(),
-                })
-            }
+            Some("Add comment") => self.open_comment_composer(),
             Some("Approve") => self.apply_review(ReviewState::Approved),
             Some("Request changes") => self.apply_review(ReviewState::ChangesRequested),
             Some("Refresh") => self.request_refresh(),
             Some("Request reviewer") => self.open_edit_action(EditAction::Reviewers),
             Some(_) => {
-                self.toast = Some("This command is not available in the current view".into())
+                self.set_toast("This command is not available in the current view");
             }
             None => {}
         }
@@ -2754,11 +2999,49 @@ impl App {
     }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         if let Some(overlay) = self.overlay.take() {
+            if matches!(&overlay, Overlay::Composer { .. })
+                && !matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            {
+                self.overlay = Some(overlay);
+                return;
+            }
             if !matches!(event.kind, MouseEventKind::Down(_)) {
                 self.overlay = Some(overlay);
                 return;
             }
             match overlay {
+                Overlay::Composer {
+                    body,
+                    error,
+                    button_hits,
+                } => {
+                    if self.pending_comment.is_some() {
+                        self.overlay = Some(Overlay::Composer {
+                            body,
+                            error,
+                            button_hits,
+                        });
+                        return;
+                    }
+                    let clicked = button_hits.iter().find_map(|(rect, action)| {
+                        rect.contains(ratatui::layout::Position {
+                            x: event.column,
+                            y: event.row,
+                        })
+                        .then_some(*action)
+                    });
+                    match clicked {
+                        Some(0) => {}
+                        Some(1) => self.submit_comment(body),
+                        _ => {
+                            self.overlay = Some(Overlay::Composer {
+                                body,
+                                error,
+                                button_hits,
+                            });
+                        }
+                    }
+                }
                 Overlay::Create(mut session) => {
                     let close = session.handle_mouse(self, event.column, event.row);
                     if self.overlay.is_none() && !close {
@@ -2984,6 +3267,9 @@ impl App {
             _ => None,
         };
         self.requests = result.requests;
+        if self.demo {
+            self.hydrate_demo_resources();
+        }
         if let Some(opened) = opened
             && !self.requests.iter().any(|request| request.id == opened.id)
         {
@@ -2998,25 +3284,29 @@ impl App {
     }
     pub fn apply_comment_write(
         &mut self,
-        temporary_id: String,
-        result: Result<(), forge::ForgeError>,
+        request: ChangeRequestId,
+        correlation_id: OpId,
+        result: Result<Comment, forge::ForgeError>,
     ) {
+        let Some(pending) = self.pending_comment.as_ref() else {
+            return;
+        };
+        if pending.request != request || pending.correlation_id != correlation_id {
+            return;
+        }
+        let pending = self.pending_comment.take().unwrap();
         match result {
-            Ok(()) => {
-                self.toast = Some("Comment posted. Refresh to reconcile its server ID.".into())
+            Ok(comment) => {
+                self.append_confirmed_comment(&request, comment);
+                if matches!(self.overlay, Some(Overlay::Composer { .. })) {
+                    self.overlay = None;
+                }
+                self.set_toast("✓ Comment posted");
             }
             Err(error) => {
-                self.toast = Some(format!("Comment failed: {error}"));
-                for request in &mut self.requests {
-                    if let Some(comment) = request
-                        .comments
-                        .iter_mut()
-                        .find(|comment| comment.id == temporary_id)
-                    {
-                        comment.body = format!("{}\n\n[failed, press c to retry]", comment.body);
-                        break;
-                    }
-                }
+                let message = format!("Comment failed: {}", error_summary(&error));
+                self.set_toast(message.clone());
+                self.set_composer_error(pending.body, message);
             }
         }
     }
@@ -3031,9 +3321,9 @@ impl App {
                 if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
                     request.review = state;
                 }
-                self.toast = Some("Review submitted".into());
+                self.set_toast("Review submitted");
             }
-            Err(error) => self.toast = Some(format!("Review failed: {error}")),
+            Err(error) => self.set_toast(format!("Review failed: {error}")),
         }
     }
     pub fn apply_log_chunk(&mut self, job: JobId, chunk: LogChunk) {
@@ -3057,20 +3347,93 @@ impl App {
         match result {
             Ok(pipelines) => {
                 if let Some(item) = self.requests.iter_mut().find(|item| item.id == request) {
-                    item.ci = pipelines
-                        .iter()
-                        .map(|pipeline| pipeline.status.ci_state())
-                        .find(|status| *status == CiState::Failed || *status == CiState::Running)
-                        .unwrap_or_else(|| {
-                            pipelines
-                                .first()
-                                .map(|pipeline| pipeline.status.ci_state())
-                                .unwrap_or(CiState::None)
-                        });
-                    item.pipelines = pipelines;
+                    item.ci = summarize_ci(&pipelines);
+                    item.pipelines = pipelines.clone();
                 }
+                let resources = self.detail_resources.entry(request).or_default();
+                resources.ci = LoadState::Loaded(pipelines);
+                resources.refreshed_at = Some(Instant::now());
             }
-            Err(error) => self.toast = Some(format!("CI refresh failed: {error}")),
+            Err(error) => {
+                let state = load_failure(error);
+                let resources = self.detail_resources.entry(request).or_default();
+                resources.ci = state;
+                resources.refreshed_at = Some(Instant::now());
+            }
+        }
+    }
+    pub fn apply_detail_request(
+        &mut self,
+        id: ChangeRequestId,
+        result: Result<ChangeRequest, forge::ForgeError>,
+    ) {
+        match result {
+            Ok(mut request) => {
+                if let Some(resources) = self.detail_resources.get(&id) {
+                    if let LoadState::Loaded(comments) = &resources.comments {
+                        request.comments = comments.clone();
+                    }
+                    if let LoadState::Loaded(reviewers) = &resources.reviews {
+                        request.reviewers = reviewers.clone();
+                    }
+                    if let LoadState::Loaded(pipelines) = &resources.ci {
+                        request.pipelines = pipelines.clone();
+                        request.ci = summarize_ci(pipelines);
+                    }
+                }
+                self.reconcile_request(request);
+                let resources = self.detail_resources.entry(id).or_default();
+                resources.request = LoadState::Loaded(());
+                resources.refreshed_at = Some(Instant::now());
+            }
+            Err(error) => {
+                let resources = self.detail_resources.entry(id).or_default();
+                resources.request = load_failure(error);
+                resources.refreshed_at = Some(Instant::now());
+            }
+        }
+    }
+    pub fn apply_comments(
+        &mut self,
+        id: ChangeRequestId,
+        result: Result<Vec<Comment>, forge::ForgeError>,
+    ) {
+        match result {
+            Ok(comments) => {
+                let comments = deduplicate_comments(comments);
+                if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
+                    request.comments = comments.clone();
+                }
+                let resources = self.detail_resources.entry(id).or_default();
+                resources.comments = LoadState::Loaded(comments);
+                resources.refreshed_at = Some(Instant::now());
+            }
+            Err(error) => {
+                let resources = self.detail_resources.entry(id).or_default();
+                resources.comments = load_failure(error);
+                resources.refreshed_at = Some(Instant::now());
+            }
+        }
+    }
+    pub fn apply_reviews(
+        &mut self,
+        id: ChangeRequestId,
+        result: Result<Vec<Reviewer>, forge::ForgeError>,
+    ) {
+        match result {
+            Ok(reviewers) => {
+                if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
+                    request.reviewers = reviewers.clone();
+                }
+                let resources = self.detail_resources.entry(id).or_default();
+                resources.reviews = LoadState::Loaded(reviewers);
+                resources.refreshed_at = Some(Instant::now());
+            }
+            Err(error) => {
+                let resources = self.detail_resources.entry(id).or_default();
+                resources.reviews = load_failure(error);
+                resources.refreshed_at = Some(Instant::now());
+            }
         }
     }
     pub fn apply_pipeline(&mut self, id: PipelineId, result: Result<Pipeline, forge::ForgeError>) {
@@ -3085,18 +3448,50 @@ impl App {
                     *current = pipeline;
                 }
             }
-            Err(error) => self.toast = Some(format!("Pipeline refresh failed: {error}")),
+            Err(error) => self.set_toast(format!("Pipeline refresh failed: {error}")),
         }
     }
     pub fn apply_ci_action(&mut self, _action: CiAction, result: Result<(), forge::ForgeError>) {
         match result {
             Ok(()) => {
-                self.toast = Some("CI action completed. Refreshing pipeline.".into());
+                self.set_toast("CI action completed. Refreshing pipeline.");
                 self.load_pipeline();
             }
-            Err(error) => self.toast = Some(format!("CI action failed: {error}")),
+            Err(error) => self.set_toast(format!("CI action failed: {error}")),
         }
     }
+}
+
+fn begin_load<T>(state: &mut LoadState<T>, force: bool, stale: bool) -> bool {
+    if matches!(state, LoadState::Loading) {
+        return false;
+    }
+    if force || stale || matches!(state, LoadState::NotLoaded | LoadState::Failed(_)) {
+        *state = LoadState::Loading;
+        true
+    } else {
+        false
+    }
+}
+
+fn load_failure<T>(error: forge::ForgeError) -> LoadState<T> {
+    match error {
+        forge::ForgeError::Unsupported => LoadState::Unsupported,
+        error => LoadState::Failed(error_summary(&error)),
+    }
+}
+
+fn deduplicate_comments(comments: Vec<Comment>) -> Vec<Comment> {
+    let mut result: Vec<Comment> = Vec::with_capacity(comments.len());
+    for comment in comments {
+        if let Some(index) = result.iter().position(|current| current.id == comment.id) {
+            result[index] = comment;
+        } else {
+            result.push(comment);
+        }
+    }
+    result.sort_by_key(|left| left.created_at);
+    result
 }
 
 pub(crate) fn error_summary(error: &forge::ForgeError) -> String {
@@ -3116,29 +3511,17 @@ pub(crate) fn error_summary(error: &forge::ForgeError) -> String {
 }
 
 fn summarize_ci(pipelines: &[Pipeline]) -> CiState {
-    if pipelines.iter().any(|pipeline| {
-        matches!(
-            pipeline.status,
-            PipelineStatus::Failed | PipelineStatus::TimedOut
-        )
-    }) {
+    let states = pipelines
+        .iter()
+        .map(|pipeline| pipeline.status.ci_state())
+        .collect::<Vec<_>>();
+    if states.contains(&CiState::Failed) {
         CiState::Failed
-    } else if pipelines
-        .iter()
-        .any(|pipeline| pipeline.status == PipelineStatus::Running)
-    {
+    } else if states.contains(&CiState::Running) {
         CiState::Running
-    } else if pipelines.iter().any(|pipeline| {
-        matches!(
-            pipeline.status,
-            PipelineStatus::Queued | PipelineStatus::Pending | PipelineStatus::Waiting
-        )
-    }) {
+    } else if states.contains(&CiState::Pending) {
         CiState::Pending
-    } else if pipelines
-        .iter()
-        .any(|pipeline| pipeline.status == PipelineStatus::Success)
-    {
+    } else if states.contains(&CiState::Passed) {
         CiState::Passed
     } else {
         CiState::None
@@ -3193,6 +3576,7 @@ fn providers(config: &Config) -> HashMap<String, Arc<dyn ForgeProvider>> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyModifiers, MouseButton};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestProvider {
         name: String,
@@ -3221,6 +3605,129 @@ mod tests {
         ) -> Result<(), forge::ForgeError> {
             Ok(())
         }
+    }
+
+    struct DetailSpyProvider {
+        name: String,
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ForgeProvider for DetailSpyProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn capabilities(&self) -> forge::ForgeCapabilities {
+            forge::ForgeCapabilities {
+                ci_read: true,
+                ..forge::ForgeCapabilities::default()
+            }
+        }
+
+        async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, forge::ForgeError> {
+            self.calls.lock().unwrap().push("list_change_requests");
+            Ok(vec![])
+        }
+
+        async fn get_change_request(
+            &self,
+            id: &ChangeRequestId,
+        ) -> Result<ChangeRequest, forge::ForgeError> {
+            self.calls.lock().unwrap().push("get_change_request");
+            forge::demo::change_requests()
+                .into_iter()
+                .find(|request| request.id == *id)
+                .ok_or(forge::ForgeError::NotFound)
+        }
+
+        async fn list_reviews(
+            &self,
+            _id: &ChangeRequestId,
+        ) -> Result<Vec<Reviewer>, forge::ForgeError> {
+            self.calls.lock().unwrap().push("list_reviews");
+            Ok(vec![])
+        }
+
+        async fn list_comments(
+            &self,
+            _id: &ChangeRequestId,
+        ) -> Result<Vec<Comment>, forge::ForgeError> {
+            self.calls.lock().unwrap().push("list_comments");
+            Ok(vec![])
+        }
+
+        async fn list_pipelines(
+            &self,
+            _id: &ChangeRequestId,
+        ) -> Result<Vec<Pipeline>, forge::ForgeError> {
+            self.calls.lock().unwrap().push("list_pipelines");
+            Ok(vec![])
+        }
+    }
+
+    struct CommentSpyProvider {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ForgeProvider for CommentSpyProvider {
+        fn name(&self) -> &str {
+            "github"
+        }
+
+        fn capabilities(&self) -> forge::ForgeCapabilities {
+            forge::ForgeCapabilities {
+                comments: true,
+                ..forge::ForgeCapabilities::default()
+            }
+        }
+
+        async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, forge::ForgeError> {
+            Ok(vec![])
+        }
+
+        async fn create_comment(
+            &self,
+            _id: &ChangeRequestId,
+            body: &str,
+        ) -> Result<Comment, forge::ForgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if self.fail {
+                Err(forge::ForgeError::PermissionDenied)
+            } else {
+                Ok(Comment {
+                    id: "server-comment-1".into(),
+                    author: Person::named("jack"),
+                    body: body.into(),
+                    created_at: Utc::now(),
+                    updated_at: None,
+                    can_edit: false,
+                    can_delete: false,
+                    url: None,
+                    resolved: None,
+                })
+            }
+        }
+    }
+
+    fn live_comment_app(
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    ) -> (App, ChangeRequestId, mpsc::UnboundedReceiver<AppEvent>) {
+        let mut app = App::test_app();
+        let (events, receiver) = mpsc::unbounded_channel();
+        app.events = events;
+        app.demo = false;
+        let id = app.requests[0].id.clone();
+        app.view = View::ChangeRequestDetail(id.clone());
+        app.providers.insert(
+            id.forge.clone(),
+            Arc::new(CommentSpyProvider { calls, fail }),
+        );
+        (app, id, receiver)
     }
 
     #[tokio::test]
@@ -3387,7 +3894,49 @@ mod tests {
         app.handle_key(KeyCode::Char('i'));
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
         assert_eq!(app.selected_request().unwrap().comments.len(), previous + 1);
-        assert_eq!(app.toast.as_deref(), Some("Comment posted"));
+        assert_eq!(app.toast.as_deref(), Some("✓ Comment posted"));
+    }
+
+    #[tokio::test]
+    async fn composer_input_is_multiline_unicode_and_does_not_include_the_opening_key() {
+        let mut app = App::test_app();
+        app.handle_key(KeyCode::Char('c'));
+        for character in "café 🚀".chars() {
+            app.handle_key(KeyCode::Char(character));
+        }
+        app.handle_key(KeyCode::Enter);
+        for character in "第二行".chars() {
+            app.handle_key(KeyCode::Char(character));
+        }
+
+        let Some(Overlay::Composer { body, .. }) = &app.overlay else {
+            panic!("composer should remain open while typing")
+        };
+        assert_eq!(body, "café 🚀\n第二行");
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        let posted = app.selected_request().unwrap().comments.last().unwrap();
+        assert_eq!(posted.body, "café 🚀\n第二行");
+    }
+
+    #[tokio::test]
+    async fn key_repeat_events_do_not_type_or_submit_a_comment() {
+        let mut app = App::test_app();
+        let before = app.selected_request().unwrap().comments.len();
+        app.handle_key(KeyCode::Char('c'));
+        app.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        app.handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Repeat,
+        ));
+
+        assert!(matches!(app.overlay, Some(Overlay::Composer { ref body, .. }) if body.is_empty()));
+        assert_eq!(app.selected_request().unwrap().comments.len(), before);
     }
 
     #[tokio::test]
@@ -3915,6 +4464,275 @@ mod tests {
 
         assert_eq!(app.selected, 3);
         assert_eq!(app.comment_scroll, 3);
+    }
+
+    #[tokio::test]
+    async fn opening_live_detail_fetches_request_reviews_and_pipelines() {
+        let mut app = App::test_app();
+        app.demo = false;
+        let id = app.requests[0].id.clone();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        app.providers.insert(
+            id.forge.clone(),
+            Arc::new(DetailSpyProvider {
+                name: id.forge.clone(),
+                calls: calls.clone(),
+            }),
+        );
+
+        app.open_selected();
+        let resources = app.detail_resources_for(&id).unwrap();
+        assert!(matches!(&resources.request, LoadState::Loading));
+        assert!(matches!(&resources.comments, LoadState::Loading));
+        assert!(matches!(&resources.reviews, LoadState::Loading));
+        assert!(matches!(&resources.ci, LoadState::Loading));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            calls.contains(&"get_change_request"),
+            "calls were {calls:?}"
+        );
+        assert!(calls.contains(&"list_comments"), "calls were {calls:?}");
+        assert!(calls.contains(&"list_reviews"), "calls were {calls:?}");
+        assert!(calls.contains(&"list_pipelines"), "calls were {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn demo_detail_resources_start_loaded_from_the_fixtures() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let app = App::new(Config::default(), true, None, events)
+            .await
+            .unwrap();
+        for request in &app.requests {
+            let resources = app.detail_resources_for(&request.id).unwrap();
+            assert!(matches!(&resources.request, LoadState::Loaded(())));
+            assert!(matches!(&resources.comments, LoadState::Loaded(_)));
+            assert!(matches!(&resources.reviews, LoadState::Loaded(_)));
+            assert!(matches!(&resources.ci, LoadState::Loaded(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_refresh_is_targeted_and_load_states_keep_empty_failed_and_unsupported_distinct()
+    {
+        let mut app = App::test_app();
+        app.demo = false;
+        let id = app.requests[0].id.clone();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let other_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        app.providers.insert(
+            id.forge.clone(),
+            Arc::new(DetailSpyProvider {
+                name: id.forge.clone(),
+                calls: calls.clone(),
+            }),
+        );
+        app.providers.insert(
+            "other".into(),
+            Arc::new(DetailSpyProvider {
+                name: "other".into(),
+                calls: other_calls.clone(),
+            }),
+        );
+
+        app.open_selected();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        // Model the first asynchronous load completing before the user presses r.
+        // This test helper drops its event receiver, so apply the loaded baseline
+        // directly and isolate the calls caused by the targeted refresh.
+        let resources = app.detail_resources.get_mut(&id).unwrap();
+        resources.request = LoadState::Loaded(());
+        resources.comments = LoadState::Loaded(vec![]);
+        resources.reviews = LoadState::Loaded(vec![]);
+        resources.ci = LoadState::Loaded(vec![]);
+        calls.lock().unwrap().clear();
+        app.handle_key(KeyCode::Char('r'));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            calls.contains(&"get_change_request"),
+            "calls were {calls:?}"
+        );
+        assert!(calls.contains(&"list_comments"), "calls were {calls:?}");
+        assert!(calls.contains(&"list_reviews"), "calls were {calls:?}");
+        assert!(calls.contains(&"list_pipelines"), "calls were {calls:?}");
+        assert!(
+            !calls.contains(&"list_change_requests"),
+            "calls were {calls:?}"
+        );
+        assert!(other_calls.lock().unwrap().is_empty());
+
+        app.apply_comments(id.clone(), Ok(vec![]));
+        app.apply_reviews(id.clone(), Err(forge::ForgeError::Unsupported));
+        app.apply_pipelines(
+            id.clone(),
+            Err(forge::ForgeError::AuthenticationRequired("github".into())),
+        );
+        let resources = app.detail_resources_for(&id).unwrap();
+        assert!(matches!(&resources.comments, LoadState::Loaded(comments) if comments.is_empty()));
+        assert!(matches!(&resources.reviews, LoadState::Unsupported));
+        assert!(
+            matches!(&resources.ci, LoadState::Failed(error) if error == "authentication required")
+        );
+    }
+
+    #[test]
+    fn toast_state_rejects_empty_and_whitespace_messages() {
+        let mut app = App::test_app();
+        app.set_toast("");
+        assert!(app.toast().is_none());
+        app.set_toast(" \t\n ");
+        assert!(app.toast().is_none());
+
+        app.set_toast("Comment posted");
+        assert_eq!(app.toast(), Some("Comment posted"));
+        app.set_toast("Comment failed: permission denied");
+        assert_eq!(app.toast(), Some("Comment failed: permission denied"));
+    }
+
+    #[tokio::test]
+    async fn comment_submission_pending_guard_prevents_duplicate_provider_calls() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, _, mut receiver) = live_comment_app(calls.clone(), false);
+
+        app.submit_comment("one comment".into());
+        app.submit_comment("one comment".into());
+        while tokio::time::timeout(std::time::Duration::from_millis(40), receiver.recv())
+            .await
+            .is_ok_and(|event| event.is_some())
+        {}
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_comment_reconciles_provider_id_once_and_closes_the_composer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, id, mut receiver) = live_comment_app(calls, false);
+        let before = app
+            .requests
+            .iter()
+            .find(|request| request.id == id)
+            .unwrap()
+            .comments
+            .len();
+        app.overlay = Some(Overlay::Composer {
+            body: "posted once".into(),
+            error: None,
+            button_hits: vec![],
+        });
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        let Some(AppEvent::CommentWrite {
+            request,
+            correlation_id,
+            result,
+        }) = receiver.recv().await
+        else {
+            panic!("expected the normalized provider comment")
+        };
+        let stale_id = correlation_id;
+        app.apply_comment_write(request.clone(), correlation_id, result);
+        app.apply_comment_write(request, stale_id, Err(forge::ForgeError::Unsupported));
+
+        let comments = &app
+            .requests
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap()
+            .comments;
+        assert_eq!(comments.len(), before + 1);
+        assert_eq!(
+            comments
+                .iter()
+                .filter(|comment| comment.id == "server-comment-1")
+                .count(),
+            1
+        );
+        assert!(app.overlay.is_none());
+        assert_eq!(app.toast(), Some("✓ Comment posted"));
+    }
+
+    #[tokio::test]
+    async fn repeated_submit_button_clicks_are_blocked_while_pending() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, _, mut receiver) = live_comment_app(calls.clone(), false);
+        let submit_hit = (Rect::new(2, 2, 12, 1), 1);
+        app.overlay = Some(Overlay::Composer {
+            body: "mouse comment".into(),
+            error: None,
+            button_hits: vec![submit_hit],
+        });
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(click);
+        if let Some(Overlay::Composer { button_hits, .. }) = &mut app.overlay {
+            *button_hits = vec![submit_hit];
+        }
+        app.handle_mouse(click);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(30), receiver.recv()).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_comment_submission_keeps_the_composer_draft() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, _, mut receiver) = live_comment_app(calls, true);
+        app.overlay = Some(Overlay::Composer {
+            body: "draft stays here".into(),
+            error: None,
+            button_hits: vec![],
+        });
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        let Some(AppEvent::CommentWrite {
+            request,
+            correlation_id,
+            result,
+        }) = receiver.recv().await
+        else {
+            panic!("comment submit should return a provider result")
+        };
+        app.apply_comment_write(request, correlation_id, result);
+
+        let Some(Overlay::Composer { body, .. }) = &app.overlay else {
+            panic!("failed submission should keep the composer open")
+        };
+        assert_eq!(body, "draft stays here");
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Comment failed: permission denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_comment_composer_does_not_create_a_toast_or_write() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, _, mut receiver) = live_comment_app(calls.clone(), false);
+        app.overlay = Some(Overlay::Composer {
+            body: "draft".into(),
+            error: None,
+            button_hits: vec![],
+        });
+
+        app.handle_key(KeyCode::Esc);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(app.toast.is_none());
     }
 }
 async fn refresh(config: Config, demo: bool, scope: Option<Scope>) -> RefreshResult {

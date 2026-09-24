@@ -38,9 +38,19 @@ pub async fn resolve(
     if demo || explicit_global {
         return StartupScope::Global;
     }
-    let target = explicit.map(Path::new).unwrap_or(path);
+    let target = explicit.map_or_else(
+        || path.to_owned(),
+        |value| {
+            let explicit_path = Path::new(value);
+            if explicit_path.is_absolute() {
+                explicit_path.to_owned()
+            } else {
+                path.join(explicit_path)
+            }
+        },
+    );
     let GitResult::Completed { stdout: root, .. } = git::run(
-        target,
+        &target,
         &["rev-parse", "--show-toplevel"],
         Duration::from_secs(2),
     )
@@ -116,6 +126,77 @@ mod tests {
                 repository: "example/demo".into(),
                 path: directory.path().to_string_lossy().into_owned()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn cwd_and_explicit_dot_resolve_the_same_project_and_global_modes_override_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+        };
+        assert!(run(&["init"]).success());
+        assert!(
+            run(&[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:JackatDJL/prtop.git"
+            ])
+            .success()
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let run_other = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(other.path())
+                .status()
+                .unwrap()
+        };
+        assert!(run_other(&["init"]).success());
+        assert!(
+            run_other(&[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:example/other.git"
+            ])
+            .success()
+        );
+
+        let implicit = resolve(directory.path(), false, false, None).await;
+        let explicit_dot = resolve(directory.path(), false, false, Some(".")).await;
+        let explicit_path = resolve(
+            directory.path(),
+            false,
+            false,
+            Some(other.path().to_str().unwrap()),
+        )
+        .await;
+        assert_eq!(implicit, explicit_dot);
+        assert_eq!(
+            explicit_path,
+            StartupScope::Project {
+                host: "github.com".into(),
+                repository: "example/other".into(),
+                path: other.path().to_string_lossy().into_owned(),
+            }
+        );
+        assert!(
+            matches!(implicit, StartupScope::Project { ref repository, .. } if repository == "JackatDJL/prtop")
+        );
+        assert_eq!(
+            resolve(directory.path(), true, false, None).await,
+            StartupScope::Global
+        );
+        assert_eq!(
+            resolve(directory.path(), false, true, None).await,
+            StartupScope::Global
         );
     }
 }

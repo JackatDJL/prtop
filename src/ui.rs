@@ -2,12 +2,13 @@ pub mod theme;
 use crate::app::{
     App, BranchCleanupChoice, DetailFocus, HitRegions, Overlay, PALETTE_COMMANDS, View,
 };
+use crate::model::LoadState;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
 };
 
 use theme::Theme;
@@ -26,7 +27,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if app.show_help {
             help(frame);
         }
-        if let Some(message) = &app.toast {
+        if let Some(message) = app.toast() {
             toast(frame, message, theme);
         }
         draw_overlay(frame, app, theme);
@@ -95,7 +96,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         help(frame);
     }
-    if let Some(message) = &app.toast {
+    if let Some(message) = app.toast() {
         toast(frame, message, theme);
     }
     draw_overlay(frame, app, theme);
@@ -174,10 +175,24 @@ fn draw_full_detail(frame: &mut Frame, app: &mut App, theme: Theme) {
     );
 }
 fn toast(frame: &mut Frame, message: &str, theme: Theme) {
+    if message.trim().is_empty() || frame.area().width < 6 || frame.area().height < 3 {
+        return;
+    }
+    let max_width = frame.area().width.saturating_sub(4);
+    let width = (Span::raw(message).width() as u16)
+        .saturating_add(6)
+        .min(max_width);
+    if width == 0 {
+        return;
+    }
     let area = Rect::new(
-        frame.area().x.saturating_add(2),
+        frame
+            .area()
+            .x
+            .saturating_add(2)
+            .min(frame.area().right().saturating_sub(width)),
         frame.area().bottom().saturating_sub(3),
-        (message.len() as u16 + 6).min(frame.area().width.saturating_sub(4)),
+        width,
         2,
     );
     frame.render_widget(Clear, area);
@@ -195,10 +210,19 @@ fn toast(frame: &mut Frame, message: &str, theme: Theme) {
 fn draw_overlay(frame: &mut Frame, app: &mut App, theme: Theme) {
     let commands = app.palette_commands();
     let request = app.request_for_view().cloned();
+    let comment_pending = app.comment_submission_pending();
     app.palette_hits.clear();
     let hits = &mut app.palette_hits;
     if let Some(overlay) = app.overlay.as_mut() {
-        overlay_view(frame, overlay, &commands, request.as_ref(), hits, theme);
+        overlay_view(
+            frame,
+            overlay,
+            &commands,
+            request.as_ref(),
+            hits,
+            comment_pending,
+            theme,
+        );
     }
 }
 
@@ -208,9 +232,22 @@ fn overlay_view(
     commands: &[&str],
     request: Option<&crate::model::ChangeRequest>,
     palette_hits: &mut Vec<(Rect, usize)>,
+    comment_pending: bool,
     theme: Theme,
 ) {
     match overlay {
+        Overlay::Composer {
+            body,
+            error,
+            button_hits,
+        } => draw_comment_composer(
+            frame,
+            body,
+            error.as_deref(),
+            button_hits,
+            comment_pending,
+            theme,
+        ),
         Overlay::Create(session) => draw_create(frame, session, theme),
         Overlay::Edit(session) => draw_edit(frame, session, request, theme),
         Overlay::Merge(session) => draw_merge(frame, session, theme),
@@ -255,6 +292,64 @@ fn overlay_view(
         }
         _ => overlay_legacy(frame, overlay, theme),
     }
+}
+
+fn draw_comment_composer(
+    frame: &mut Frame,
+    body: &str,
+    error: Option<&str>,
+    button_hits: &mut Vec<(Rect, usize)>,
+    pending: bool,
+    theme: Theme,
+) {
+    let area = centered(frame.area(), 72, 58);
+    frame.render_widget(Clear, area);
+    let mut lines = if body.is_empty() {
+        vec![Line::styled(
+            "Write a comment…",
+            Style::default().fg(theme.muted),
+        )]
+    } else {
+        body.lines()
+            .map(|line| Line::from(line.to_owned()))
+            .collect()
+    };
+    if pending {
+        lines.push(Line::styled(
+            "Posting comment…",
+            Style::default().fg(theme.primary),
+        ));
+    }
+    if let Some(error) = error {
+        lines.push(Line::styled(
+            format!("Failed to post comment: {error}"),
+            Style::default().fg(theme.danger),
+        ));
+        lines.push(Line::from("Ctrl+Enter retries · Esc keeps the draft"));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border_active))
+                .title(" Add comment "),
+        ),
+        area,
+    );
+    let submit_label = if pending {
+        "Posting…"
+    } else if error.is_some() {
+        "Retry"
+    } else {
+        "Post comment"
+    };
+    button_hits.clear();
+    button_hits.extend(
+        button_rects(frame, area, &[("Cancel", 0), (submit_label, 1)], 1, theme)
+            .into_iter()
+            .enumerate()
+            .map(|(index, rect)| (rect, index)),
+    );
 }
 
 fn draw_create(frame: &mut Frame, session: &mut crate::create::CreateWorkflow, theme: Theme) {
@@ -839,9 +934,16 @@ fn overlay_legacy(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
     let area = centered(frame.area(), 62, 42);
     frame.render_widget(Clear, area);
     let (title, body) = match overlay {
-        Overlay::Composer { body } => (
+        Overlay::Composer { body, error, .. } => (
             "Add comment",
-            format!("{}\n\nCtrl+Enter submits · Esc cancels", body),
+            format!(
+                "{}\n\n{}",
+                body,
+                error
+                    .as_ref()
+                    .map(|error| format!("Failed to post comment: {error}\nCtrl+Enter retries"))
+                    .unwrap_or_else(|| "Enter adds a line · Ctrl+Enter posts · Esc cancels".into())
+            ),
         ),
         Overlay::ReviewMenu { selected } => {
             let options = ["Approve", "Request changes", "Comment"];
@@ -944,55 +1046,106 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         );
         return;
     }
-    let items: Vec<ListItem> = visible
+    let rows: Vec<Row<'_>> = visible
         .iter()
         .enumerate()
         .map(|(i, pr)| {
-            let marker = if i == app.selected { ">" } else { " " };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{marker} {:<12} {:<20} {:>4}  ",
-                        pr.id.forge,
-                        pr.id.repository,
-                        pr.id.display(pr.kind)
-                    ),
-                    if i == app.selected {
-                        Style::default()
-                            .fg(theme.selection_fg)
-                            .bg(theme.selection_bg)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    },
-                ),
-                Span::raw(format!(
-                    "{:<30.30} {} {:<8} {} {}",
-                    pr.title,
-                    pr.ci.glyph(),
-                    pr.ci.label(),
-                    pr.review.glyph(),
-                    pr.review.label()
-                )),
-            ]))
+            Row::new([
+                Cell::from(if i == app.selected { ">" } else { " " }),
+                Cell::from(pr.id.forge.as_str()),
+                Cell::from(pr.id.repository.as_str()),
+                Cell::from(pr.id.display(pr.kind)),
+                Cell::from(pr.title.as_str()),
+                Cell::from(format!("{} {}", pr.ci.glyph(), pr.ci.label())),
+                Cell::from(format!("{} {}", pr.review.glyph(), pr.review.label())),
+            ])
+            .style(if i == app.selected {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
         })
         .collect();
-    let title = if app.filtering {
-        format!(" requests  filter: {}_ ", app.filter)
-    } else if app.filter.is_empty() {
-        " requests  forge        repository              id    title                          ci       review ".into()
-    } else {
-        format!(" requests  filter: {} ", app.filter)
-    };
+    let layout = request_table_layout(area.width);
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.border_active))
-                .title(title),
-        ),
+        Table::new(rows, layout.widths)
+            .header(
+                Row::new([
+                    Cell::from(""),
+                    Cell::from("forge"),
+                    Cell::from("repository"),
+                    Cell::from("id"),
+                    Cell::from("title"),
+                    Cell::from("ci"),
+                    Cell::from("review"),
+                ])
+                .style(
+                    Style::default()
+                        .fg(theme.secondary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .column_spacing(layout.spacing)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border_active))
+                    .title(if app.filtering {
+                        format!(" requests  filter: {}_ ", app.filter)
+                    } else if app.filter.is_empty() {
+                        " requests ".to_owned()
+                    } else {
+                        " requests  filter ".to_owned()
+                    }),
+            ),
         area,
     );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequestTableLayout {
+    widths: [u16; 7],
+    spacing: u16,
+}
+
+fn request_table_layout(area_width: u16) -> RequestTableLayout {
+    let spacing: u16 = if area_width >= 28 { 1 } else { 0 };
+    let available = area_width
+        .saturating_sub(2)
+        .saturating_sub(spacing.saturating_mul(6));
+    let minimums = [1, 3, 4, 2, 0, 1, 1];
+    if available < minimums.iter().copied().sum::<u16>() {
+        let mut widths = [0; 7];
+        let mut remaining = available;
+        for index in [0, 1, 2, 3, 5, 6, 4] {
+            widths[index] = remaining.min(minimums[index]);
+            remaining -= widths[index];
+        }
+        return RequestTableLayout { widths, spacing };
+    }
+    let mut widths = [2, 10, 24, 6, 12, 8, 8];
+    let mut excess = widths
+        .iter()
+        .copied()
+        .sum::<u16>()
+        .saturating_sub(available);
+    // Keep useful metadata first on narrow terminals; title truncates before the optional
+    // status labels compact down to their Unicode glyphs.
+    for index in [5, 6, 4, 2, 1, 3, 0] {
+        let shrink = excess.min(widths[index].saturating_sub(minimums[index]));
+        widths[index] -= shrink;
+        excess -= shrink;
+    }
+    if excess == 0 && widths.iter().copied().sum::<u16>() < available {
+        let spare = available.saturating_sub(widths.iter().copied().sum::<u16>());
+        let repository_growth = (spare / 3).min(42_u16.saturating_sub(widths[2]));
+        widths[2] = widths[2].saturating_add(repository_growth);
+        widths[4] = widths[4].saturating_add(spare.saturating_sub(repository_growth));
+    }
+    RequestTableLayout { widths, spacing }
 }
 fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let columns = Layout::default()
@@ -1019,27 +1172,9 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         );
         return;
     };
-    let comments = pr
-        .comments
-        .iter()
-        .rev()
-        .skip(app.comment_scroll)
-        .take(10)
-        .map(|c| {
-            Line::from(format!(
-                "{} · {}{}\n{}",
-                c.author.name.as_deref().unwrap_or(&c.author.login),
-                c.created_at.format("%H:%M"),
-                if c.updated_at.is_some() {
-                    " edited"
-                } else {
-                    ""
-                },
-                c.body.replace('\n', " ")
-            ))
-        })
-        .collect::<Vec<_>>();
-    let description = vec![
+    let dashboard_preview = matches!(&app.view, View::Dashboard);
+    let resources = app.detail_resources_for(&pr.id);
+    let mut description = vec![
         Line::styled(&pr.title, Style::default().add_modifier(Modifier::BOLD)),
         Line::from(format!(
             "{} · {} → {} · {} {}",
@@ -1056,6 +1191,20 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             pr.mergeability.label()
         )),
     ];
+    match resources.map(|state| &state.request) {
+        Some(LoadState::Loaded(())) => {}
+        Some(LoadState::Failed(error)) => description.push(Line::styled(
+            format!("Request details unavailable: {error} · press r to retry"),
+            Style::default().fg(theme.danger),
+        )),
+        Some(LoadState::Unsupported) => description.push(Line::from("Request details unsupported")),
+        Some(LoadState::NotLoaded) | None if dashboard_preview => {
+            description.push(Line::from("Enter to load full request details"))
+        }
+        Some(LoadState::NotLoaded | LoadState::Loading) | None => {
+            description.push(Line::from("Loading request details…"))
+        }
+    }
     frame.render_widget(
         Paragraph::new(description).block(panel_block(
             " description ",
@@ -1064,10 +1213,58 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         )),
         left[0],
     );
-    let mut comment_lines = vec![Line::styled(
-        format!("latest {} of {}", comments.len(), pr.comments.len()),
-        Style::default().fg(theme.secondary),
-    )];
+    let mut comment_lines = match resources.map(|state| &state.comments) {
+        Some(LoadState::Loaded(comments)) => {
+            let visible = comments
+                .iter()
+                .rev()
+                .skip(app.comment_scroll)
+                .take(10)
+                .map(|comment| {
+                    Line::from(format!(
+                        "{} · {}{}\n{}",
+                        comment
+                            .author
+                            .name
+                            .as_deref()
+                            .unwrap_or(&comment.author.login),
+                        comment.created_at.format("%H:%M"),
+                        if comment.updated_at.is_some() {
+                            " edited"
+                        } else {
+                            ""
+                        },
+                        comment.body.replace('\n', " ")
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if comments.is_empty() {
+                vec![
+                    Line::styled("latest 0 of 0", Style::default().fg(theme.secondary)),
+                    Line::from("No comments yet."),
+                ]
+            } else {
+                let mut lines = vec![Line::styled(
+                    format!("latest {} of {}", visible.len(), comments.len()),
+                    Style::default().fg(theme.secondary),
+                )];
+                lines.extend(visible);
+                lines
+            }
+        }
+        Some(LoadState::Failed(error)) => vec![
+            Line::styled("Comments unavailable", Style::default().fg(theme.danger)),
+            Line::from(error.as_str()),
+            Line::from("press r to retry"),
+        ],
+        Some(LoadState::Unsupported) => vec![Line::from("Comments unsupported by this forge")],
+        Some(LoadState::NotLoaded) | None if dashboard_preview => {
+            vec![Line::from("Enter to load comments")]
+        }
+        Some(LoadState::NotLoaded | LoadState::Loading) | None => {
+            vec![Line::from("Loading comments…")]
+        }
+    };
     if let Some(activity) = app.activity.get(&pr.id) {
         comment_lines.extend(activity.iter().rev().map(|event| {
             Line::styled(
@@ -1076,7 +1273,6 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             )
         }));
     }
-    comment_lines.extend(comments);
     frame.render_widget(
         Paragraph::new(comment_lines)
             .wrap(Wrap { trim: true })
@@ -1087,19 +1283,36 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             )),
         left[1],
     );
-    let mut ci = vec![];
-    if !pr.pipelines.is_empty() {
-        for pipeline in pr.pipelines.iter().skip(app.ci_scroll).take(8) {
-            ci.push(Line::from(format!(
-                "{} {:<24} {}",
-                pipeline.status.glyph(),
-                pipeline.name,
-                pipeline.status.label()
-            )));
+    let ci = match resources.map(|state| &state.ci) {
+        Some(LoadState::Loaded(pipelines)) if pipelines.is_empty() => {
+            vec![Line::from("No pipeline reported")]
         }
-    } else {
-        ci.push(Line::from("No pipeline reported"));
-    }
+        Some(LoadState::Loaded(pipelines)) => pipelines
+            .iter()
+            .skip(app.ci_scroll)
+            .take(8)
+            .map(|pipeline| {
+                Line::from(format!(
+                    "{} {:<24} {}",
+                    pipeline.status.glyph(),
+                    pipeline.name,
+                    pipeline.status.label()
+                ))
+            })
+            .collect(),
+        Some(LoadState::Failed(error)) => vec![
+            Line::styled("CI unavailable", Style::default().fg(theme.danger)),
+            Line::from(error.as_str()),
+            Line::from("press r to retry"),
+        ],
+        Some(LoadState::Unsupported) => vec![Line::from("CI unsupported by this forge")],
+        Some(LoadState::NotLoaded) | None if dashboard_preview => {
+            vec![Line::from("Enter to load CI")]
+        }
+        Some(LoadState::NotLoaded | LoadState::Loading) | None => {
+            vec![Line::from("Loading CI…")]
+        }
+    };
     frame.render_widget(
         Paragraph::new(ci).block(panel_block(
             " CI ",
@@ -1108,22 +1321,38 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         )),
         right[0],
     );
-    let reviewers = pr
-        .reviewers
-        .iter()
-        .map(|reviewer| {
-            Line::from(format!(
-                "{} {:<16} {}",
-                reviewer.state.glyph(),
-                reviewer
-                    .person
-                    .name
-                    .as_deref()
-                    .unwrap_or(&reviewer.person.login),
-                reviewer.state.label()
-            ))
-        })
-        .collect::<Vec<_>>();
+    let reviewers = match resources.map(|state| &state.reviews) {
+        Some(LoadState::Loaded(reviewers)) if reviewers.is_empty() => {
+            vec![Line::from("No reviewers reported")]
+        }
+        Some(LoadState::Loaded(reviewers)) => reviewers
+            .iter()
+            .map(|reviewer| {
+                Line::from(format!(
+                    "{} {:<16} {}",
+                    reviewer.state.glyph(),
+                    reviewer
+                        .person
+                        .name
+                        .as_deref()
+                        .unwrap_or(&reviewer.person.login),
+                    reviewer.state.label()
+                ))
+            })
+            .collect(),
+        Some(LoadState::Failed(error)) => vec![
+            Line::styled("Reviewers unavailable", Style::default().fg(theme.danger)),
+            Line::from(error.as_str()),
+            Line::from("press r to retry"),
+        ],
+        Some(LoadState::Unsupported) => vec![Line::from("Reviewer data unsupported by this forge")],
+        Some(LoadState::NotLoaded) | None if dashboard_preview => {
+            vec![Line::from("Enter to load reviewers")]
+        }
+        Some(LoadState::NotLoaded | LoadState::Loading) | None => {
+            vec![Line::from("Loading reviewers…")]
+        }
+    };
     frame.render_widget(
         Paragraph::new(reviewers).block(panel_block(
             " reviewers ",
@@ -1203,7 +1432,7 @@ fn draw_pipeline(frame: &mut Frame, app: &mut App, theme: Theme) {
             .style(Style::default().fg(theme.muted)),
         outer[2],
     );
-    if let Some(message) = &app.toast {
+    if let Some(message) = app.toast() {
         toast(frame, message, theme);
     }
     draw_overlay(frame, app, theme);
@@ -1278,7 +1507,7 @@ fn draw_job(frame: &mut Frame, app: &mut App, theme: Theme) {
             .style(Style::default().fg(theme.muted)),
         outer[2],
     );
-    if let Some(message) = &app.toast {
+    if let Some(message) = app.toast() {
         toast(frame, message, theme);
     }
     draw_overlay(frame, app, theme);
@@ -1297,6 +1526,241 @@ fn help(frame: &mut Frame) {
     let area = centered(frame.area(), 60, 50);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new("j/k or arrows  Move selection\nEnter / l      Toggle detail view\n/              Filter requests\nr              Refresh asynchronously\n?              Close this help\nq              Quit").block(Block::default().borders(Borders::ALL).title(" keys ")).wrap(Wrap { trim: true }), area);
+}
+
+#[cfg(test)]
+mod stabilization_tests {
+    use super::*;
+    use crate::model::{CiState, LoadState, ReviewState};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn text_positions(buffer: &ratatui::buffer::Buffer, needle: &str) -> Vec<(u16, u16)> {
+        let needle_width = needle.chars().count() as u16;
+        let mut positions = Vec::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer
+                .area
+                .width
+                .saturating_sub(needle_width)
+                .saturating_add(1)
+            {
+                let mut found = String::new();
+                for offset in 0..needle_width {
+                    found.push_str(buffer[(x.saturating_add(offset), y)].symbol());
+                }
+                if found.starts_with(needle) {
+                    positions.push((x, y));
+                }
+            }
+        }
+        positions
+    }
+
+    fn text_position(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        text_positions(buffer, needle).into_iter().next()
+    }
+
+    #[tokio::test]
+    async fn request_headers_and_selected_and_unselected_rows_share_columns() {
+        let mut app = App::test_app();
+        app.requests.truncate(2);
+        app.requests[0].id.forge = "github".into();
+        app.requests[0].id.repository = "table/repo".into();
+        app.requests[0].id.number = 70;
+        app.requests[0].title = "Table title".into();
+        app.requests[0].ci = CiState::Failed;
+        app.requests[0].review = ReviewState::Approved;
+        app.requests[1].id.forge = "github".into();
+        app.requests[1].id.repository = "other/repo".into();
+        app.selected = 1;
+
+        let backend = TestBackend::new(120, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_list(
+                    frame,
+                    frame.area(),
+                    &app,
+                    Theme::for_mode(crate::ui::theme::ColorMode::Ansi),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let header_forge = text_position(buffer, "forge").unwrap();
+        let header_repository = text_position(buffer, "repository").unwrap();
+        let header_id = text_position(buffer, "id").unwrap();
+        let header_title = text_position(buffer, "title").unwrap();
+        let header_ci = text_position(buffer, "ci").unwrap();
+        let header_review = text_position(buffer, "review").unwrap();
+        let forge_positions = text_positions(buffer, "github");
+        assert_eq!(forge_positions.len(), 2);
+        let selected_forge = forge_positions[1];
+        let repository = text_position(buffer, "table/repo").unwrap();
+        let request_id = text_position(buffer, "#70").unwrap();
+        let title = text_position(buffer, "Table title").unwrap();
+        let ci = text_position(buffer, "✗").unwrap();
+        let review = text_position(buffer, "✓").unwrap();
+
+        assert_eq!(header_forge.0, selected_forge.0);
+        assert_eq!(header_repository.0, repository.0);
+        assert_eq!(header_id.0, request_id.0);
+        assert_eq!(header_title.0, title.0);
+        assert_eq!(header_ci.0, ci.0);
+        assert_eq!(header_review.0, review.0);
+
+        let other_forge = forge_positions[0];
+        assert_eq!(selected_forge.0, other_forge.0);
+        let marker = text_position(buffer, ">").unwrap();
+        assert_eq!(marker.1, selected_forge.1);
+        assert!(marker.0 < selected_forge.0);
+    }
+
+    #[test]
+    fn request_table_widths_fit_every_terminal_width() {
+        for width in 0..=240 {
+            let layout = request_table_layout(width);
+            let requested =
+                layout.widths.iter().copied().sum::<u16>() + layout.spacing.saturating_mul(6);
+            assert!(
+                requested <= width.saturating_sub(2),
+                "width {width}: {layout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_detail_renders_loading_separately_from_loaded_empty_panels() {
+        let mut app = App::test_app();
+        app.demo = false;
+        let id = app.requests[0].id.clone();
+        app.view = View::ChangeRequestDetail(id.clone());
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_detail(
+                    frame,
+                    frame.area(),
+                    &app,
+                    Theme::for_mode(crate::ui::theme::ColorMode::Ansi),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(text_position(buffer, "Loading comments").is_some());
+        assert!(text_position(buffer, "Loading CI").is_some());
+        assert!(text_position(buffer, "Loading reviewers").is_some());
+
+        let mut resources = crate::app::DetailResources::default();
+        resources.request = LoadState::Loaded(());
+        resources.comments = LoadState::Loaded(vec![]);
+        resources.reviews = LoadState::Loaded(vec![]);
+        resources.ci = LoadState::Loaded(vec![]);
+        app.detail_resources.insert(id, resources);
+        terminal
+            .draw(|frame| {
+                draw_detail(
+                    frame,
+                    frame.area(),
+                    &app,
+                    Theme::for_mode(crate::ui::theme::ColorMode::Ansi),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(text_position(buffer, "No comments yet.").is_some());
+        assert!(text_position(buffer, "No pipeline reported").is_some());
+        assert!(text_position(buffer, "No reviewers reported").is_some());
+    }
+
+    #[test]
+    fn live_dashboard_preview_does_not_claim_unstarted_detail_loads_are_running() {
+        let mut app = App::test_app();
+        app.demo = false;
+        app.view = View::Dashboard;
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_detail(
+                    frame,
+                    frame.area(),
+                    &app,
+                    Theme::for_mode(crate::ui::theme::ColorMode::Ansi),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(text_position(buffer, "Enter to load comments").is_some());
+        assert!(text_position(buffer, "Enter to load CI").is_some());
+        assert!(text_position(buffer, "Enter to load reviewers").is_some());
+        assert!(text_position(buffer, "Loading comments").is_none());
+    }
+
+    #[test]
+    fn whitespace_only_toast_does_not_paint_a_green_notification() {
+        let theme = Theme::for_mode(crate::ui::theme::ColorMode::Ansi);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| toast(frame, "   \t", theme)).unwrap();
+
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|cell| cell.bg != theme.success)
+        );
+    }
+
+    #[test]
+    fn request_table_handles_narrow_unicode_rows_without_panicking() {
+        let mut app = App::test_app();
+        app.requests.truncate(1);
+        app.requests[0].id.repository = "組織/非常に長いリポジトリ名".into();
+        app.requests[0].title = "🚀 Unicode title with a safely clipped tail".into();
+        let backend = TestBackend::new(22, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_list(
+                    frame,
+                    frame.area(),
+                    &app,
+                    Theme::for_mode(crate::ui::theme::ColorMode::Ansi),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(text_position(buffer, "非常に長いリポジトリ名").is_none());
+        assert!(text_position(buffer, "safely clipped tail").is_none());
+    }
+
+    #[test]
+    fn request_table_uses_wide_terminals_to_preserve_repository_and_title_text() {
+        let mut app = App::test_app();
+        app.requests.truncate(1);
+        app.requests[0].id.repository = "organization/long-project-repository".into();
+        app.requests[0].title = "A long request title remains readable with room".into();
+        let backend = TestBackend::new(160, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_list(
+                    frame,
+                    frame.area(),
+                    &app,
+                    Theme::for_mode(crate::ui::theme::ColorMode::Ansi),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(text_position(buffer, "organization/long-project-repository").is_some());
+        assert!(text_position(buffer, "A long request title remains readable with room").is_some());
+    }
 }
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let vertical = Layout::default()

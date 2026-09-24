@@ -339,11 +339,11 @@ impl MergeSession {
     }
     pub fn begin_merge(&mut self, app: &mut App) {
         if self.loading || self.preflight_error.is_some() {
-            app.toast = Some("Merge preflight must complete before merging".into());
+            app.set_toast("Merge preflight must complete before merging");
             return;
         }
         if !self.technically_mergeable {
-            app.toast = Some("The provider reports merge conflicts".into());
+            app.set_toast("The provider reports merge conflicts");
             return;
         }
         if self.warnings.is_empty() {

@@ -6,10 +6,33 @@
 cargo run -- --demo
 ```
 
-The first vertical slice has an asynchronous Ratatui dashboard, deterministic demo data,
-normalized forge models, provider boundaries, TOML configuration, and a local cache. Live
-GitHub, GitLab, and Forgejo adapters are intentionally limited to the safe read path until
-their API fixtures and write confirmations land in later milestones.
+## Startup scope
+
+Without an argument, prtop detects the Git repository containing the current directory and opens
+that configured project when its remote is recognized. You can also pass `.` or another local
+repository path explicitly. Add Cargo's `--` before application arguments:
+
+```sh
+cargo run
+cargo run -- .
+cargo run -- ~/dev/prtop
+cargo run -- --global
+cargo run -- --demo
+```
+
+The installed binary accepts the same application arguments directly:
+
+```sh
+prtop
+prtop .
+prtop ~/dev/prtop
+prtop --global
+prtop --demo
+```
+
+prtop has an asynchronous Ratatui dashboard, deterministic demo data, normalized forge models,
+provider boundaries, TOML configuration, and a local cache. GitHub, GitLab, and Forgejo expose
+the reads and capability-gated writes supported by their adapters.
 
 ## Reviews, comments, and mouse input
 
@@ -19,8 +42,9 @@ active and is disabled during terminal restoration. Clicks and scrolling go thro
 selection and focus state as keyboard navigation.
 
 Comments are stored chronologically. The detail pane begins at the newest ten comments and
-scrolls toward older entries. Provider capability flags will gate live write actions before the
-UI exposes them.
+scrolls toward older entries. Comments load asynchronously in request detail. Posting is
+available where the provider advertises comment support; success reconciles the provider's
+comment ID, while failures keep the draft available for retry.
 
 ## CI/CD
 

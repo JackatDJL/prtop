@@ -225,6 +225,20 @@ impl ForgeProvider for ForgejoProvider {
         let rows: Vec<ReviewRow> = ensure(response).await?.json().await.map_err(network)?;
         Ok(latest_reviews(rows))
     }
+    async fn list_comments(&self, id: &ChangeRequestId) -> Result<Vec<Comment>, ForgeError> {
+        let token = self.credential().await?;
+        let response = reqwest::Client::new()
+            .get(self.api(&format!(
+                "repos/{}/issues/{}/comments?limit=100",
+                id.repository, id.number
+            )))
+            .header("Authorization", format!("token {token}"))
+            .send()
+            .await
+            .map_err(network)?;
+        let rows: Vec<IssueComment> = ensure(response).await?.json().await.map_err(network)?;
+        Ok(rows.into_iter().map(IssueComment::into_comment).collect())
+    }
     async fn get_repository(&self, repository: &str) -> Result<RepositoryInfo, ForgeError> {
         let token = self.credential().await?;
         let response = reqwest::Client::new()
@@ -510,7 +524,11 @@ impl ForgeProvider for ForgejoProvider {
             .map_err(network)?;
         ensure(response).await.map(|_| ())
     }
-    async fn create_comment(&self, id: &ChangeRequestId, body: &str) -> Result<(), ForgeError> {
+    async fn create_comment(
+        &self,
+        id: &ChangeRequestId,
+        body: &str,
+    ) -> Result<Comment, ForgeError> {
         let token = self.credential().await?;
         let response = reqwest::Client::new()
             .post(self.api(&format!(
@@ -522,7 +540,8 @@ impl ForgeProvider for ForgejoProvider {
             .send()
             .await
             .map_err(network)?;
-        ensure(response).await.map(|_| ())
+        let row: IssueComment = ensure(response).await?.json().await.map_err(network)?;
+        Ok(row.into_comment())
     }
     async fn edit_comment(
         &self,

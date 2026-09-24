@@ -580,7 +580,11 @@ impl ForgeProvider for GitLabProvider {
             .map_err(network)?;
         ensure(response).await.map(|_| ())
     }
-    async fn create_comment(&self, id: &ChangeRequestId, body: &str) -> Result<(), ForgeError> {
+    async fn create_comment(
+        &self,
+        id: &ChangeRequestId,
+        body: &str,
+    ) -> Result<Comment, ForgeError> {
         let token = self.credential().await?;
         let response = reqwest::Client::new()
             .post(self.api(&format!(
@@ -593,7 +597,8 @@ impl ForgeProvider for GitLabProvider {
             .send()
             .await
             .map_err(network)?;
-        ensure(response).await.map(|_| ())
+        let note: Note = ensure(response).await?.json().await.map_err(network)?;
+        Ok(note.into_comment())
     }
     async fn edit_comment(
         &self,
@@ -655,7 +660,7 @@ impl ForgeProvider for GitLabProvider {
                     .map_err(network)?;
                 ensure(response).await.map(|_| ())
             }
-            ReviewAction::Comment => self.create_comment(id, body).await,
+            ReviewAction::Comment => self.create_comment(id, body).await.map(|_| ()),
             ReviewAction::RequestChanges => Err(ForgeError::Unsupported),
         }
     }
@@ -673,6 +678,25 @@ impl ForgeProvider for GitLabProvider {
                 },
                 state: ReviewState::Approved,
             })
+            .collect())
+    }
+    async fn list_comments(&self, id: &ChangeRequestId) -> Result<Vec<Comment>, ForgeError> {
+        let token = self.credential().await?;
+        let response = reqwest::Client::new()
+            .get(self.api(&format!(
+                "projects/{}/merge_requests/{}/notes?per_page=100",
+                Self::project(id),
+                id.number
+            )))
+            .header("PRIVATE-TOKEN", token)
+            .send()
+            .await
+            .map_err(network)?;
+        let notes: Vec<Note> = ensure(response).await?.json().await.map_err(network)?;
+        Ok(notes
+            .into_iter()
+            .filter(|note| !note.system)
+            .map(Note::into_comment)
             .collect())
     }
     async fn search_reviewers(
@@ -1000,6 +1024,8 @@ struct ApprovalUser {
 struct Note {
     id: u64,
     body: String,
+    #[serde(default)]
+    system: bool,
     author: User,
     created_at: DateTime<Utc>,
     updated_at: Option<DateTime<Utc>>,

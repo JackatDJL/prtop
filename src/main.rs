@@ -29,7 +29,11 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about,
+    after_help = "Examples (Cargo):\n  cargo run\n  cargo run -- .\n  cargo run -- ~/dev/prtop\n  cargo run -- --global\n  cargo run -- --demo\n\nInstalled binary:\n  prtop\n  prtop .\n  prtop ~/dev/prtop\n  prtop --global\n  prtop --demo"
+)]
 struct Cli {
     /// Use deterministic fixture data and never contact a forge.
     #[arg(long)]
@@ -105,7 +109,9 @@ async fn main() -> Result<()> {
             "Repository detected, but its remote is not recognized: {remote}"
         ));
     }
-    app.toast = startup_notice;
+    if let Some(notice) = startup_notice {
+        app.set_toast(notice);
+    }
     app.request_refresh();
 
     let _guard = TerminalGuard::enter()?;
@@ -166,6 +172,36 @@ fn register_github_project(config: &mut config::Config, repository: &str, path: 
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_accepts_implicit_cwd_explicit_dot_path_global_and_demo_modes() {
+        let implicit = Cli::try_parse_from(["prtop"]).unwrap();
+        assert_eq!(implicit.scope, None);
+        assert!(!implicit.global && !implicit.demo);
+
+        let current = Cli::try_parse_from(["prtop", "."]).unwrap();
+        assert_eq!(current.scope.as_deref(), Some("."));
+
+        let other = Cli::try_parse_from(["prtop", "~/dev/prtop"]).unwrap();
+        assert_eq!(other.scope.as_deref(), Some("~/dev/prtop"));
+
+        let global = Cli::try_parse_from(["prtop", "--global"]).unwrap();
+        assert!(global.global);
+
+        let demo = Cli::try_parse_from(["prtop", "--demo"]).unwrap();
+        assert!(demo.demo);
+    }
+
+    #[test]
+    fn cli_help_shows_cargo_argument_forwarding_and_binary_examples() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("cargo run -- ."));
+        assert!(help.contains("cargo run -- ~/dev/prtop"));
+        assert!(help.contains("cargo run -- --global"));
+        assert!(help.contains("prtop ~/dev/prtop"));
+        assert!(!help.contains("cargo run prtop"));
+    }
 
     #[test]
     fn registers_a_project_against_an_existing_github_forge() {
@@ -231,10 +267,13 @@ async fn run(
             }
             Some(message) = receiver.recv() => match message {
                 AppEvent::Refresh(result) => app.apply_refresh(result),
-                AppEvent::CommentWrite { temporary_id, result } => app.apply_comment_write(temporary_id, result),
+                AppEvent::CommentWrite { request, correlation_id, result } => app.apply_comment_write(request, correlation_id, result),
                 AppEvent::ReviewWrite { request, state, result } => app.apply_review_write(request, state, result),
                 AppEvent::LogLoaded { job, chunk } => app.apply_log_chunk(job, chunk),
                 AppEvent::PipelinesLoaded { request, pipelines } => app.apply_pipelines(request, pipelines),
+                AppEvent::DetailRequestLoaded { request, result } => app.apply_detail_request(request, result),
+                AppEvent::CommentsLoaded { request, result } => app.apply_comments(request, result),
+                AppEvent::ReviewsLoaded { request, result } => app.apply_reviews(request, result),
                 AppEvent::PipelineLoaded { id, pipeline } => app.apply_pipeline(id, *pipeline),
                 AppEvent::CiActionCompleted { action, result } => app.apply_ci_action(action, result),
                 AppEvent::GitPreflightCompleted { op, result } => app.apply_git_preflight(op, result),
