@@ -240,10 +240,16 @@ impl ForgeProvider for ForgejoProvider {
                 .send()
                 .await
                 .map_err(network)?;
-            let rows: Vec<IssueComment> = ensure(response).await?.json().await.map_err(network)?;
+            let response = ensure(response).await?;
+            let total = response
+                .headers()
+                .get("X-Total-Count")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok());
+            let rows: Vec<IssueComment> = response.json().await.map_err(network)?;
             let page_len = rows.len();
             comments.extend(rows.into_iter().map(IssueComment::into_comment));
-            if page_len < 100 {
+            if comment_pages_complete(comments.len(), total, page_len) {
                 break;
             }
             page += 1;
@@ -610,6 +616,10 @@ impl ForgeProvider for ForgejoProvider {
         ensure(response).await.map(|_| ())
     }
 }
+
+fn comment_pages_complete(accumulated: usize, total: Option<usize>, page_len: usize) -> bool {
+    page_len == 0 || total.is_some_and(|total| accumulated >= total)
+}
 fn network(error: reqwest::Error) -> ForgeError {
     ForgeError::Unavailable(error.to_string())
 }
@@ -854,6 +864,14 @@ fn normalize(forge: &str, repo: &str, row: Row) -> ChangeRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_pagination_uses_total_header_and_empty_page_fallback() {
+        assert!(!comment_pages_complete(50, Some(120), 50));
+        assert!(comment_pages_complete(120, Some(120), 20));
+        assert!(!comment_pages_complete(50, None, 50));
+        assert!(comment_pages_complete(50, None, 0));
+    }
     #[test]
     fn normalizes_forgejo_pull() {
         let row:Row=serde_json::from_str(r#"{"number":12,"title":"Renderer","user":{"login":"jack"},"head":{"ref":"new"},"base":{"ref":"main"},"updated_at":"2026-08-29T12:00:00Z"}"#).unwrap();

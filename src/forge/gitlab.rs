@@ -953,7 +953,74 @@ impl ForgeProvider for GitLabProvider {
 }
 
 fn is_note_text(body: &str) -> bool {
-    body.chars().any(char::is_alphanumeric)
+    let body = body.trim();
+    !body.is_empty() && !is_emoji_shortcode(body) && !is_unicode_emoji_only(body)
+}
+
+fn is_emoji_shortcode(body: &str) -> bool {
+    let Some(name) = body
+        .strip_prefix(':')
+        .and_then(|body| body.strip_suffix(':'))
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_+-".contains(character))
+}
+
+fn is_unicode_emoji_only(body: &str) -> bool {
+    let mut has_emoji = false;
+    let mut characters = body.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_whitespace() {
+            continue;
+        }
+
+        if matches!(character, '0'..='9' | '#' | '*') {
+            let mut next = characters.clone();
+            if next.next() == Some('\u{fe0f}') && next.next() == Some('\u{20e3}') {
+                characters.next();
+                characters.next();
+                has_emoji = true;
+                continue;
+            }
+            return false;
+        }
+
+        if !is_emoji_codepoint(character as u32) {
+            return false;
+        }
+        has_emoji = true;
+    }
+    has_emoji
+}
+
+fn is_emoji_codepoint(codepoint: u32) -> bool {
+    matches!(
+        codepoint,
+        0x200d
+            | 0x20e3
+            | 0xfe0e..=0xfe0f
+            | 0x1f000..=0x1faff
+            | 0x2190..=0x21ff
+            | 0x2300..=0x23ff
+            | 0x25a0..=0x25ff
+            | 0x2600..=0x27bf
+            | 0x2934..=0x2935
+            | 0x2b00..=0x2bff
+            | 0x3030
+            | 0x303d
+            | 0x3297
+            | 0x3299
+            | 0x00a9
+            | 0x00ae
+            | 0x203c
+            | 0x2049
+            | 0x2122
+            | 0x2139
+    )
 }
 fn network(error: reqwest::Error) -> ForgeError {
     ForgeError::Unavailable(error.to_string())
@@ -1254,11 +1321,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gitlab_comment_text_requires_non_emoji_text() {
+    fn gitlab_comment_text_rejects_only_emoji_reactions() {
         assert!(!is_note_text("👍"));
         assert!(!is_note_text("  🔥  "));
+        assert!(!is_note_text(":thumbsup:"));
+        assert!(!is_note_text("  :+1:  "));
+        assert!(!is_note_text("👨‍👩‍👧‍👦"));
+        assert!(!is_note_text("1️⃣"));
         assert!(is_note_text("👍 looks good"));
         assert!(is_note_text("unicode café"));
+        assert!(is_note_text("?"));
+        assert!(is_note_text("…"));
     }
     #[test]
     fn normalizes_gitlab_mr() {
