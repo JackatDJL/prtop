@@ -244,11 +244,13 @@ fn overlay_view(
         Overlay::Composer {
             body,
             error,
+            retry_requires_refresh,
             button_hits,
         } => draw_comment_composer(
             frame,
             body,
             error.as_deref(),
+            *retry_requires_refresh,
             button_hits,
             comment_pending,
             theme,
@@ -303,6 +305,7 @@ fn draw_comment_composer(
     frame: &mut Frame,
     body: &str,
     error: Option<&str>,
+    retry_requires_refresh: bool,
     button_hits: &mut Vec<(Rect, usize)>,
     pending: bool,
     theme: Theme,
@@ -330,7 +333,11 @@ fn draw_comment_composer(
             format!("Failed to post comment: {error}"),
             Style::default().fg(theme.danger),
         ));
-        lines.push(Line::from("Ctrl+Enter retries · Esc discards the draft"));
+        lines.push(Line::from(if retry_requires_refresh {
+            "Esc keeps draft · press r to refresh, then c to retry if absent"
+        } else {
+            "Ctrl+Enter retries · Esc discards the draft"
+        }));
     }
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
@@ -343,6 +350,8 @@ fn draw_comment_composer(
     );
     let submit_label = if pending {
         "Posting…"
+    } else if retry_requires_refresh {
+        "Refresh comments"
     } else if error.is_some() {
         "Retry"
     } else {
@@ -939,14 +948,26 @@ fn overlay_legacy(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
     let area = centered(frame.area(), 62, 42);
     frame.render_widget(Clear, area);
     let (title, body) = match overlay {
-        Overlay::Composer { body, error, .. } => (
+        Overlay::Composer {
+            body,
+            error,
+            retry_requires_refresh,
+            ..
+        } => (
             "Add comment",
             format!(
                 "{}\n\n{}",
                 body,
                 error
                     .as_ref()
-                    .map(|error| format!("Failed to post comment: {error}\nCtrl+Enter retries"))
+                    .map(|error| {
+                        let hint = if *retry_requires_refresh {
+                            "Esc keeps draft · press r to refresh, then c to retry if absent"
+                        } else {
+                            "Ctrl+Enter retries"
+                        };
+                        format!("Failed to post comment: {error}\n{hint}")
+                    })
                     .unwrap_or_else(|| "Enter adds a line · Ctrl+Enter posts · Esc cancels".into())
             ),
         ),
@@ -1633,6 +1654,27 @@ mod stabilization_tests {
                 "width {width}: {layout:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn timed_out_comment_composer_requires_refresh_before_retry() {
+        let mut app = App::test_app();
+        app.overlay = Some(Overlay::Composer {
+            body: "ambiguous timeout draft".into(),
+            error: Some(
+                "submission timed out; the server may have accepted it. Refresh comments before retrying"
+                    .into(),
+            ),
+            retry_requires_refresh: true,
+            button_hits: vec![],
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert!(text_position(buffer, "submission timed out").is_some());
+        assert!(text_position(buffer, "Refresh comments").is_some());
+        assert!(text_position(buffer, "Ctrl+Enter retries").is_none());
     }
 
     #[test]

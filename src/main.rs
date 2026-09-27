@@ -272,7 +272,7 @@ async fn run(
                 AppEvent::LogLoaded { job, chunk } => app.apply_log_chunk(job, chunk),
                 AppEvent::PipelinesLoaded { request, pipelines } => app.apply_pipelines(request, pipelines),
                 AppEvent::DetailRequestLoaded { request, result } => app.apply_detail_request(request, result),
-                AppEvent::CommentsLoaded { request, result } => app.apply_comments(request, result),
+                AppEvent::CommentsLoaded { request, revision, result } => app.apply_comments(request, revision, result),
                 AppEvent::ReviewsLoaded { request, result } => app.apply_reviews(request, result),
                 AppEvent::PipelineLoaded { id, pipeline } => app.apply_pipeline(id, *pipeline),
                 AppEvent::CiActionCompleted { action, result } => app.apply_ci_action(action, result),

@@ -18,6 +18,8 @@ pub enum ForgeError {
     AuthenticationRequired(String),
     #[error("provider unavailable: {0}")]
     Unavailable(String),
+    #[error("comment submission timed out")]
+    CommentTimedOut,
     #[error("permission denied")]
     PermissionDenied,
     #[error("rate limited")]

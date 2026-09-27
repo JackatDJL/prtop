@@ -88,6 +88,7 @@ pub enum AppEvent {
     },
     CommentsLoaded {
         request: ChangeRequestId,
+        revision: u64,
         result: Result<Vec<Comment>, forge::ForgeError>,
     },
     ReviewsLoaded {
@@ -259,6 +260,7 @@ pub enum Overlay {
     Composer {
         body: String,
         error: Option<String>,
+        retry_requires_refresh: bool,
         button_hits: Vec<(Rect, usize)>,
     },
     ReviewMenu {
@@ -332,6 +334,7 @@ pub struct DetailResources {
     pub comments: LoadState<Vec<Comment>>,
     pub reviews: LoadState<Vec<Reviewer>>,
     pub ci: LoadState<Vec<Pipeline>>,
+    comments_revision: u64,
     refreshed_at: Option<Instant>,
 }
 
@@ -342,6 +345,7 @@ impl Default for DetailResources {
             comments: LoadState::NotLoaded,
             reviews: LoadState::NotLoaded,
             ci: LoadState::NotLoaded,
+            comments_revision: 0,
             refreshed_at: None,
         }
     }
@@ -392,6 +396,8 @@ pub struct App {
     pub(crate) last_op: Option<OpId>,
     pub(crate) in_flight: HashMap<(ChangeRequestId, &'static str), OpId>,
     pending_comment: Option<PendingComment>,
+    comment_retry_draft: Option<(ChangeRequestId, String)>,
+    comment_retry_requires_refresh: Option<ChangeRequestId>,
 }
 
 impl App {
@@ -466,6 +472,8 @@ impl App {
             last_op: None,
             in_flight: HashMap::new(),
             pending_comment: None,
+            comment_retry_draft: None,
+            comment_retry_requires_refresh: None,
         };
         if demo {
             app.hydrate_demo_resources();
@@ -535,6 +543,8 @@ impl App {
             last_op: None,
             in_flight: HashMap::new(),
             pending_comment: None,
+            comment_retry_draft: None,
+            comment_retry_requires_refresh: None,
         }
     }
     pub fn toast(&self) -> Option<&str> {
@@ -581,6 +591,7 @@ impl App {
                     comments: LoadState::Loaded(request.comments),
                     reviews: LoadState::Loaded(request.reviewers),
                     ci: LoadState::Loaded(request.pipelines),
+                    comments_revision: 0,
                     refreshed_at: Some(Instant::now()),
                 },
             );
@@ -638,24 +649,34 @@ impl App {
                 Overlay::Composer {
                     mut body,
                     mut error,
+                    retry_requires_refresh,
                     button_hits,
                 } => {
                     let pending = self.pending_comment.is_some();
                     match key {
+                        KeyCode::Esc if !pending && retry_requires_refresh => {
+                            if let Some(request) = self.comment_retry_requires_refresh.clone() {
+                                self.comment_retry_draft = Some((request, body));
+                            }
+                        }
                         KeyCode::Esc if !pending => {}
                         KeyCode::Esc => {
                             self.overlay = Some(Overlay::Composer {
                                 body,
                                 error,
+                                retry_requires_refresh,
                                 button_hits,
                             })
                         }
                         KeyCode::Backspace if !pending => {
                             body.pop();
-                            error = None;
+                            if !retry_requires_refresh {
+                                error = None;
+                            }
                             self.overlay = Some(Overlay::Composer {
                                 body,
                                 error,
+                                retry_requires_refresh,
                                 button_hits,
                             });
                         }
@@ -664,6 +685,15 @@ impl App {
                                 self.overlay = Some(Overlay::Composer {
                                     body,
                                     error,
+                                    retry_requires_refresh,
+                                    button_hits,
+                                });
+                            } else if retry_requires_refresh {
+                                self.set_toast("Refresh comments before retrying");
+                                self.overlay = Some(Overlay::Composer {
+                                    body,
+                                    error,
+                                    retry_requires_refresh,
                                     button_hits,
                                 });
                             } else {
@@ -672,19 +702,25 @@ impl App {
                         }
                         KeyCode::Enter if !pending => {
                             body.push('\n');
-                            error = None;
+                            if !retry_requires_refresh {
+                                error = None;
+                            }
                             self.overlay = Some(Overlay::Composer {
                                 body,
                                 error,
+                                retry_requires_refresh,
                                 button_hits,
                             });
                         }
                         KeyCode::Char(c) if !pending => {
                             body.push(c);
-                            error = None;
+                            if !retry_requires_refresh {
+                                error = None;
+                            }
                             self.overlay = Some(Overlay::Composer {
                                 body,
                                 error,
+                                retry_requires_refresh,
                                 button_hits,
                             });
                         }
@@ -692,6 +728,7 @@ impl App {
                             self.overlay = Some(Overlay::Composer {
                                 body,
                                 error,
+                                retry_requires_refresh,
                                 button_hits,
                             })
                         }
@@ -837,9 +874,24 @@ impl App {
         }
     }
     fn open_comment_composer(&mut self) {
+        let request = self.request_for_view().map(|item| item.id.clone());
+        let saved_draft = self.comment_retry_draft.take();
+        let body = match (request.as_ref(), saved_draft) {
+            (Some(request), Some((draft_request, body))) if *request == draft_request => body,
+            (_, Some(draft)) => {
+                self.comment_retry_draft = Some(draft);
+                String::new()
+            }
+            _ => String::new(),
+        };
+        let retry_requires_refresh = request
+            .as_ref()
+            .is_some_and(|request| self.comment_retry_requires_refresh.as_ref() == Some(request));
         self.overlay = Some(Overlay::Composer {
-            body: String::new(),
-            error: None,
+            body,
+            error: retry_requires_refresh
+                .then(|| "Previous submission timed out; refresh comments before retrying".into()),
+            retry_requires_refresh,
             button_hits: vec![],
         });
     }
@@ -1322,10 +1374,12 @@ impl App {
             let provider = provider.clone();
             let sender = sender.clone();
             let id = request.clone();
+            let revision = resources.comments_revision;
             tokio::spawn(async move {
                 let result = provider.list_comments(&id).await;
                 let _ = sender.send(AppEvent::CommentsLoaded {
                     request: id,
+                    revision,
                     result,
                 });
             });
@@ -2711,12 +2765,22 @@ impl App {
         }
         if body.trim().is_empty() {
             self.set_toast("Comment is empty");
-            self.set_composer_error(body, "Comment is empty".into());
+            self.set_composer_error(body, "Comment is empty".into(), false);
             return;
         }
         let Some(request) = self.request_for_view().map(|item| item.id.clone()) else {
             return;
         };
+        if self.comment_retry_requires_refresh.as_ref() == Some(&request) {
+            self.set_toast("Refresh comments before retrying");
+            self.set_composer_error(
+                body,
+                "Previous submission timed out; refresh comments before retrying".into(),
+                true,
+            );
+            return;
+        }
+        self.comment_retry_draft = None;
         let correlation_id = OpId::next();
         if self.demo {
             let comment = Comment {
@@ -2736,12 +2800,16 @@ impl App {
             };
             self.append_confirmed_comment(&request, comment);
             self.overlay = None;
-            self.set_toast("✓ Comment posted");
+            self.set_toast("Comment posted");
             return;
         }
         let Some(provider) = self.providers.get(&request.forge).cloned() else {
             self.set_toast("No provider is configured for this request");
-            self.set_composer_error(body, "No provider is configured for this request".into());
+            self.set_composer_error(
+                body,
+                "No provider is configured for this request".into(),
+                false,
+            );
             return;
         };
         self.pending_comment = Some(PendingComment {
@@ -2752,6 +2820,7 @@ impl App {
         self.overlay = Some(Overlay::Composer {
             body: body.clone(),
             error: None,
+            retry_requires_refresh: false,
             button_hits: vec![],
         });
         let sender = self.events.clone();
@@ -2769,24 +2838,46 @@ impl App {
         });
         self.set_toast("Posting comment…");
     }
-    fn set_composer_error(&mut self, body: String, error: String) {
+    fn set_composer_error(&mut self, body: String, error: String, retry_requires_refresh: bool) {
         match &mut self.overlay {
             Some(Overlay::Composer {
                 body: current,
                 error: current_error,
+                retry_requires_refresh: current_retry_requires_refresh,
                 ..
             }) => {
                 *current = body;
                 *current_error = Some(error);
+                *current_retry_requires_refresh = retry_requires_refresh;
             }
             _ => {
                 self.overlay = Some(Overlay::Composer {
                     body,
                     error: Some(error),
+                    retry_requires_refresh,
                     button_hits: vec![],
                 });
             }
         }
+    }
+    fn refresh_comments_after_timeout(&mut self, request: ChangeRequestId) {
+        let Some(provider) = self.providers.get(&request.forge).cloned() else {
+            self.set_toast("No provider is configured for this request");
+            return;
+        };
+        let resources = self.detail_resources.entry(request.clone()).or_default();
+        resources.comments = LoadState::Loading;
+        let revision = resources.comments_revision;
+        let sender = self.events.clone();
+        tokio::spawn(async move {
+            let result = provider.list_comments(&request).await;
+            let _ = sender.send(AppEvent::CommentsLoaded {
+                request,
+                revision,
+                result,
+            });
+        });
+        self.set_toast("Refreshing comments…");
     }
     fn append_confirmed_comment(&mut self, id: &ChangeRequestId, comment: Comment) {
         let Some(request) = self.requests.iter_mut().find(|request| request.id == *id) else {
@@ -2805,6 +2896,7 @@ impl App {
         let comments = request.comments.clone();
         let resources = self.detail_resources.entry(id.clone()).or_default();
         resources.comments = LoadState::Loaded(comments);
+        resources.comments_revision = resources.comments_revision.saturating_add(1);
         resources.refreshed_at = Some(Instant::now());
         self.comment_scroll = 0;
     }
@@ -3020,12 +3112,14 @@ impl App {
                 Overlay::Composer {
                     body,
                     error,
+                    retry_requires_refresh,
                     button_hits,
                 } => {
                     if self.pending_comment.is_some() {
                         self.overlay = Some(Overlay::Composer {
                             body,
                             error,
+                            retry_requires_refresh,
                             button_hits,
                         });
                         return;
@@ -3038,12 +3132,33 @@ impl App {
                         .then_some(*action)
                     });
                     match clicked {
-                        Some(0) => {}
+                        Some(0) => {
+                            if retry_requires_refresh
+                                && let Some(request) = self.comment_retry_requires_refresh.clone()
+                            {
+                                self.comment_retry_draft = Some((request, body));
+                            }
+                        }
+                        Some(1) if retry_requires_refresh => {
+                            if let Some(request) = self.comment_retry_requires_refresh.clone() {
+                                self.comment_retry_draft = Some((request.clone(), body));
+                                self.overlay = None;
+                                self.refresh_comments_after_timeout(request);
+                            } else {
+                                self.overlay = Some(Overlay::Composer {
+                                    body,
+                                    error,
+                                    retry_requires_refresh,
+                                    button_hits,
+                                });
+                            }
+                        }
                         Some(1) => self.submit_comment(body),
                         _ => {
                             self.overlay = Some(Overlay::Composer {
                                 body,
                                 error,
+                                retry_requires_refresh,
                                 button_hits,
                             });
                         }
@@ -3320,16 +3435,28 @@ impl App {
         let pending = self.pending_comment.take().unwrap();
         match result {
             Ok(comment) => {
+                self.comment_retry_requires_refresh = None;
+                self.comment_retry_draft = None;
                 self.append_confirmed_comment(&request, comment);
                 if matches!(self.overlay, Some(Overlay::Composer { .. })) {
                     self.overlay = None;
                 }
-                self.set_toast("✓ Comment posted");
+                self.set_toast("Comment posted");
             }
             Err(error) => {
-                let message = format!("Comment failed: {}", error_summary(&error));
+                let retry_requires_refresh = matches!(error, forge::ForgeError::CommentTimedOut);
+                if retry_requires_refresh {
+                    let resources = self.detail_resources.entry(request.clone()).or_default();
+                    resources.comments_revision = resources.comments_revision.saturating_add(1);
+                    resources.comments = LoadState::NotLoaded;
+                    resources.refreshed_at = None;
+                    self.comment_retry_requires_refresh = Some(request.clone());
+                    self.comment_retry_draft = Some((request.clone(), pending.body.clone()));
+                }
+                let detail = error_summary(&error);
+                let message = format!("Comment failed: {detail}");
                 self.set_toast(message.clone());
-                self.set_composer_error(pending.body, message);
+                self.set_composer_error(pending.body, detail, retry_requires_refresh);
             }
         }
     }
@@ -3405,7 +3532,7 @@ impl App {
                     }
                 }
                 self.reconcile_request(request);
-                let resources = self.detail_resources.entry(id).or_default();
+                let resources = self.detail_resources.entry(id.clone()).or_default();
                 resources.request = LoadState::Loaded(());
                 resources.refreshed_at = Some(Instant::now());
             }
@@ -3419,17 +3546,28 @@ impl App {
     pub fn apply_comments(
         &mut self,
         id: ChangeRequestId,
+        revision: u64,
         result: Result<Vec<Comment>, forge::ForgeError>,
     ) {
+        if self
+            .detail_resources
+            .get(&id)
+            .is_some_and(|resources| revision < resources.comments_revision)
+        {
+            return;
+        }
         match result {
             Ok(comments) => {
                 let comments = deduplicate_comments(comments);
                 if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
                     request.comments = comments.clone();
                 }
-                let resources = self.detail_resources.entry(id).or_default();
+                let resources = self.detail_resources.entry(id.clone()).or_default();
                 resources.comments = LoadState::Loaded(comments);
                 resources.refreshed_at = Some(Instant::now());
+                if self.comment_retry_requires_refresh.as_ref() == Some(&id) {
+                    self.comment_retry_requires_refresh = None;
+                }
             }
             Err(error) => {
                 let resources = self.detail_resources.entry(id).or_default();
@@ -3521,6 +3659,10 @@ pub(crate) fn error_summary(error: &forge::ForgeError) -> String {
     match error {
         forge::ForgeError::AuthenticationRequired(_) => "authentication required".into(),
         forge::ForgeError::Unavailable(_) => "network or provider unavailable".into(),
+        forge::ForgeError::CommentTimedOut => {
+            "submission timed out; the server may have accepted it. Refresh comments before retrying"
+                .into()
+        }
         forge::ForgeError::PermissionDenied => "permission denied".into(),
         forge::ForgeError::RateLimited { .. } => "rate limited".into(),
         forge::ForgeError::NotFound => "request or repository not found".into(),
@@ -3542,9 +3684,7 @@ where
 {
     match tokio::time::timeout(limit, write).await {
         Ok(result) => result,
-        Err(_) => Err(forge::ForgeError::Unavailable(
-            "comment submission timed out; refresh comments before retrying".into(),
-        )),
+        Err(_) => Err(forge::ForgeError::CommentTimedOut),
     }
 }
 
@@ -3723,6 +3863,13 @@ mod tests {
         }
 
         async fn list_change_requests(&self) -> Result<Vec<ChangeRequest>, forge::ForgeError> {
+            Ok(vec![])
+        }
+
+        async fn list_comments(
+            &self,
+            _id: &ChangeRequestId,
+        ) -> Result<Vec<Comment>, forge::ForgeError> {
             Ok(vec![])
         }
 
@@ -3932,7 +4079,7 @@ mod tests {
         app.handle_key(KeyCode::Char('i'));
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
         assert_eq!(app.selected_request().unwrap().comments.len(), previous + 1);
-        assert_eq!(app.toast.as_deref(), Some("✓ Comment posted"));
+        assert_eq!(app.toast.as_deref(), Some("Comment posted"));
     }
 
     #[tokio::test]
@@ -4602,7 +4749,7 @@ mod tests {
         );
         assert!(other_calls.lock().unwrap().is_empty());
 
-        app.apply_comments(id.clone(), Ok(vec![]));
+        app.apply_comments(id.clone(), 0, Ok(vec![]));
         app.apply_reviews(id.clone(), Err(forge::ForgeError::Unsupported));
         app.apply_pipelines(
             id.clone(),
@@ -4742,10 +4889,125 @@ mod tests {
             Duration::from_millis(1),
         )
         .await;
+        assert!(matches!(result, Err(forge::ForgeError::CommentTimedOut)));
+        assert!(
+            error_summary(&forge::ForgeError::CommentTimedOut)
+                .contains("Refresh comments before retrying")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_comment_load_cannot_remove_a_confirmed_comment() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, id, _) = live_comment_app(calls, false);
+        let correlation_id = OpId::next();
+        app.pending_comment = Some(PendingComment {
+            request: id.clone(),
+            correlation_id,
+            body: "confirmed after the fetch began".into(),
+        });
+        app.detail_resources.entry(id.clone()).or_default().comments = LoadState::Loading;
+        let comment = Comment {
+            id: "confirmed-comment".into(),
+            author: Person::named("jack"),
+            body: "confirmed after the fetch began".into(),
+            created_at: Utc::now(),
+            updated_at: None,
+            can_edit: false,
+            can_delete: false,
+            url: None,
+            resolved: None,
+        };
+
+        app.apply_comment_write(id.clone(), correlation_id, Ok(comment.clone()));
+        app.apply_comments(id.clone(), 0, Ok(vec![]));
+
+        assert!(
+            app.requests
+                .iter()
+                .find(|request| request.id == id)
+                .unwrap()
+                .comments
+                .iter()
+                .any(|loaded| loaded.id == comment.id)
+        );
         assert!(matches!(
+            &app.detail_resources[&id].comments,
+            LoadState::Loaded(comments) if comments.iter().any(|loaded| loaded.id == comment.id)
+        ));
+    }
+
+    #[tokio::test]
+    async fn timed_out_comment_requires_refresh_before_retry_and_keeps_draft() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, id, mut receiver) = live_comment_app(calls.clone(), false);
+        let correlation_id = OpId::next();
+        app.pending_comment = Some(PendingComment {
+            request: id.clone(),
+            correlation_id,
+            body: "ambiguous timeout draft".into(),
+        });
+        app.overlay = Some(Overlay::Composer {
+            body: "ambiguous timeout draft".into(),
+            error: None,
+            retry_requires_refresh: false,
+            button_hits: vec![(Rect::new(2, 2, 24, 1), 1)],
+        });
+
+        app.apply_comment_write(
+            id.clone(),
+            correlation_id,
+            Err(forge::ForgeError::CommentTimedOut),
+        );
+        assert!(app.toast().unwrap().contains("server may have accepted it"));
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Composer { retry_requires_refresh: true, error: Some(error), .. })
+                if error.contains("Refresh comments before retrying")
+        ));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(receiver.try_recv().is_err());
+        app.handle_key(KeyCode::Esc);
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.comment_retry_draft,
+            Some((id.clone(), "ambiguous timeout draft".into()))
+        );
+        app.handle_key(KeyCode::Char('c'));
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Composer { body, retry_requires_refresh: true, .. })
+                if body == "ambiguous timeout draft"
+        ));
+        if let Some(Overlay::Composer { button_hits, .. }) = &mut app.overlay {
+            *button_hits = vec![(Rect::new(2, 2, 24, 1), 1)];
+        }
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.overlay.is_none());
+        let Some(AppEvent::CommentsLoaded {
+            request,
+            revision,
             result,
-            Err(forge::ForgeError::Unavailable(message))
-                if message.contains("refresh comments before retrying")
+        }) = receiver.recv().await
+        else {
+            panic!("refresh comments should return a result")
+        };
+        assert_eq!(revision, 1);
+        app.apply_comments(request, revision, result);
+
+        assert!(app.comment_retry_requires_refresh.is_none());
+        app.handle_key(KeyCode::Char('c'));
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Composer { body, retry_requires_refresh: false, .. })
+                if body == "ambiguous timeout draft"
         ));
     }
 
@@ -4763,6 +5025,7 @@ mod tests {
         app.overlay = Some(Overlay::Composer {
             body: "posted once".into(),
             error: None,
+            retry_requires_refresh: false,
             button_hits: vec![],
         });
 
@@ -4794,7 +5057,7 @@ mod tests {
             1
         );
         assert!(app.overlay.is_none());
-        assert_eq!(app.toast(), Some("✓ Comment posted"));
+        assert_eq!(app.toast(), Some("Comment posted"));
     }
 
     #[tokio::test]
@@ -4805,6 +5068,7 @@ mod tests {
         app.overlay = Some(Overlay::Composer {
             body: "mouse comment".into(),
             error: None,
+            retry_requires_refresh: false,
             button_hits: vec![submit_hit],
         });
         let click = MouseEvent {
@@ -4831,6 +5095,7 @@ mod tests {
         app.overlay = Some(Overlay::Composer {
             body: "draft stays here".into(),
             error: None,
+            retry_requires_refresh: false,
             button_hits: vec![],
         });
 
@@ -4862,6 +5127,7 @@ mod tests {
         app.overlay = Some(Overlay::Composer {
             body: "draft".into(),
             error: None,
+            retry_requires_refresh: false,
             button_hits: vec![],
         });
 
