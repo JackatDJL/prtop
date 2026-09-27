@@ -22,7 +22,7 @@ impl PickerKind {
         }
     }
     pub fn multi(self) -> bool {
-        matches!(self, Self::Assignee | Self::Label)
+        matches!(self, Self::Reviewer | Self::Assignee | Self::Label)
     }
 }
 
@@ -50,7 +50,11 @@ pub struct PickerSession {
     pub query: String,
     pub selected: usize,
     pub items: Vec<PickerItem>,
+    /// Search results retained so selected people keep their provider IDs across queries.
+    pub known_items: Vec<PickerItem>,
     pub checked: Vec<String>,
+    /// True after the user deliberately changes the current row.
+    pub selection_touched: bool,
     pub loading: bool,
     pub error: Option<String>,
     /// Correlates async loads with the session that requested them.
@@ -64,7 +68,9 @@ impl PickerSession {
             query: String::new(),
             selected: 0,
             items: vec![],
+            known_items: vec![],
             checked: vec![],
+            selection_touched: false,
             loading: true,
             error: None,
             token,
@@ -88,13 +94,19 @@ impl PickerSession {
         self.selected = self.selected.min(self.visible_count().saturating_sub(1));
     }
     pub fn move_down(&mut self) {
-        self.selected = (self.selected + 1).min(self.visible_count().saturating_sub(1));
+        let selected = (self.selected + 1).min(self.visible_count().saturating_sub(1));
+        self.selection_touched = true;
+        self.selected = selected;
     }
     pub fn move_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let selected = self.selected.saturating_sub(1);
+        self.selection_touched = true;
+        self.selected = selected;
     }
     pub fn select_row(&mut self, row: usize) {
-        self.selected = row.min(self.visible_count().saturating_sub(1));
+        let selected = row.min(self.visible_count().saturating_sub(1));
+        self.selection_touched = true;
+        self.selected = selected;
     }
     pub fn selected_item(&self) -> Option<&PickerItem> {
         self.filtered().get(self.selected).copied()
@@ -108,18 +120,38 @@ impl PickerSession {
         } else {
             self.checked.push(id.to_owned());
         }
+        self.selection_touched = true;
     }
     pub fn is_checked(&self, id: &str) -> bool {
         self.checked.iter().any(|checked| checked == id)
     }
-    pub fn take_checked(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.checked)
-    }
     pub fn apply_items(&mut self, token: OpId, items: Vec<PickerItem>) {
         if token == self.token {
+            self.remember_items(items.iter().cloned());
             self.items = items;
             self.loading = false;
+            if !self.selection_touched
+                && let Some(selected) = self
+                    .items
+                    .iter()
+                    .position(|item| self.checked.iter().any(|id| id == &item.id))
+            {
+                self.selected = selected;
+            }
             self.clamp();
+        }
+    }
+    pub fn remember_items(&mut self, items: impl IntoIterator<Item = PickerItem>) {
+        for item in items {
+            if let Some(existing) = self
+                .known_items
+                .iter_mut()
+                .find(|known| known.id == item.id)
+            {
+                *existing = item;
+            } else {
+                self.known_items.push(item);
+            }
         }
     }
     pub fn failed(&mut self, token: OpId, error: String) {
@@ -175,7 +207,7 @@ mod tests {
         session.toggle_checked("main");
         session.toggle_checked("develop");
         session.toggle_checked("main");
-        assert_eq!(session.take_checked(), vec!["develop"]);
+        assert_eq!(session.checked, vec!["develop"]);
     }
 
     #[test]
@@ -190,5 +222,54 @@ mod tests {
         let mut session = session();
         session.apply_items(OpId(2), vec![PickerItem::simple("late")]);
         assert_eq!(session.items.len(), 3);
+    }
+
+    #[test]
+    fn selected_people_keep_provider_ids_across_searches() {
+        let mut session = PickerSession::new(PickerKind::Reviewer, OpId(1));
+        session.apply_items(
+            OpId(1),
+            vec![PickerItem {
+                id: "bob".into(),
+                label: "Bob Example".into(),
+                detail: Some("42".into()),
+            }],
+        );
+        session.toggle_checked("bob");
+        session.token = OpId(2);
+        session.query = "ali".into();
+        session.loading = true;
+        session.apply_items(
+            OpId(2),
+            vec![PickerItem {
+                id: "alice".into(),
+                label: "Alice Example".into(),
+                detail: Some("7".into()),
+            }],
+        );
+
+        assert_eq!(session.checked, vec!["bob".to_owned()]);
+        assert_eq!(
+            session
+                .known_items
+                .iter()
+                .find(|item| item.id == "bob")
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn loaded_items_select_the_current_value_without_marking_it_touched() {
+        let mut session = PickerSession::new(PickerKind::Milestone, OpId(1));
+        session.checked.push("v1.2".into());
+        session.apply_items(
+            OpId(1),
+            vec![PickerItem::simple("v1.3"), PickerItem::simple("v1.2")],
+        );
+        assert_eq!(session.selected_item().unwrap().id, "v1.2");
+        assert!(!session.selection_touched);
     }
 }

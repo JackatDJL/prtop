@@ -26,23 +26,9 @@ impl<T> WriteState<T> {
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Pending)
     }
+    #[cfg(test)]
     pub fn is_idle(&self) -> bool {
         matches!(self, Self::Idle)
-    }
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Idle => "",
-            Self::Pending => "in progress…",
-            Self::Success(_) => "done",
-            Self::Failed(_) => "failed",
-        }
-    }
-    pub fn result(self) -> Option<Result<T, String>> {
-        match self {
-            Self::Idle | Self::Pending => None,
-            Self::Success(value) => Some(Ok(value)),
-            Self::Failed(error) => Some(Err(error)),
-        }
     }
 }
 

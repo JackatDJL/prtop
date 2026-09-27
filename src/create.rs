@@ -2,7 +2,7 @@
 //! field editing with capability-gated pickers, and a final preview. Provider failures
 //! preserve every draft field; the submit stage blocks duplicate submissions.
 
-use crate::app::{App, AppEvent, Overlay};
+use crate::app::{App, AppEvent};
 use crate::editor::TextArea;
 use crate::forge::{ForgeCapabilities, ForgeError, NewChangeRequest};
 use crate::git::repo::{self, BranchState, PushError, RepoContext};
@@ -27,6 +27,15 @@ pub enum Button {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PushState {
+    Idle,
+    WaitingForPush,
+    Pushing,
+    PushSucceeded,
+    PushFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Field {
     Target,
     Title,
@@ -63,7 +72,7 @@ pub enum CreateEditor {
     Milestone(PickerSession),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct CreateWorkflow {
     pub forge: String,
     pub host: String,
@@ -75,8 +84,12 @@ pub struct CreateWorkflow {
     pub stage: CreateStage,
     pub preflight: Option<BranchState>,
     pub preflight_loading: bool,
+    pub preflight_error: Option<String>,
+    pub preflight_op: Option<OpId>,
     pub remote_branch_exists: Option<bool>,
     pub pushing: bool,
+    pub push_state: PushState,
+    pub push_op: Option<OpId>,
     pub push_error: Option<String>,
     pub target: String,
     pub title: String,
@@ -94,6 +107,7 @@ pub struct CreateWorkflow {
     pub submit_op: Option<OpId>,
     /// Rects refreshed by the renderer each frame so mouse clicks stay in one state model.
     pub mouse_area: Option<Rect>,
+    pub field_hits: Vec<(Rect, usize)>,
     pub button_hits: Vec<(Rect, Button)>,
 }
 
@@ -129,8 +143,12 @@ impl CreateWorkflow {
             stage: CreateStage::Preflight,
             preflight: None,
             preflight_loading: true,
+            preflight_error: None,
+            preflight_op: None,
             remote_branch_exists: None,
             pushing: false,
+            push_state: PushState::Idle,
+            push_op: None,
             push_error: None,
             target,
             title: String::new(),
@@ -147,6 +165,7 @@ impl CreateWorkflow {
             submit: WriteState::Idle,
             submit_op: None,
             mouse_area: None,
+            field_hits: vec![],
             button_hits: vec![],
         }
     }
@@ -156,7 +175,8 @@ impl CreateWorkflow {
         ALL_FIELDS
             .into_iter()
             .filter(|field| match field {
-                Field::Target | Field::Title | Field::Description | Field::Draft => true,
+                Field::Target | Field::Title | Field::Description => true,
+                Field::Draft => caps.create_draft,
                 Field::Reviewers => caps.request_reviewers,
                 Field::Labels => caps.labels,
                 Field::Assignees => caps.assignees,
@@ -167,7 +187,7 @@ impl CreateWorkflow {
     pub fn current_field(&self) -> Option<Field> {
         self.fields().get(self.field).copied()
     }
-    fn set_button(&mut self, buttons: Vec<Button>) {
+    pub(crate) fn set_button(&mut self, buttons: Vec<Button>) {
         if self.buttons != buttons {
             self.buttons = buttons;
             self.button_selected = 0;
@@ -184,12 +204,7 @@ impl CreateWorkflow {
             Some(count) => format!(", {count} behind base"),
         };
         let remote = match self.remote_branch_exists {
-            Some(true) => format!(
-                "{} ({} ahead of base{})",
-                format!("{}/{}", self.context.remote, preflight.branch),
-                preflight.ahead.unwrap_or(0),
-                ""
-            ),
+            Some(true) => format!("{}/{}", self.context.remote, preflight.branch),
             Some(false) => "not pushed".into(),
             None => "checking…".into(),
         };
@@ -202,10 +217,28 @@ impl CreateWorkflow {
             format!("Remote          {remote}"),
             format!(
                 "Working tree    {}",
-                if preflight.dirty { "uncommitted changes" } else { "clean" }
+                if preflight.dirty {
+                    "uncommitted changes"
+                } else {
+                    "clean"
+                }
             ),
-            String::new(),
-            "CI              not run yet".into(),
+            format!(
+                "Unpushed        {}",
+                preflight
+                    .unpushed
+                    .map_or_else(|| "unknown".into(), |count| count.to_string())
+            ),
+            format!(
+                "Push            {}",
+                match self.push_state {
+                    PushState::Idle => "not needed",
+                    PushState::WaitingForPush => "required",
+                    PushState::Pushing => "in progress",
+                    PushState::PushSucceeded => "succeeded",
+                    PushState::PushFailed => "failed; retry available",
+                }
+            ),
         ]
     }
     pub fn start_preflight(&mut self, app: &App) {
@@ -218,14 +251,21 @@ impl CreateWorkflow {
                 remote_branch_exists: Some(false),
                 ahead: Some(4),
                 behind: Some(0),
+                unpushed: Some(4),
                 dirty: false,
             });
             self.remote_branch_exists = Some(false);
+            self.push_state = PushState::WaitingForPush;
             self.title = "New reader".into();
+            self.set_button(vec![Button::Cancel, Button::PushAndContinue]);
             return;
         };
         self.preflight_loading = true;
+        self.preflight_error = None;
+        let op = OpId::next();
+        self.preflight_op = Some(op);
         app.spawn_preflight(
+            op,
             root,
             self.context.remote.clone(),
             self.target.clone(),
@@ -237,73 +277,98 @@ impl CreateWorkflow {
         state: BranchState,
         remote_exists: Option<bool>,
         template: Option<String>,
+        subjects: Vec<String>,
     ) {
         self.preflight_loading = false;
         self.preflight = Some(state.clone());
         if remote_exists.is_some() {
             self.remote_branch_exists = remote_exists;
         }
+        self.push_state = if self.push_needed() {
+            PushState::WaitingForPush
+        } else {
+            PushState::Idle
+        };
+        self.set_button(if self.push_needed() {
+            vec![Button::Cancel, Button::PushAndContinue]
+        } else {
+            vec![Button::Cancel, Button::Continue]
+        });
         if self.title.is_empty() {
-            let root = self.context.root.clone().unwrap_or_default();
-            let subjects = repo::commit_subjects(&root, &self.target, &self.context.remote, 5);
             self.title = repo::title_from(&state.branch, &subjects, state.ahead.unwrap_or(0));
         }
-        if self.body.is_empty() && let Some(template) = template {
+        if self.body.is_empty()
+            && let Some(template) = template
+        {
             self.body = TextArea::from_str(&template);
         }
     }
     pub fn push_needed(&self) -> bool {
         self.remote_branch_exists == Some(false)
+            || self
+                .preflight
+                .as_ref()
+                .is_some_and(|state| state.unpushed.is_none_or(|count| count > 0))
     }
     pub fn begin_push(&mut self, app: &App) {
         if self.pushing {
             return;
         }
+        let op = OpId::next();
+        self.push_op = Some(op);
+        self.pushing = true;
+        self.push_state = PushState::Pushing;
+        self.push_error = None;
+        let branch = self.preflight_branch();
         let Some(root) = self.context.root.clone() else {
             // Demo push: instant success keeps the flow testable without a repository.
-            self.pushing = true;
             let sender = app.events.clone();
             tokio::spawn(async move {
                 let _ = sender.send(AppEvent::PushCompleted {
-                    op: OpId::next(),
-                    branch: String::new(),
+                    op,
+                    branch,
                     result: Ok(()),
                 });
             });
             return;
         };
-        self.pushing = true;
-        self.push_error = None;
-        let branch = self
-            .preflight
-            .as_ref()
-            .map(|state| state.branch.clone())
-            .unwrap_or_default();
         let remote = self.context.remote.clone();
         let sender = app.events.clone();
         tokio::spawn(async move {
             let result = repo::push(&root, &remote, &branch).await;
-            let _ = sender.send(AppEvent::PushCompleted {
-                op: OpId::next(),
-                branch,
-                result,
-            });
+            let branch = repo::current_branch(&root).await.unwrap_or_default();
+            let _ = sender.send(AppEvent::PushCompleted { op, branch, result });
         });
     }
-    pub fn apply_push(&mut self, result: Result<(), PushError>) {
+    pub fn apply_push(&mut self, op: OpId, branch: String, result: Result<(), PushError>) {
+        if self.push_op != Some(op) {
+            return;
+        }
+        self.push_op = None;
         self.pushing = false;
+        if result.is_ok() && branch != self.preflight_branch() {
+            self.push_error = Some("the checked-out source branch changed during push".into());
+            self.push_state = PushState::PushFailed;
+            return;
+        }
         match result {
             Ok(()) => {
                 self.remote_branch_exists = Some(true);
+                if let Some(state) = &mut self.preflight {
+                    state.remote_branch_exists = Some(true);
+                    state.unpushed = Some(0);
+                }
                 self.push_error = None;
+                self.push_state = PushState::PushSucceeded;
                 self.stage = CreateStage::Fields;
             }
             Err(PushError::TimedOut) => {
-                self.push_error = Some("push timed out".into());
+                self.push_error = Some("git push timed out".into());
+                self.push_state = PushState::PushFailed;
             }
             Err(PushError::Failed { stderr }) => {
-                let stderr = stderr.lines().last().unwrap_or("push failed").to_owned();
-                self.push_error = Some(stderr);
+                self.push_error = Some(push_error_summary(&stderr));
+                self.push_state = PushState::PushFailed;
             }
         }
     }
@@ -311,33 +376,27 @@ impl CreateWorkflow {
         match field {
             Field::Target => {
                 let token = OpId::next();
-                let mut session = PickerSession::new(PickerKind::TargetBranch, token);
-                let branches = self
-                    .context
-                    .root
-                    .as_ref()
-                    .map(|root| repo::branches(root, &self.context.remote))
-                    .unwrap_or_else(|| {
-                        vec![
-                            "main".into(),
-                            "develop".into(),
-                            "release/1.0".into(),
-                            self.preflight
-                                .as_ref()
-                                .map(|state| state.branch.clone())
-                                .unwrap_or_default(),
-                        ]
-                    });
-                session.apply_items(
+                self.editor = Some(CreateEditor::Target(PickerSession::new(
+                    PickerKind::TargetBranch,
                     token,
-                    branches
+                )));
+                if let Some(root) = self.context.root.clone() {
+                    app.spawn_target_branches(
+                        token,
+                        root,
+                        self.context.remote.clone(),
+                        self.preflight_branch(),
+                    );
+                } else {
+                    let branches = ["main", "develop", "release/1.0"]
                         .into_iter()
-                        .filter(|branch| !branch.is_empty() && *branch != self.preflight_branch())
+                        .filter(|branch| *branch != self.preflight_branch())
                         .map(PickerItem::simple)
-                        .collect(),
-                );
-                session.selected = 0;
-                self.editor = Some(CreateEditor::Target(session));
+                        .collect();
+                    if let Some(CreateEditor::Target(session)) = &mut self.editor {
+                        session.apply_items(token, branches);
+                    }
+                }
             }
             Field::Title => {
                 self.editor = Some(CreateEditor::Title(TextArea::from_str(&self.title)));
@@ -348,26 +407,45 @@ impl CreateWorkflow {
             Field::Draft => self.draft = !self.draft,
             Field::Reviewers => {
                 let token = OpId::next();
-                self.editor = Some(CreateEditor::Reviewers(PickerSession::new(
+                let mut session = PickerSession::new(PickerKind::Reviewer, token);
+                session.checked = self
+                    .reviewers
+                    .iter()
+                    .map(|person| person.login.clone())
+                    .collect();
+                session.remember_items(self.reviewers.iter().map(|person| PickerItem {
+                    id: person.login.clone(),
+                    label: person.display_name().to_owned(),
+                    detail: person.id.map(|id| id.to_string()),
+                }));
+                session.multi = true;
+                self.editor = Some(CreateEditor::Reviewers(session));
+                app.spawn_picker_search(
                     PickerKind::Reviewer,
                     token,
-                )));
-                app.spawn_picker_search(PickerKind::Reviewer, token, &self.forge, &self.repository, "");
+                    &self.forge,
+                    &self.repository,
+                    "",
+                );
             }
             Field::Labels => {
                 let token = OpId::next();
-                self.editor = Some(CreateEditor::Labels(PickerSession::new(
+                let mut session = PickerSession::new(PickerKind::Label, token);
+                session.checked = self.labels.clone();
+                self.editor = Some(CreateEditor::Labels(session));
+                app.spawn_picker_search(
                     PickerKind::Label,
                     token,
-                )));
-                app.spawn_picker_search(PickerKind::Label, token, &self.forge, &self.repository, "");
+                    &self.forge,
+                    &self.repository,
+                    "",
+                );
             }
             Field::Assignees => {
                 let token = OpId::next();
-                self.editor = Some(CreateEditor::Assignees(PickerSession::new(
-                    PickerKind::Assignee,
-                    token,
-                )));
+                let mut session = PickerSession::new(PickerKind::Assignee, token);
+                session.checked = self.assignees.clone();
+                self.editor = Some(CreateEditor::Assignees(session));
                 app.spawn_picker_search(
                     PickerKind::Assignee,
                     token,
@@ -459,12 +537,27 @@ impl CreateWorkflow {
             milestone: self.milestone.clone(),
         }
     }
-    pub fn begin_submit(&mut self, app: &App) {
+    pub fn begin_submit(&mut self, app: &mut App) {
         if self.submit.is_pending() {
+            return;
+        }
+        if self.remote_branch_exists != Some(true) {
+            app.toast = Some(
+                if self.push_needed() {
+                    "Push the source branch before creating the request"
+                } else {
+                    "Waiting for Git preflight"
+                }
+                .into(),
+            );
             return;
         }
         if self.title.trim().is_empty() || self.target.is_empty() {
             app.toast = Some("A target branch and title are required".into());
+            return;
+        }
+        if self.target == self.preflight_branch() {
+            app.toast = Some("The target branch must differ from the source branch".into());
             return;
         }
         let op = OpId::next();
@@ -481,9 +574,16 @@ impl CreateWorkflow {
             tokio::spawn(async move {
                 let _ = sender.send(AppEvent::CreateCompleted {
                     op,
-                    result: Ok(crate::forge::demo::created_request(
-                        &forge, &repository, kind, number, &input,
-                    )),
+                    result: Ok(crate::forge::CreateResult {
+                        request: crate::forge::demo::created_request(
+                            &forge,
+                            &repository,
+                            kind,
+                            number,
+                            &input,
+                        ),
+                        metadata_warnings: vec![],
+                    }),
                 });
             });
             return;
@@ -515,7 +615,7 @@ impl CreateWorkflow {
             }
             Err(error) => {
                 // The whole draft stays intact so the user can retry or adjust.
-                self.submit = WriteState::Failed(error.to_string());
+                self.submit = WriteState::Failed(crate::app::error_summary(&error));
                 None
             }
         }
@@ -527,10 +627,21 @@ impl CreateWorkflow {
         }
     }
     /// Handles one key while the wizard is open. Returns true when the workflow closes.
-    pub fn handle_key(&mut self, app: &mut App, key: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers) -> bool {
+    pub fn handle_key(
+        &mut self,
+        app: &mut App,
+        key: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
         use crossterm::event::KeyCode::*;
-        use crossterm::event::KeyModifiers;
-        if let Some(CreateEditor::Title(area)) = &mut self.editor {
+        if self.stage == CreateStage::Preflight
+            && self.preflight_error.is_some()
+            && key == Char('r')
+        {
+            self.start_preflight(app);
+            return false;
+        }
+        if let Some(CreateEditor::Title(_area)) = &mut self.editor {
             match key {
                 Esc => {
                     if let Some(CreateEditor::Title(area)) = self.editor.take() {
@@ -627,19 +738,24 @@ impl CreateWorkflow {
             };
             if let Some(mut session) = picker {
                 match key {
-                    Esc => {}
+                    Esc => {
+                        self.editor = None;
+                        return false;
+                    }
                     Backspace => {
                         session.query.pop();
                         session.clamp();
+                    }
+                    Char(' ') if session.multi => {
+                        if let Some(id) = session.selected_item().map(|item| item.id.clone()) {
+                            session.toggle_checked(&id);
+                        }
                     }
                     Char(c) => {
                         // Re-search live for provider-backed datasets.
                         session.query.push(c);
                         session.clamp();
-                        if matches!(
-                            session.kind,
-                            PickerKind::Reviewer | PickerKind::Assignee
-                        ) {
+                        if matches!(session.kind, PickerKind::Reviewer | PickerKind::Assignee) {
                             let token = OpId::next();
                             session.token = token;
                             session.loading = true;
@@ -654,20 +770,18 @@ impl CreateWorkflow {
                             return false;
                         }
                     }
-                    Up | Char('k') => session.move_up(),
-                    Down | Char('j') => session.move_down(),
+                    Up => session.move_up(),
+                    Down => session.move_down(),
                     Enter if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                        self.commit_picker(&session, true);
+                        self.commit_picker(&mut session, true);
                         return false;
                     }
                     Enter => {
-                        self.commit_picker(&session, false);
-                        return false;
-                    }
-                    Char(' ') if session.multi => {
-                        if let Some(item) = session.selected_item() {
-                            session.toggle_checked(&item.id);
+                        self.commit_picker(&mut session, false);
+                        if session.multi {
+                            self.editor = Some(Self::editor_with_session(&editor, session));
                         }
+                        return false;
                     }
                     _ => {}
                 }
@@ -678,6 +792,9 @@ impl CreateWorkflow {
         }
         match self.stage {
             CreateStage::Preflight => {
+                if self.preflight_loading || self.pushing {
+                    return key == Esc;
+                }
                 if self.push_needed() && !self.pushing {
                     self.set_button(vec![Button::Cancel, Button::PushAndContinue]);
                 } else if self.push_needed() {
@@ -687,9 +804,12 @@ impl CreateWorkflow {
                 }
                 match key {
                     Esc => return true,
-                    Left | Char('h') => self.button_selected = self.button_selected.saturating_sub(1),
+                    Left | Char('h') => {
+                        self.button_selected = self.button_selected.saturating_sub(1)
+                    }
                     Right | Char('l') => {
-                        self.button_selected = (self.button_selected + 1).min(self.buttons.len() - 1)
+                        self.button_selected =
+                            (self.button_selected + 1).min(self.buttons.len() - 1)
                     }
                     Enter => {
                         let button = self.buttons.get(self.button_selected).copied();
@@ -705,66 +825,66 @@ impl CreateWorkflow {
                     _ => {}
                 }
             }
-            CreateStage::Fields => {
-                match key {
-                    Esc => {
-                        self.stage = CreateStage::Preflight;
-                        self.submit = WriteState::Idle;
-                        self.submit_op = None;
-                    }
-                    Up | Char('k') => self.field = self.field.saturating_sub(1),
-                    Down | Char('j') | Tab => {
-                        let count = self.fields().len();
-                        self.field = (self.field + 1).min(count.saturating_sub(1));
-                    }
-                    Enter if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                        self.stage = CreateStage::Preview;
-                        self.set_button(vec![Button::Cancel, Button::Create]);
-                    }
-                    Enter => {
-                        if let Some(field) = self.current_field() {
-                            self.open_field_editor(app, field);
-                        }
-                    }
-                    Char(' ') => {
-                        if self.current_field() == Some(Field::Draft) {
-                            self.draft = !self.draft;
-                        }
-                    }
-                    _ => {}
+            CreateStage::Fields => match key {
+                Esc => {
+                    self.stage = CreateStage::Preflight;
+                    self.submit = WriteState::Idle;
+                    self.submit_op = None;
                 }
-            }
+                Up | Char('k') => self.field = self.field.saturating_sub(1),
+                Down | Char('j') | Tab => {
+                    let count = self.fields().len();
+                    self.field = (self.field + 1).min(count.saturating_sub(1));
+                }
+                Enter if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    self.stage = CreateStage::Preview;
+                    self.set_button(vec![Button::Cancel, Button::Create]);
+                }
+                Enter => {
+                    if let Some(field) = self.current_field() {
+                        self.open_field_editor(app, field);
+                    }
+                }
+                Char(' ') if self.current_field() == Some(Field::Draft) => {
+                    self.draft = !self.draft;
+                }
+                _ => {}
+            },
             CreateStage::Preview => {
                 if self.submit.is_pending() {
                     return false;
                 }
                 match key {
-                Esc => {
-                    self.stage = CreateStage::Fields;
-                    self.submit = WriteState::Idle;
-                    self.submit_op = None;
-                }
-                Left | Char('h') => self.button_selected = self.button_selected.saturating_sub(1),
-                Right | Char('l') => {
-                    self.button_selected = (self.button_selected + 1).min(self.buttons.len() - 1)
-                }
-                Enter if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                    self.begin_submit(app);
-                }
-                Enter => {
-                    let button = self.buttons.get(self.button_selected).copied();
-                    match button {
-                        Some(Button::Cancel) => {
-                            self.stage = CreateStage::Fields;
-                            self.submit = WriteState::Idle;
-                            self.submit_op = None;
-                        }
-                        Some(Button::Create) => self.begin_submit(app),
-                        _ => {}
+                    Esc => {
+                        self.stage = CreateStage::Fields;
+                        self.submit = WriteState::Idle;
+                        self.submit_op = None;
                     }
+                    Left | Char('h') => {
+                        self.button_selected = self.button_selected.saturating_sub(1)
+                    }
+                    Right | Char('l') => {
+                        self.button_selected =
+                            (self.button_selected + 1).min(self.buttons.len() - 1)
+                    }
+                    Enter if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                        self.begin_submit(app);
+                    }
+                    Enter => {
+                        let button = self.buttons.get(self.button_selected).copied();
+                        match button {
+                            Some(Button::Cancel) => {
+                                self.stage = CreateStage::Fields;
+                                self.submit = WriteState::Idle;
+                                self.submit_op = None;
+                            }
+                            Some(Button::Create) => self.begin_submit(app),
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
         }
         false
     }
@@ -778,7 +898,7 @@ impl CreateWorkflow {
             CreateEditor::Title(_) | CreateEditor::Description => editor.clone(),
         }
     }
-    fn commit_picker(&mut self, session: &PickerSession, apply_multi: bool) {
+    fn commit_picker(&mut self, session: &mut PickerSession, apply_multi: bool) {
         match session.kind {
             PickerKind::TargetBranch => {
                 if let Some(item) = session.selected_item() {
@@ -787,10 +907,27 @@ impl CreateWorkflow {
                 self.editor = None;
             }
             PickerKind::Reviewer => {
-                if let Some(item) = session.selected_item() {
-                    self.reviewers.push(Person::named(item.id.clone()));
+                if apply_multi {
+                    self.reviewers = session
+                        .checked
+                        .iter()
+                        .map(|login| {
+                            session
+                                .known_items
+                                .iter()
+                                .find(|item| item.id == *login)
+                                .map(|item| Person {
+                                    login: item.id.clone(),
+                                    name: item.detail.clone(),
+                                    id: item.detail.as_deref().and_then(|id| id.parse().ok()),
+                                })
+                                .unwrap_or_else(|| Person::named(login.clone()))
+                        })
+                        .collect();
+                    self.editor = None;
+                } else if let Some(id) = session.selected_item().map(|item| item.id.clone()) {
+                    session.toggle_checked(&id);
                 }
-                self.editor = None;
             }
             PickerKind::Milestone => {
                 if let Some(item) = session.selected_item() {
@@ -812,27 +949,68 @@ impl CreateWorkflow {
                         _ => {}
                     }
                     self.editor = None;
-                } else if let Some(item) = session.selected_item() {
-                    session.toggle_checked(&item.id);
+                } else if let Some(id) = session.selected_item().map(|item| item.id.clone()) {
+                    session.toggle_checked(&id);
                 }
             }
         }
     }
     /// Handles a mouse click inside the wizard. Rows are hit-tested against the rects the
     /// renderer refreshed this frame.
-    pub fn handle_mouse(
-        &mut self,
-        app: &mut App,
-        column: u16,
-        row: u16,
-    ) -> bool {
+    pub fn handle_mouse(&mut self, app: &mut App, column: u16, row: u16) -> bool {
         for (rect, button) in self.button_hits.clone() {
             if rect.contains(ratatui::layout::Position { x: column, y: row }) {
+                if (self.preflight_loading || self.pushing) && self.stage == CreateStage::Preflight
+                {
+                    return button == Button::Cancel;
+                }
+                let picker_open = self.editor.as_ref().is_some_and(|editor| {
+                    matches!(
+                        editor,
+                        CreateEditor::Target(_)
+                            | CreateEditor::Reviewers(_)
+                            | CreateEditor::Labels(_)
+                            | CreateEditor::Assignees(_)
+                            | CreateEditor::Milestone(_)
+                    )
+                });
+                if self.stage == CreateStage::Fields && picker_open {
+                    match button {
+                        Button::Cancel => self.editor = None,
+                        Button::Continue => {
+                            if let Some(
+                                CreateEditor::Target(session)
+                                | CreateEditor::Reviewers(session)
+                                | CreateEditor::Labels(session)
+                                | CreateEditor::Assignees(session)
+                                | CreateEditor::Milestone(session),
+                            ) = &mut self.editor
+                            {
+                                let mut session = session.clone();
+                                self.commit_picker(&mut session, true);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return false;
+                }
                 match button {
                     Button::Cancel => return true,
                     Button::Continue => {
                         if self.stage == CreateStage::Preflight {
-                            self.stage = CreateStage::Fields;
+                            if self.push_needed() {
+                                self.begin_push(app);
+                            } else {
+                                self.stage = CreateStage::Fields;
+                            }
+                        } else if self.stage == CreateStage::Fields {
+                            if let Some(CreateEditor::Title(area)) = self.editor.take() {
+                                self.title = area.text();
+                            } else {
+                                self.editor = None;
+                            }
+                            self.stage = CreateStage::Preview;
+                            self.set_button(vec![Button::Cancel, Button::Create]);
                         }
                     }
                     Button::PushAndContinue => self.begin_push(app),
@@ -845,23 +1023,91 @@ impl CreateWorkflow {
                 return false;
             }
         }
-        if let Some(area) = self.mouse_area {
-            if area.contains(ratatui::layout::Position { x: column, y: row }) {
-                let row = row.saturating_sub(area.y + 1) as usize;
-                if let Some(CreateEditor::Target(session)) = &self.editor {
-                    let mut session = session.clone();
-                    if row < session.visible_count() {
-                        if row == session.selected {
-                            self.commit_picker(&session, false);
-                        } else {
-                            session.select_row(row);
-                            self.editor = Some(CreateEditor::Target(session));
+        for (rect, index) in self.field_hits.clone() {
+            if rect.contains(ratatui::layout::Position { x: column, y: row })
+                && self.stage == CreateStage::Fields
+            {
+                self.field = index.min(self.fields().len().saturating_sub(1));
+                if let Some(field) = self.current_field() {
+                    self.open_field_editor(app, field);
+                }
+                return false;
+            }
+        }
+        if let Some(area) = self.mouse_area
+            && area.contains(ratatui::layout::Position { x: column, y: row })
+        {
+            let row = row.saturating_sub(area.y) as usize;
+            if let Some(
+                CreateEditor::Target(session)
+                | CreateEditor::Reviewers(session)
+                | CreateEditor::Labels(session)
+                | CreateEditor::Assignees(session)
+                | CreateEditor::Milestone(session),
+            ) = &self.editor
+            {
+                let mut session = session.clone();
+                if row < session.visible_count() {
+                    if row == session.selected {
+                        self.commit_picker(&mut session, false);
+                        if session.multi
+                            && let Some(editor) = &self.editor
+                        {
+                            self.editor = Some(Self::editor_with_session(editor, session));
+                        }
+                    } else {
+                        session.select_row(row);
+                        if let Some(editor) = &self.editor {
+                            self.editor = Some(Self::editor_with_session(editor, session));
                         }
                     }
                 }
             }
         }
         false
+    }
+}
+
+fn push_error_summary(stderr: &str) -> String {
+    let diagnostic = stderr.to_lowercase();
+    if diagnostic.contains("authentication failed")
+        || diagnostic.contains("could not read username")
+        || diagnostic.contains("permission denied")
+    {
+        "authentication or permission denied while pushing".into()
+    } else if diagnostic.contains("non-fast-forward")
+        || diagnostic.contains("fetch first")
+        || diagnostic.contains("rejected")
+    {
+        "remote rejected the push; fetch and reconcile the branch before retrying".into()
+    } else if diagnostic.contains("repository not found") || diagnostic.contains("not found") {
+        "remote repository not found".into()
+    } else {
+        "git push failed; check the configured remote and credentials".into()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn full_caps() -> ForgeCapabilities {
+    ForgeCapabilities {
+        create_change_request: true,
+        create_draft: true,
+        edit_title: true,
+        edit_description: true,
+        labels: true,
+        request_reviewers: true,
+        assignees: true,
+        milestone: true,
+        draft_transition: true,
+        close: true,
+        reopen: true,
+        merge: true,
+        merge_commit: true,
+        squash_merge: true,
+        rebase_merge: true,
+        auto_merge: true,
+        delete_source_branch: true,
+        ..ForgeCapabilities::default()
     }
 }
 
@@ -886,39 +1132,25 @@ mod tests {
         )
     }
 
-    pub(crate) fn full_caps() -> ForgeCapabilities {
-        ForgeCapabilities {
-            create_change_request: true,
-            edit_title: true,
-            edit_description: true,
-            labels: true,
-            assignees: true,
-            milestone: true,
-            draft_transition: true,
-            close: true,
-            reopen: true,
-            merge: true,
-            merge_commit: true,
-            squash_merge: true,
-            rebase_merge: true,
-            auto_merge: true,
-            delete_source_branch: true,
-            ..ForgeCapabilities::default()
-        }
-    }
-
     #[test]
     fn fields_are_filtered_by_capabilities() {
         let mut workflow = demo_workflow();
         workflow.caps = ForgeCapabilities {
             create_change_request: true,
+            create_draft: true,
             request_reviewers: true,
             ..ForgeCapabilities::default()
         };
         let fields = workflow.fields();
         assert_eq!(
             fields,
-            vec![Field::Target, Field::Title, Field::Description, Field::Draft, Field::Reviewers]
+            vec![
+                Field::Target,
+                Field::Title,
+                Field::Description,
+                Field::Draft,
+                Field::Reviewers
+            ]
         );
     }
 
@@ -929,6 +1161,36 @@ mod tests {
         assert!(!workflow.preflight_loading);
         assert!(workflow.push_needed());
         assert_eq!(workflow.title, "New reader");
+    }
+
+    #[test]
+    fn unpushed_commits_require_a_push_even_when_remote_branch_exists() {
+        let mut workflow = demo_workflow();
+        workflow.apply_preflight(
+            BranchState {
+                branch: "feature/new-reader".into(),
+                unpushed: Some(2),
+                remote_branch_exists: Some(true),
+                ..BranchState::default()
+            },
+            Some(true),
+            None,
+            vec![],
+        );
+        assert!(workflow.push_needed());
+        assert_eq!(workflow.push_state, PushState::WaitingForPush);
+    }
+
+    #[test]
+    fn preflight_escape_can_cancel_while_loading() {
+        let mut workflow = demo_workflow();
+        workflow.preflight_loading = true;
+        let mut app = App::test_app();
+        assert!(workflow.handle_key(
+            &mut app,
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
     }
 
     #[test]
@@ -946,7 +1208,9 @@ mod tests {
     fn push_completion_advances_to_fields() {
         let mut workflow = demo_workflow();
         workflow.start_preflight(&App::test_app());
-        workflow.apply_push(Ok(()));
+        let op = OpId::next();
+        workflow.push_op = Some(op);
+        workflow.apply_push(op, "feature/new-reader".into(), Ok(()));
         assert_eq!(workflow.stage, CreateStage::Fields);
         assert_eq!(workflow.remote_branch_exists, Some(true));
     }
@@ -955,44 +1219,68 @@ mod tests {
     fn push_failure_keeps_the_preflight_and_reports_the_error() {
         let mut workflow = demo_workflow();
         workflow.start_preflight(&App::test_app());
-        workflow.apply_push(Err(PushError::Failed {
-            stderr: "remote: Repository not found".into(),
-        }));
+        let op = OpId::next();
+        workflow.push_op = Some(op);
+        workflow.apply_push(
+            op,
+            "feature/new-reader".into(),
+            Err(PushError::Failed {
+                stderr: "remote: Repository not found".into(),
+            }),
+        );
         assert_eq!(workflow.stage, CreateStage::Preflight);
         assert_eq!(
             workflow.push_error.as_deref(),
-            Some("remote: Repository not found")
+            Some("remote repository not found")
         );
     }
 
     #[test]
-    fn submission_is_blocked_while_a_previous_submit_is_pending() {
+    fn push_completion_detects_a_changed_checkout_branch() {
+        let mut workflow = demo_workflow();
+        workflow.start_preflight(&App::test_app());
+        let op = OpId::next();
+        workflow.push_op = Some(op);
+        workflow.apply_push(op, "another-branch".into(), Ok(()));
+        assert_eq!(workflow.stage, CreateStage::Preflight);
+        assert_eq!(
+            workflow.push_error.as_deref(),
+            Some("the checked-out source branch changed during push")
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_is_blocked_while_a_previous_submit_is_pending() {
         let mut app = App::test_app();
         let mut workflow = demo_workflow();
         workflow.start_preflight(&app);
-        workflow.apply_push(Ok(()));
+        let op = OpId::next();
+        workflow.push_op = Some(op);
+        workflow.apply_push(op, "feature/new-reader".into(), Ok(()));
         workflow.target = "main".into();
         workflow.title = "New reader".into();
-        workflow.begin_submit(&app);
+        workflow.begin_submit(&mut app);
         assert!(workflow.submit.is_pending());
         let first_op = workflow.submit_op;
         // A second submit attempt (double Enter) must not re-arm the write.
-        workflow.begin_submit(&app);
+        workflow.begin_submit(&mut app);
         assert_eq!(workflow.submit_op, first_op);
         assert_eq!(app.toast.as_deref(), None);
     }
 
-    #[test]
-    fn failed_submission_preserves_the_draft() {
+    #[tokio::test]
+    async fn failed_submission_preserves_the_draft() {
         let mut app = App::test_app();
         let mut workflow = demo_workflow();
         workflow.start_preflight(&app);
-        workflow.apply_push(Ok(()));
+        let op = OpId::next();
+        workflow.push_op = Some(op);
+        workflow.apply_push(op, "feature/new-reader".into(), Ok(()));
         workflow.target = "main".into();
         workflow.title = "New reader".into();
         workflow.body = TextArea::from_str("## Summary\nCareful work.");
         workflow.draft = true;
-        workflow.begin_submit(&app);
+        workflow.begin_submit(&mut app);
         let op = workflow.submit_op.unwrap();
         let created = workflow
             .apply_submit(
@@ -1010,15 +1298,17 @@ mod tests {
         assert!(workflow.body.text().contains("Careful work."));
     }
 
-    #[test]
-    fn successful_submission_returns_the_created_request() {
+    #[tokio::test]
+    async fn successful_submission_returns_the_created_request() {
         let mut app = App::test_app();
         let mut workflow = demo_workflow();
         workflow.start_preflight(&app);
-        workflow.apply_push(Ok(()));
+        let op = OpId::next();
+        workflow.push_op = Some(op);
+        workflow.apply_push(op, "feature/new-reader".into(), Ok(()));
         workflow.target = "main".into();
         workflow.title = "New reader".into();
-        workflow.begin_submit(&app);
+        workflow.begin_submit(&mut app);
         let op = workflow.submit_op.unwrap();
         let created = workflow.apply_submit(
             op,
@@ -1026,6 +1316,7 @@ mod tests {
                 "github",
                 "jack/quickdrop",
                 ChangeRequestKind::PullRequest,
+                app.next_demo_number("github", "jack/quickdrop"),
                 &workflow.to_input(),
             )),
         );
@@ -1033,14 +1324,16 @@ mod tests {
         assert_eq!(workflow.stage, CreateStage::Preview);
     }
 
-    #[test]
-    fn stale_op_results_are_ignored() {
+    #[tokio::test]
+    async fn stale_op_results_are_ignored() {
         let mut app = App::test_app();
         let mut workflow = demo_workflow();
         workflow.start_preflight(&app);
-        workflow.apply_push(Ok(()));
+        let op = OpId::next();
+        workflow.push_op = Some(op);
+        workflow.apply_push(op, "feature/new-reader".into(), Ok(()));
         workflow.title = "New reader".into();
-        workflow.begin_submit(&app);
+        workflow.begin_submit(&mut app);
         let op = workflow.submit_op.unwrap();
         let ignored = workflow
             .apply_submit(
@@ -1056,17 +1349,45 @@ mod tests {
     fn picker_commits_update_their_field() {
         let mut workflow = demo_workflow();
         let mut session = PickerSession::new(PickerKind::TargetBranch, OpId(1));
-        session.apply_items(OpId(1), vec![PickerItem::simple("main"), PickerItem::simple("develop")]);
+        session.apply_items(
+            OpId(1),
+            vec![PickerItem::simple("main"), PickerItem::simple("develop")],
+        );
         session.selected = 1;
-        workflow.commit_picker(&session, false);
+        workflow.commit_picker(&mut session, false);
         assert_eq!(workflow.target, "develop");
 
         let mut labels = PickerSession::new(PickerKind::Label, OpId(2));
-        labels.apply_items(OpId(2), vec![PickerItem::simple("bug"), PickerItem::simple("mobile")]);
+        labels.apply_items(
+            OpId(2),
+            vec![PickerItem::simple("bug"), PickerItem::simple("mobile")],
+        );
         labels.toggle_checked("bug");
         labels.toggle_checked("mobile");
-        workflow.commit_picker(&labels, true);
+        workflow.commit_picker(&mut labels, true);
         assert_eq!(workflow.labels, vec!["bug", "mobile"]);
+    }
+
+    #[test]
+    fn enter_toggles_multi_picker_selection_without_losing_the_session() {
+        let mut workflow = demo_workflow();
+        workflow.stage = CreateStage::Fields;
+        let mut app = App::test_app();
+        let mut session = PickerSession::new(PickerKind::Reviewer, OpId(9));
+        session.apply_items(
+            OpId(9),
+            vec![PickerItem::simple("alice"), PickerItem::simple("bob")],
+        );
+        workflow.editor = Some(CreateEditor::Reviewers(session));
+        workflow.handle_key(
+            &mut app,
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let Some(CreateEditor::Reviewers(session)) = workflow.editor else {
+            panic!("multi picker should remain open after toggling");
+        };
+        assert_eq!(session.checked, vec!["alice"]);
     }
 
     #[test]
@@ -1082,7 +1403,11 @@ mod tests {
         .collect();
         assert_eq!(
             strategies,
-            vec![MergeStrategy::Squash, MergeStrategy::MergeCommit, MergeStrategy::Rebase]
+            vec![
+                MergeStrategy::Squash,
+                MergeStrategy::MergeCommit,
+                MergeStrategy::Rebase
+            ]
         );
     }
 

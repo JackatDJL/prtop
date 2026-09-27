@@ -123,6 +123,13 @@ pub struct ChangeRequest {
     /// Present only when a provider actually reports queue membership. prtop never invents one.
     #[serde(default)]
     pub merge_queue: Option<MergeQueue>,
+    /// Approval thresholds reported by providers that expose them (currently GitLab).
+    #[serde(default)]
+    pub approvals_required: Option<u32>,
+    #[serde(default)]
+    pub approvals_left: Option<u32>,
+    #[serde(default)]
+    pub approvals_satisfied: Option<bool>,
 }
 #[derive(Deserialize)]
 struct ChangeRequestWire {
@@ -167,6 +174,12 @@ struct ChangeRequestWire {
     merged_sha: Option<String>,
     #[serde(default)]
     merge_queue: Option<MergeQueue>,
+    #[serde(default)]
+    approvals_required: Option<u32>,
+    #[serde(default)]
+    approvals_left: Option<u32>,
+    #[serde(default)]
+    approvals_satisfied: Option<bool>,
 }
 impl<'de> Deserialize<'de> for ChangeRequest {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -207,6 +220,9 @@ impl<'de> Deserialize<'de> for ChangeRequest {
             head_sha: wire.head_sha,
             merged_sha: wire.merged_sha,
             merge_queue: wire.merge_queue,
+            approvals_required: wire.approvals_required,
+            approvals_left: wire.approvals_left,
+            approvals_satisfied: wire.approvals_satisfied,
         })
     }
 }
@@ -266,7 +282,7 @@ fn legacy_pipeline(legacy: LegacyPipeline, request: &ChangeRequestId) -> Pipelin
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Person {
     pub login: String,
     pub name: Option<String>,
@@ -388,7 +404,6 @@ impl PipelineStatus {
             Self::Queued | Self::Pending | Self::Running | Self::Waiting
         )
     }
-    #[allow(dead_code)]
     pub fn ci_state(self) -> CiState {
         match self {
             Self::Success => CiState::Passed,
@@ -449,7 +464,8 @@ pub struct MergeOutcome {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pipeline {
-    pub id: PipelineId,    pub name: String,
+    pub id: PipelineId,
+    pub name: String,
     pub ref_name: String,
     pub sha: String,
     pub status: PipelineStatus,

@@ -1,12 +1,13 @@
 use crate::{
     config::ProjectConfig,
     forge::{
-        ForgeCapabilities, ForgeError, ForgeProvider, MergeOutcome, MergeStrategy, Milestone,
-        NewChangeRequest, RepositoryInfo, RequestPatch, ReviewAction, auth, normalized_request,
+        CreateResult, ForgeCapabilities, ForgeError, ForgeProvider, MergeOutcome, MergeStrategy,
+        Milestone, NewChangeRequest, RepositoryInfo, RequestPatch, ReviewAction, auth,
+        normalized_request,
     },
     model::{
-        ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Label, Person,
-        RequestState, ReviewState, Reviewer,
+        ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Label, Person, RequestState,
+        ReviewState, Reviewer,
     },
 };
 use async_trait::async_trait;
@@ -51,7 +52,12 @@ impl ForgejoProvider {
     fn api(&self, path: &str) -> String {
         format!("https://{}/api/v1/{path}", self.host)
     }
-    async fn get_pull(&self, token: &str, repository: &str, number: u64) -> Result<Row, ForgeError> {
+    async fn get_pull(
+        &self,
+        token: &str,
+        repository: &str,
+        number: u64,
+    ) -> Result<Row, ForgeError> {
         let response = reqwest::Client::new()
             .get(self.api(&format!("repos/{repository}/pulls/{number}")))
             .header("Authorization", format!("token {token}"))
@@ -76,10 +82,7 @@ impl ForgejoProvider {
         body: serde_json::Value,
     ) -> Result<(), ForgeError> {
         let response = reqwest::Client::new()
-            .patch(self.api(&format!(
-                "repos/{}/issues/{}",
-                id.repository, id.number
-            )))
+            .patch(self.api(&format!("repos/{}/issues/{}", id.repository, id.number)))
             .header("Authorization", format!("token {token}"))
             .json(&body)
             .send()
@@ -113,7 +116,9 @@ impl ForgejoProvider {
         title: &str,
     ) -> Result<u64, ForgeError> {
         let response = reqwest::Client::new()
-            .get(self.api(&format!("repos/{repository}/milestones?state=open&limit=100")))
+            .get(self.api(&format!(
+                "repos/{repository}/milestones?state=open&limit=100"
+            )))
             .header("Authorization", format!("token {token}"))
             .send()
             .await
@@ -133,9 +138,10 @@ impl IntoLabelIds for Vec<Option<u64>> {
         if self.iter().all(|id| id.is_some()) {
             Ok(self.into_iter().flatten().collect())
         } else {
-            Err(ForgeError::Validation(
-                format!("unknown label(s): {}", wanted.join(", ")),
-            ))
+            Err(ForgeError::Validation(format!(
+                "unknown label(s): {}",
+                wanted.join(", ")
+            )))
         }
     }
 }
@@ -156,6 +162,7 @@ impl ForgeProvider for ForgejoProvider {
             // Forgejo Actions is optional and varies by server release. Discovery can later
             // promote these flags; the conservative default never offers unsafe CI writes.
             create_change_request: true,
+            create_draft: false,
             edit_title: true,
             edit_description: true,
             labels: true,
@@ -169,6 +176,7 @@ impl ForgeProvider for ForgejoProvider {
             merge_commit: true,
             squash_merge: true,
             rebase_merge: true,
+            delete_source_branch: true,
             ..ForgeCapabilities::default()
         }
     }
@@ -199,7 +207,23 @@ impl ForgeProvider for ForgejoProvider {
     }
     async fn get_change_request(&self, id: &ChangeRequestId) -> Result<ChangeRequest, ForgeError> {
         let token = self.credential().await?;
-        self.fetch_full(&token, id).await
+        let mut request = self.fetch_full(&token, id).await?;
+        crate::forge::apply_review_states(&mut request, self.list_reviews(id).await?);
+        Ok(request)
+    }
+    async fn list_reviews(&self, id: &ChangeRequestId) -> Result<Vec<Reviewer>, ForgeError> {
+        let token = self.credential().await?;
+        let response = reqwest::Client::new()
+            .get(self.api(&format!(
+                "repos/{}/pulls/{}/reviews?limit=100",
+                id.repository, id.number
+            )))
+            .header("Authorization", format!("token {token}"))
+            .send()
+            .await
+            .map_err(network)?;
+        let rows: Vec<ReviewRow> = ensure(response).await?.json().await.map_err(network)?;
+        Ok(latest_reviews(rows))
     }
     async fn get_repository(&self, repository: &str) -> Result<RepositoryInfo, ForgeError> {
         let token = self.credential().await?;
@@ -210,15 +234,13 @@ impl ForgeProvider for ForgejoProvider {
             .await
             .map_err(network)?;
         let row: RepositoryRow = ensure(response).await?.json().await.map_err(network)?;
-        Ok(RepositoryInfo {
-            default_branch: row.default_branch,
-        })
+        Ok(repository_info(row))
     }
     async fn create_change_request(
         &self,
         input: &NewChangeRequest,
         repository: &str,
-    ) -> Result<ChangeRequest, ForgeError> {
+    ) -> Result<CreateResult, ForgeError> {
         let token = self.credential().await?;
         let response = reqwest::Client::new()
             .post(self.api(&format!("repos/{repository}/pulls")))
@@ -234,36 +256,57 @@ impl ForgeProvider for ForgejoProvider {
             .await
             .map_err(network)?;
         let row: Row = ensure(response).await?.json().await.map_err(network)?;
-        let mut created = normalize(&self.name, repository, row);
-        // Best-effort metadata after creation; the targeted refresh reconciles provider truth.
+        let created = normalize(&self.name, repository, row);
+        let mut metadata_warnings = Vec::new();
         if !input.labels.is_empty() {
-            if let Ok(ids) = self.label_ids(&token, repository, &input.labels).await {
-                let _ = self
-                    .patch_issue(
-                        &token,
-                        &created.id,
-                        serde_json::json!({"labels": ids}),
-                    )
-                    .await;
+            match self.label_ids(&token, repository, &input.labels).await {
+                Ok(ids) => {
+                    if self
+                        .patch_issue(&token, &created.id, serde_json::json!({"labels": ids}))
+                        .await
+                        .is_err()
+                    {
+                        metadata_warnings
+                            .push("labels were not applied; edit request metadata".into());
+                    }
+                }
+                Err(_) => {
+                    metadata_warnings.push("labels were not applied; edit request metadata".into())
+                }
             }
         }
-        if !input.assignees.is_empty() {
-            let _ = self
+        if !input.assignees.is_empty()
+            && self
                 .patch_issue(
                     &token,
                     &created.id,
                     serde_json::json!({"assignees": input.assignees}),
                 )
-                .await;
+                .await
+                .is_err()
+        {
+            metadata_warnings.push("assignees were not applied; edit request metadata".into());
         }
         if let Some(milestone) = &input.milestone {
-            if let Ok(id) = self.milestone_id(&token, repository, milestone).await {
-                let _ = self
-                    .patch_issue(&token, &created.id, serde_json::json!({"milestone": id}))
-                    .await;
+            match self.milestone_id(&token, repository, milestone).await {
+                Ok(id) => {
+                    if self
+                        .patch_issue(&token, &created.id, serde_json::json!({"milestone": id}))
+                        .await
+                        .is_err()
+                    {
+                        metadata_warnings
+                            .push("milestone was not applied; edit request metadata".into());
+                    }
+                }
+                Err(_) => metadata_warnings
+                    .push("milestone was not applied; edit request metadata".into()),
             }
         }
-        Ok(created)
+        Ok(CreateResult {
+            request: created,
+            metadata_warnings,
+        })
     }
     async fn update_change_request(
         &self,
@@ -291,10 +334,7 @@ impl ForgeProvider for ForgejoProvider {
                 RequestState::Closed | RequestState::Merged => "closed",
             };
             let response = reqwest::Client::new()
-                .patch(self.api(&format!(
-                    "repos/{}/pulls/{}",
-                    id.repository, id.number
-                )))
+                .patch(self.api(&format!("repos/{}/pulls/{}", id.repository, id.number)))
                 .header("Authorization", format!("token {token}"))
                 .json(&serde_json::json!({"state": state}))
                 .send()
@@ -309,7 +349,7 @@ impl ForgeProvider for ForgejoProvider {
         }
         if let Some(assignees) = &patch.assignees {
             self.patch_issue(&token, id, serde_json::json!({"assignees": assignees}))
-            .await?;
+                .await?;
         }
         if let Some(milestone) = &patch.milestone {
             let milestone_id = match milestone {
@@ -345,14 +385,15 @@ impl ForgeProvider for ForgejoProvider {
         id: &ChangeRequestId,
         names: &[String],
     ) -> Result<Vec<Label>, ForgeError> {
-        let updated = self.update_change_request(
-            id,
-            &RequestPatch {
-                labels: Some(names.to_vec()),
-                ..RequestPatch::default()
-            },
-        )
-        .await?;
+        let updated = self
+            .update_change_request(
+                id,
+                &RequestPatch {
+                    labels: Some(names.to_vec()),
+                    ..RequestPatch::default()
+                },
+            )
+            .await?;
         Ok(updated.labels)
     }
     async fn search_assignees(
@@ -362,9 +403,7 @@ impl ForgeProvider for ForgejoProvider {
     ) -> Result<Vec<Person>, ForgeError> {
         let token = self.credential().await?;
         let response = reqwest::Client::new()
-            .get(self.api(&format!(
-                "repos/{repository}/assignees?limit=100"
-            )))
+            .get(self.api(&format!("repos/{repository}/assignees?limit=100")))
             .header("Authorization", format!("token {token}"))
             .send()
             .await
@@ -386,14 +425,15 @@ impl ForgeProvider for ForgejoProvider {
         id: &ChangeRequestId,
         logins: &[String],
     ) -> Result<Vec<Person>, ForgeError> {
-        let updated = self.update_change_request(
-            id,
-            &RequestPatch {
-                assignees: Some(logins.to_vec()),
-                ..RequestPatch::default()
-            },
-        )
-        .await?;
+        let updated = self
+            .update_change_request(
+                id,
+                &RequestPatch {
+                    assignees: Some(logins.to_vec()),
+                    ..RequestPatch::default()
+                },
+            )
+            .await?;
         Ok(updated.assignees)
     }
     async fn list_milestones(&self, repository: &str) -> Result<Vec<Milestone>, ForgeError> {
@@ -417,14 +457,15 @@ impl ForgeProvider for ForgejoProvider {
         id: &ChangeRequestId,
         milestone: Option<&str>,
     ) -> Result<Option<String>, ForgeError> {
-        let updated = self.update_change_request(
-            id,
-            &RequestPatch {
-                milestone: Some(milestone.map(str::to_owned)),
-                ..RequestPatch::default()
-            },
-        )
-        .await?;
+        let updated = self
+            .update_change_request(
+                id,
+                &RequestPatch {
+                    milestone: Some(milestone.map(str::to_owned)),
+                    ..RequestPatch::default()
+                },
+            )
+            .await?;
         Ok(updated.milestone)
     }
     async fn merge_change_request(
@@ -460,8 +501,7 @@ impl ForgeProvider for ForgejoProvider {
     }
     async fn delete_branch(&self, repository: &str, branch: &str) -> Result<(), ForgeError> {
         let token = self.credential().await?;
-        let encoded =
-            url::form_urlencoded::byte_serialize(branch.as_bytes()).collect::<String>();
+        let encoded = url::form_urlencoded::byte_serialize(branch.as_bytes()).collect::<String>();
         let response = reqwest::Client::new()
             .delete(self.api(&format!("repos/{repository}/branches/{encoded}")))
             .header("Authorization", format!("token {token}"))
@@ -602,6 +642,14 @@ struct User {
     full_name: Option<String>,
 }
 #[derive(Deserialize)]
+struct ReviewRow {
+    #[serde(default)]
+    user: Option<User>,
+    state: String,
+    #[serde(default)]
+    dismissed: bool,
+}
+#[derive(Deserialize)]
 struct Branch {
     #[serde(rename = "ref")]
     branch: String,
@@ -650,6 +698,59 @@ struct MilestoneRow {
 struct RepositoryRow {
     #[serde(default)]
     default_branch: Option<String>,
+    #[serde(default)]
+    allow_merge_commits: Option<bool>,
+    #[serde(default)]
+    allow_rebase: Option<bool>,
+    #[serde(default)]
+    allow_squash_merge: Option<bool>,
+}
+fn repository_info(row: RepositoryRow) -> RepositoryInfo {
+    RepositoryInfo {
+        default_branch: row.default_branch,
+        allow_merge_commit: row.allow_merge_commits,
+        allow_squash_merge: row.allow_squash_merge,
+        allow_rebase_merge: row.allow_rebase,
+        ..RepositoryInfo::default()
+    }
+}
+fn latest_reviews(rows: Vec<ReviewRow>) -> Vec<Reviewer> {
+    let mut latest: Vec<Reviewer> = Vec::new();
+    for row in rows {
+        if matches!(row.state.as_str(), "COMMENT" | "COMMENTED" | "PENDING") {
+            continue;
+        }
+        let Some(user) = row.user else {
+            continue;
+        };
+        let state = if row.dismissed {
+            ReviewState::None
+        } else {
+            match row.state.as_str() {
+                "APPROVED" => ReviewState::Approved,
+                "REQUEST_CHANGES" | "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
+                "REQUEST_REVIEW" => ReviewState::Requested,
+                _ => ReviewState::None,
+            }
+        };
+        let reviewer = Reviewer {
+            person: Person {
+                login: user.login,
+                name: user.full_name,
+                id: Some(user.id),
+            },
+            state,
+        };
+        if let Some(current) = latest
+            .iter_mut()
+            .find(|current| current.person.login == reviewer.person.login)
+        {
+            *current = reviewer;
+        } else {
+            latest.push(reviewer);
+        }
+    }
+    latest
 }
 fn request_state(row: &Row) -> RequestState {
     if row.merged.unwrap_or(false) || row.merged_at.is_some() {
@@ -693,7 +794,10 @@ fn normalize(forge: &str, repo: &str, row: Row) -> ChangeRequest {
             id: Some(user.id),
         })
         .collect();
-    request.milestone = row.milestone.as_ref().map(|milestone| milestone.title.clone());
+    request.milestone = row
+        .milestone
+        .as_ref()
+        .map(|milestone| milestone.title.clone());
     request.web_url = row.html_url.clone();
     request.mergeable_state = None;
     request.head_sha = row.head_sha.clone();
@@ -765,5 +869,80 @@ mod tests {
         assert!(!caps.auto_merge);
         assert!(!caps.draft_transition);
         assert!(!caps.ci_read);
+    }
+
+    #[test]
+    fn repository_settings_filter_unsupported_merge_strategies() {
+        let row: RepositoryRow = serde_json::from_str(
+            r#"{"default_branch":"main","allow_merge_commits":false,"allow_rebase":true,"allow_squash_merge":false}"#,
+        )
+        .unwrap();
+        let info = repository_info(row);
+        let mut caps =
+            ForgejoProvider::new("codeberg".into(), "codeberg.org".into(), &[]).capabilities();
+        info.filter_capabilities(&mut caps);
+        assert!(!caps.merge_commit);
+        assert!(!caps.squash_merge);
+        assert!(caps.rebase_merge);
+        assert!(!caps.auto_merge);
+    }
+
+    #[test]
+    fn non_decisive_reviews_do_not_replace_the_latest_decision() {
+        let rows: Vec<ReviewRow> = serde_json::from_str(
+            r#"[
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"APPROVED"},
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"COMMENT"},
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"PENDING"}
+            ]"#,
+        )
+        .unwrap();
+        let latest = latest_reviews(rows);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state, ReviewState::Approved);
+    }
+
+    #[test]
+    fn request_review_and_dismissal_update_reviewer_state() {
+        let rows: Vec<ReviewRow> = serde_json::from_str(
+            r#"[
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"APPROVED"},
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"REQUEST_REVIEW"},
+                {"user":{"login":"alice","id":7,"full_name":"Alice"},"state":"APPROVED"},
+                {"user":{"login":"alice","id":7,"full_name":"Alice"},"state":"APPROVED","dismissed":true},
+                {"user":null,"team":{"id":9,"name":"reviewers"},"state":"APPROVED"}
+            ]"#,
+        )
+        .unwrap();
+        let latest = latest_reviews(rows);
+        assert_eq!(latest.len(), 2);
+        assert_eq!(
+            latest
+                .iter()
+                .find(|reviewer| reviewer.person.login == "bob")
+                .unwrap()
+                .state,
+            ReviewState::Requested
+        );
+        assert_eq!(
+            latest
+                .iter()
+                .find(|reviewer| reviewer.person.login == "alice")
+                .unwrap()
+                .state,
+            ReviewState::None
+        );
+    }
+
+    #[test]
+    fn omitted_repository_merge_settings_remain_unknown() {
+        let row: RepositoryRow = serde_json::from_str(r#"{"default_branch":"main"}"#).unwrap();
+        let info = repository_info(row);
+        let mut caps =
+            ForgejoProvider::new("codeberg".into(), "codeberg.org".into(), &[]).capabilities();
+        info.filter_capabilities(&mut caps);
+        assert!(caps.merge_commit);
+        assert!(caps.squash_merge);
+        assert!(caps.rebase_merge);
     }
 }

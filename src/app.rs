@@ -1,8 +1,14 @@
 use crate::{
     cache,
     config::{Config, ForgeKind},
+    create::{self, CreateWorkflow},
+    edit::{self, EditAction, EditSession},
     forge::{self, ForgeProvider},
+    git::repo::{self, BranchState, PushError, RepoContext},
+    merge::MergeSession,
     model::*,
+    picker::{PickerItem, PickerKind, PickerSession},
+    write::OpId,
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -12,7 +18,22 @@ use std::collections::HashMap;
 use std::{sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 
-pub const PALETTE_COMMANDS: [&str; 14] = [
+pub const PALETTE_COMMANDS: [&str; 29] = [
+    "Create pull request",
+    "Edit",
+    "Edit title",
+    "Edit description",
+    "Edit labels",
+    "Edit reviewers",
+    "Edit assignees",
+    "Edit milestone",
+    "Mark as draft",
+    "Mark ready for review",
+    "Close request",
+    "Reopen request",
+    "Merge",
+    "Enable auto-merge",
+    "Disable auto-merge",
     "Add comment",
     "Approve",
     "Request changes",
@@ -62,6 +83,114 @@ pub enum AppEvent {
         action: CiAction,
         result: Result<(), forge::ForgeError>,
     },
+    GitPreflightCompleted {
+        op: OpId,
+        result: Result<GitPreflight, String>,
+    },
+    MergePreflightLoaded {
+        id: ChangeRequestId,
+        result: Result<ChangeRequest, forge::ForgeError>,
+    },
+    ProjectGitLoaded(Result<BranchState, String>),
+    GitBranchesLoaded {
+        token: OpId,
+        branches: Vec<String>,
+    },
+    RepositoryInfoLoaded {
+        forge: String,
+        repository: String,
+        result: Result<forge::RepositoryInfo, forge::ForgeError>,
+    },
+    PushCompleted {
+        op: OpId,
+        branch: String,
+        result: Result<(), PushError>,
+    },
+    PickerLoaded {
+        token: OpId,
+        result: Result<Vec<PickerItem>, forge::ForgeError>,
+    },
+    CreateCompleted {
+        op: OpId,
+        result: Result<forge::CreateResult, forge::ForgeError>,
+    },
+    RequestWriteCompleted {
+        id: ChangeRequestId,
+        op: OpId,
+        action: LifecycleAction,
+        result: Result<ChangeRequest, forge::ForgeError>,
+    },
+    MetadataWriteCompleted {
+        id: ChangeRequestId,
+        op: OpId,
+        kind: MetaKind,
+        result: Result<edit::MetaPayload, forge::ForgeError>,
+    },
+    MergeCompleted {
+        id: ChangeRequestId,
+        op: OpId,
+        result: Result<MergeOutcome, forge::ForgeError>,
+    },
+    AutoMergeCompleted {
+        id: ChangeRequestId,
+        op: OpId,
+        enabled: bool,
+        result: Result<bool, forge::ForgeError>,
+    },
+    TargetedRequestLoaded {
+        id: ChangeRequestId,
+        result: Result<ChangeRequest, forge::ForgeError>,
+    },
+    BranchCleanupCompleted {
+        id: ChangeRequestId,
+        message: String,
+        result: Result<(), String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct GitPreflight {
+    pub state: BranchState,
+    pub remote_exists: Option<bool>,
+    pub template: Option<String>,
+    pub subjects: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetaKind {
+    Labels,
+    Reviewers,
+    Assignees,
+    Milestone,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleAction {
+    Title,
+    Body,
+    Draft,
+    Ready,
+    Close,
+    Reopen,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfirmAction {
+    CloseRequest(ChangeRequestId),
+    DeleteRemoteBranch { id: ChangeRequestId, branch: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfirmDialog {
+    pub title: String,
+    pub body: String,
+    pub confirm: String,
+    pub cancel: String,
+    pub danger: bool,
+    /// Zero is always the safe, cancel action.
+    pub selected: usize,
+    pub action: ConfirmAction,
+    pub button_hits: Vec<(Rect, usize)>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -106,13 +235,40 @@ pub enum View {
     PipelineDetail(PipelineId),
     JobDetail(JobId),
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Overlay {
     Composer { body: String },
     ReviewMenu { selected: usize },
     Palette { query: String, selected: usize },
     ConfirmDelete,
     ConfirmCi { action: CiAction },
+    Create(Box<CreateWorkflow>),
+    Edit(EditSession),
+    Merge(MergeSession),
+    Confirm(ConfirmDialog),
+    BranchCleanup(BranchCleanupSession),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchCleanupSession {
+    pub id: ChangeRequestId,
+    pub kind: ChangeRequestKind,
+    pub branch: String,
+    pub root: Option<std::path::PathBuf>,
+    pub remote: String,
+    pub choices: Vec<BranchCleanupChoice>,
+    /// Keep is index zero and remains the default.
+    pub selected: usize,
+    pub pending: bool,
+    pub button_hits: Vec<(Rect, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchCleanupChoice {
+    KeepBranches,
+    DeleteRemote,
+    DeleteLocal,
+    DeleteBoth,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CiAction {
@@ -162,11 +318,20 @@ pub struct App {
     pub regions: HitRegions,
     pub toast: Option<String>,
     pub overlay: Option<Overlay>,
+    pub repo_context: RepoContext,
+    pub project_git: Option<BranchState>,
+    pub palette_hits: Vec<(Rect, usize)>,
+    pub activity: HashMap<ChangeRequestId, Vec<String>>,
+    repository_info: HashMap<(String, String), forge::RepositoryInfo>,
+    repository_info_loading: std::collections::HashSet<(String, String)>,
+    repository_info_failed: std::collections::HashSet<(String, String)>,
     config: Config,
-    demo: bool,
+    pub(crate) demo: bool,
     scope: Option<Scope>,
-    events: mpsc::UnboundedSender<AppEvent>,
-    providers: HashMap<String, Arc<dyn ForgeProvider>>,
+    pub(crate) events: mpsc::UnboundedSender<AppEvent>,
+    pub(crate) providers: HashMap<String, Arc<dyn ForgeProvider>>,
+    pub(crate) last_op: Option<OpId>,
+    pub(crate) in_flight: HashMap<(ChangeRequestId, &'static str), OpId>,
 }
 
 impl App {
@@ -181,8 +346,28 @@ impl App {
         } else {
             cache::load().unwrap_or_default()
         };
-        let providers = providers(&config);
-        Ok(Self {
+        let mut repo_context = if demo {
+            RepoContext {
+                remote: "origin".into(),
+                host: Some("github.com".into()),
+                repository: Some("jack/quickdrop".into()),
+                default_branch: Some("main".into()),
+                ..RepoContext::default()
+            }
+        } else {
+            repo::probe(&std::env::current_dir()?)
+                .await
+                .unwrap_or_default()
+        };
+        if repo_context.remote.is_empty() {
+            repo_context.remote = "origin".into();
+        }
+        let providers = if demo {
+            forge::demo::demo_providers().into_iter().collect()
+        } else {
+            providers(&config)
+        };
+        let app = Self {
             requests,
             selected: 0,
             filter: String::new(),
@@ -205,12 +390,85 @@ impl App {
             regions: HitRegions::default(),
             toast: None,
             overlay: None,
+            repo_context,
+            project_git: None,
+            palette_hits: vec![],
+            activity: HashMap::new(),
+            repository_info: HashMap::new(),
+            repository_info_loading: std::collections::HashSet::new(),
+            repository_info_failed: std::collections::HashSet::new(),
             config,
             demo,
             scope,
             events,
             providers,
-        })
+            last_op: None,
+            in_flight: HashMap::new(),
+        };
+        if !demo && let Some(root) = app.repo_context.root.clone() {
+            let target = app.repo_context.default_branch.clone().unwrap_or_default();
+            let remote = app.repo_context.remote.clone();
+            let sender = app.events.clone();
+            tokio::spawn(async move {
+                let state = repo::branch_state(&root, &target, &remote).await;
+                let result = if state.branch.is_empty() {
+                    Err("could not determine the current Git branch".to_owned())
+                } else {
+                    Ok(state)
+                };
+                let _ = sender.send(AppEvent::ProjectGitLoaded(result));
+            });
+        }
+        Ok(app)
+    }
+    #[cfg(test)]
+    pub(crate) fn test_app() -> Self {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let config = Config::default();
+        Self {
+            requests: forge::demo::change_requests(),
+            selected: 0,
+            filter: String::new(),
+            filtering: false,
+            show_help: false,
+            view: View::Dashboard,
+            health: vec![],
+            last_refresh: None,
+            stale: false,
+            focus: Focus::Requests,
+            detail_focus: DetailFocus::Comments,
+            comment_scroll: 0,
+            ci_scroll: 0,
+            job_selected: 0,
+            log_scroll: 0,
+            follow_logs: true,
+            log_query: None,
+            log_searching: false,
+            logs: HashMap::new(),
+            regions: HitRegions::default(),
+            toast: None,
+            overlay: None,
+            repo_context: RepoContext {
+                remote: "origin".into(),
+                host: Some("github.com".into()),
+                repository: Some("jack/quickdrop".into()),
+                default_branch: Some("main".into()),
+                ..RepoContext::default()
+            },
+            project_git: None,
+            palette_hits: vec![],
+            activity: HashMap::new(),
+            repository_info: HashMap::new(),
+            repository_info_loading: std::collections::HashSet::new(),
+            repository_info_failed: std::collections::HashSet::new(),
+            providers: forge::demo::demo_providers().into_iter().collect(),
+            config,
+            demo: true,
+            scope: None,
+            events,
+            last_op: None,
+            in_flight: HashMap::new(),
+        }
     }
     pub fn visible(&self) -> Vec<&ChangeRequest> {
         self.requests
@@ -335,7 +593,7 @@ impl App {
                         self.overlay = Some(Overlay::Palette { query, selected });
                     }
                     KeyCode::Down => {
-                        selected = (selected + 1).min(Self::palette_command_count(&query));
+                        selected = (selected + 1).min(self.palette_command_count(&query));
                         self.overlay = Some(Overlay::Palette { query, selected });
                     }
                     KeyCode::Up => {
@@ -358,6 +616,51 @@ impl App {
                     KeyCode::Enter | KeyCode::Esc => {}
                     KeyCode::Char('y') => self.start_ci_action(action),
                     _ => self.overlay = Some(Overlay::ConfirmCi { action }),
+                },
+                Overlay::Create(mut session) => {
+                    let close = session.handle_key(self, key, event.modifiers);
+                    if self.overlay.is_none() && !close {
+                        self.overlay = Some(Overlay::Create(session));
+                    }
+                }
+                Overlay::Edit(mut session) => {
+                    let close = session.handle_key(self, key, event.modifiers);
+                    if self.overlay.is_none() && !close {
+                        self.overlay = Some(Overlay::Edit(session));
+                    }
+                }
+                Overlay::Merge(mut session) => {
+                    if key == KeyCode::Char('r') && session.preflight_error.is_some() {
+                        session.preflight_error = None;
+                        session.loading = true;
+                        self.load_merge_preflight(session.id.clone());
+                    } else {
+                        let close = session.handle_key(self, key, event.modifiers);
+                        if self.overlay.is_none() && !close {
+                            self.overlay = Some(Overlay::Merge(session));
+                        }
+                    }
+                }
+                Overlay::Confirm(mut dialog) => match key {
+                    KeyCode::Esc => {}
+                    KeyCode::Left | KeyCode::Char('h') => dialog.selected = 0,
+                    KeyCode::Right | KeyCode::Char('l') => dialog.selected = 1,
+                    KeyCode::Enter if dialog.selected == 1 => self.confirm(dialog.action),
+                    KeyCode::Enter => {}
+                    _ => self.overlay = Some(Overlay::Confirm(dialog)),
+                },
+                Overlay::BranchCleanup(mut session) => match key {
+                    KeyCode::Esc => {}
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        session.selected = session.selected.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        session.selected =
+                            (session.selected + 1).min(session.choices.len().saturating_sub(1))
+                    }
+                    KeyCode::Enter if session.selected == 0 => {}
+                    KeyCode::Enter if !session.pending => self.start_branch_cleanup(session),
+                    _ => self.overlay = Some(Overlay::BranchCleanup(session)),
                 },
             }
             return false;
@@ -400,6 +703,7 @@ impl App {
     fn handle_dashboard_key(&mut self, key: KeyCode) -> bool {
         match key {
             KeyCode::Char('q') => return true,
+            KeyCode::Char('n') => self.open_create(),
             KeyCode::Char('j') | KeyCode::Down if self.focus == Focus::Comments => {
                 self.comment_scroll = self.comment_scroll.saturating_add(1)
             }
@@ -505,6 +809,8 @@ impl App {
                     body: String::new(),
                 })
             }
+            KeyCode::Char('e') => self.open_edit(),
+            KeyCode::Char('M') => self.open_merge(),
             KeyCode::Char('R') if self.can(|capabilities| capabilities.reviews) => {
                 self.overlay = Some(Overlay::ReviewMenu { selected: 0 })
             }
@@ -814,6 +1120,7 @@ impl App {
             self.detail_focus = DetailFocus::Comments;
             self.comment_scroll = 0;
             self.ci_scroll = 0;
+            self.load_repository_info(id.forge.clone(), id.repository.clone());
             if self.can(|capabilities| capabilities.ci_read) {
                 self.load_pipelines(id);
             }
@@ -852,11 +1159,1347 @@ impl App {
         });
     }
     fn can(&self, predicate: impl Fn(forge::ForgeCapabilities) -> bool) -> bool {
-        self.demo
-            || self
-                .request_for_view()
-                .and_then(|request| self.providers.get(&request.id.forge))
-                .is_some_and(|provider| predicate(provider.capabilities()))
+        self.request_for_view()
+            .and_then(|request| self.providers.get(&request.id.forge))
+            .is_some_and(|provider| predicate(provider.capabilities()))
+    }
+    fn capabilities_for(&self, id: &ChangeRequestId) -> forge::ForgeCapabilities {
+        let mut capabilities = self
+            .providers
+            .get(&id.forge)
+            .map(|provider| provider.capabilities())
+            .unwrap_or_default();
+        if self.demo {
+            return capabilities;
+        }
+        let key = (id.forge.clone(), id.repository.clone());
+        if let Some(info) = self.repository_info.get(&key) {
+            info.filter_capabilities(&mut capabilities);
+        } else {
+            capabilities.merge = false;
+            capabilities.merge_commit = false;
+            capabilities.squash_merge = false;
+            capabilities.rebase_merge = false;
+            capabilities.auto_merge = false;
+        }
+        capabilities
+    }
+    pub(crate) fn claim(&mut self, id: &ChangeRequestId, kind: &'static str) -> Option<OpId> {
+        let key = (id.clone(), kind);
+        if self.in_flight.contains_key(&key) {
+            return None;
+        }
+        let op = OpId::next();
+        self.in_flight.insert(key, op);
+        self.last_op = Some(op);
+        Some(op)
+    }
+    fn project_forge(&self) -> Option<(String, String, String, ChangeRequestKind)> {
+        let host = self.repo_context.host.clone()?;
+        let repository = self.repo_context.repository.clone()?;
+        let forge = if self.demo {
+            "github".to_owned()
+        } else {
+            self.config
+                .forges
+                .iter()
+                .find(|forge| forge.host == host)
+                .map(|forge| forge.name.clone())?
+        };
+        let kind = if self
+            .config
+            .forges
+            .iter()
+            .find(|config| config.name == forge)
+            .is_some_and(|config| matches!(config.kind, ForgeKind::Gitlab))
+        {
+            ChangeRequestKind::MergeRequest
+        } else {
+            ChangeRequestKind::PullRequest
+        };
+        Some((forge, host, repository, kind))
+    }
+    pub(crate) fn can_create_current_project(&self) -> bool {
+        self.project_forge().is_some_and(|(forge, _, _, _)| {
+            self.providers
+                .get(&forge)
+                .is_some_and(|provider| provider.capabilities().create_change_request)
+        })
+    }
+    fn open_create(&mut self) {
+        let Some((forge, host, repository, kind)) = self.project_forge() else {
+            self.toast = Some("Create requires a configured Git repository and forge".into());
+            return;
+        };
+        let Some(provider) = self.providers.get(&forge) else {
+            self.toast = Some("No provider is configured for this project".into());
+            return;
+        };
+        let caps = provider.capabilities();
+        if !caps.create_change_request {
+            self.toast = Some("This forge does not support creating change requests".into());
+            return;
+        }
+        let mut context = self.repo_context.clone();
+        context.host = Some(host);
+        context.repository = Some(repository);
+        let mut workflow = CreateWorkflow::new(forge, context, kind, caps, self.demo);
+        workflow.start_preflight(self);
+        if !self.demo {
+            self.load_repository_info(workflow.forge.clone(), workflow.repository.clone());
+        }
+        self.overlay = Some(Overlay::Create(Box::new(workflow)));
+    }
+    fn load_repository_info(&mut self, forge: String, repository: String) {
+        if self.demo {
+            return;
+        }
+        let key = (forge.clone(), repository.clone());
+        if self.repository_info.contains_key(&key)
+            || !self.repository_info_loading.insert(key.clone())
+        {
+            return;
+        }
+        self.repository_info_failed.remove(&key);
+        let Some(provider) = self.providers.get(&forge).cloned() else {
+            self.repository_info_loading.remove(&key);
+            self.repository_info_failed.insert(key);
+            self.toast = Some("No provider is configured for this repository".into());
+            return;
+        };
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = provider.get_repository(&repository).await;
+            let _ = events.send(AppEvent::RepositoryInfoLoaded {
+                forge,
+                repository,
+                result,
+            });
+        });
+    }
+    fn open_edit(&mut self) {
+        let Some(request) = self.detail_request().cloned() else {
+            return;
+        };
+        let caps = self
+            .providers
+            .get(&request.id.forge)
+            .map(|provider| provider.capabilities())
+            .unwrap_or_default();
+        self.overlay = Some(Overlay::Edit(EditSession::new(request.id, caps)));
+    }
+    fn open_edit_action(&mut self, action: EditAction) {
+        let Some(request) = self.detail_request().cloned() else {
+            return;
+        };
+        let caps = self
+            .providers
+            .get(&request.id.forge)
+            .map(|provider| provider.capabilities())
+            .unwrap_or_default();
+        let mut session = EditSession::new(request.id, caps);
+        session.dispatch(self, action);
+        if self.overlay.is_none() {
+            self.overlay = Some(Overlay::Edit(session));
+        }
+    }
+    fn open_merge(&mut self) {
+        let Some(request) = self.detail_request().cloned() else {
+            return;
+        };
+        let mut caps = self
+            .providers
+            .get(&request.id.forge)
+            .map(|provider| provider.capabilities())
+            .unwrap_or_default();
+        let repository_key = (request.id.forge.clone(), request.id.repository.clone());
+        if let Some(info) = self.repository_info.get(&repository_key) {
+            info.filter_capabilities(&mut caps);
+        }
+        if let Some(mut session) = MergeSession::build(&request, &caps) {
+            if !self.demo && !self.repository_info.contains_key(&repository_key) {
+                session.loading = true;
+                self.repository_info_loading.insert(repository_key);
+            }
+            self.overlay = Some(Overlay::Merge(session));
+            if !self.demo {
+                self.load_merge_preflight(request.id.clone());
+            }
+        } else {
+            self.toast = Some("Merge is not supported or this request is not open".into());
+        }
+    }
+    pub(crate) fn load_merge_preflight(&self, id: ChangeRequestId) {
+        let Some(provider) = self.providers.get(&id.forge).cloned() else {
+            return;
+        };
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let repository = id.repository.clone();
+            let forge = id.forge.clone();
+            let info = provider.get_repository(&repository).await;
+            let _ = events.send(AppEvent::RepositoryInfoLoaded {
+                forge,
+                repository,
+                result: info,
+            });
+            let result = async {
+                let mut request = provider.get_change_request_for_merge(&id).await?;
+                if provider.capabilities().ci_read {
+                    let pipelines = provider.list_pipelines(&id).await?;
+                    if !pipelines.is_empty() {
+                        request.ci = summarize_ci(&pipelines);
+                    }
+                    request.pipelines = pipelines;
+                }
+                Ok(request)
+            }
+            .await;
+            let _ = events.send(AppEvent::MergePreflightLoaded { id, result });
+        });
+    }
+    pub(crate) fn spawn_preflight(
+        &self,
+        op: OpId,
+        root: std::path::PathBuf,
+        remote: String,
+        target: String,
+        kind: ChangeRequestKind,
+    ) {
+        let sender = self.events.clone();
+        tokio::spawn(async move {
+            let mut state = repo::branch_state(&root, &target, &remote).await;
+            if state.branch.is_empty() {
+                let _ = sender.send(AppEvent::GitPreflightCompleted {
+                    op,
+                    result: Err("could not determine the current Git branch".into()),
+                });
+                return;
+            }
+            let remote_exists =
+                match repo::remote_branch_exists(&root, &remote, &state.branch).await {
+                    Ok(exists) => exists,
+                    Err(PushError::TimedOut) => {
+                        let _ = sender.send(AppEvent::GitPreflightCompleted {
+                            op,
+                            result: Err("remote branch check timed out".into()),
+                        });
+                        return;
+                    }
+                    Err(PushError::Failed { .. }) => {
+                        let _ = sender.send(AppEvent::GitPreflightCompleted {
+                            op,
+                            result: Err(
+                                "could not verify the remote branch; check the configured remote"
+                                    .into(),
+                            ),
+                        });
+                        return;
+                    }
+                };
+            let subjects = repo::commit_subjects(&root, &target, &remote, 5).await;
+            let template = repo::find_template(&root, kind);
+            state.remote_branch_exists = Some(remote_exists);
+            if !remote_exists {
+                state.unpushed = state.ahead;
+            }
+            let _ = sender.send(AppEvent::GitPreflightCompleted {
+                op,
+                result: Ok(GitPreflight {
+                    state,
+                    remote_exists: Some(remote_exists),
+                    template,
+                    subjects,
+                }),
+            });
+        });
+    }
+    pub(crate) fn spawn_target_branches(
+        &self,
+        token: OpId,
+        root: std::path::PathBuf,
+        remote: String,
+        source: String,
+    ) {
+        let sender = self.events.clone();
+        tokio::spawn(async move {
+            let branches = repo::branches(&root, &remote)
+                .await
+                .into_iter()
+                .filter(|branch| branch != &source)
+                .collect();
+            let _ = sender.send(AppEvent::GitBranchesLoaded { token, branches });
+        });
+    }
+    pub(crate) fn spawn_picker_search(
+        &self,
+        kind: PickerKind,
+        token: OpId,
+        forge: &str,
+        repository: &str,
+        query: &str,
+    ) {
+        let forge = forge.to_owned();
+        let repository = repository.to_owned();
+        let query = query.to_owned();
+        let demo = self.demo;
+        let provider = self.providers.get(&forge).cloned();
+        let sender = self.events.clone();
+        tokio::spawn(async move {
+            let result = if demo {
+                let q = query.to_lowercase();
+                Ok(forge::demo::picker_items(kind)
+                    .into_iter()
+                    .filter(|item| {
+                        q.is_empty()
+                            || item.id.to_lowercase().contains(&q)
+                            || item.label.to_lowercase().contains(&q)
+                    })
+                    .collect())
+            } else if let Some(provider) = provider {
+                match kind {
+                    PickerKind::Reviewer => provider
+                        .search_reviewers(
+                            &ChangeRequestId {
+                                forge: forge.clone(),
+                                repository: repository.clone(),
+                                number: 0,
+                            },
+                            &query,
+                        )
+                        .await
+                        .map(|people| {
+                            people
+                                .into_iter()
+                                .map(|person| {
+                                    let id = person.login.clone();
+                                    let label = person.display_name().to_owned();
+                                    PickerItem {
+                                        id,
+                                        label,
+                                        detail: person.id.map(|id| id.to_string()),
+                                    }
+                                })
+                                .collect()
+                        }),
+                    PickerKind::Assignee => provider
+                        .search_assignees(&repository, &query)
+                        .await
+                        .map(|people| {
+                            people
+                                .into_iter()
+                                .map(|person| {
+                                    let id = person.login.clone();
+                                    let label = person.display_name().to_owned();
+                                    PickerItem {
+                                        id,
+                                        label,
+                                        detail: person.id.map(|id| id.to_string()),
+                                    }
+                                })
+                                .collect()
+                        }),
+                    PickerKind::Label => provider.list_labels(&repository).await.map(|labels| {
+                        labels
+                            .into_iter()
+                            .map(|label| PickerItem {
+                                id: label.name.clone(),
+                                label: label.name,
+                                detail: label.color,
+                            })
+                            .collect()
+                    }),
+                    PickerKind::Milestone => {
+                        provider
+                            .list_milestones(&repository)
+                            .await
+                            .map(|milestones| {
+                                milestones
+                                    .into_iter()
+                                    .map(|milestone| PickerItem::simple(milestone.name))
+                                    .collect()
+                            })
+                    }
+                    PickerKind::TargetBranch => Err(forge::ForgeError::Unsupported),
+                }
+            } else {
+                Err(forge::ForgeError::NotFound)
+            };
+            let _ = sender.send(AppEvent::PickerLoaded { token, result });
+        });
+    }
+    pub(crate) fn next_demo_number(&self, forge: &str, repository: &str) -> u64 {
+        self.requests
+            .iter()
+            .filter(|request| request.id.forge == forge && request.id.repository == repository)
+            .map(|request| request.id.number)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+    pub(crate) fn start_update(
+        &mut self,
+        id: ChangeRequestId,
+        patch: forge::RequestPatch,
+        action: LifecycleAction,
+    ) {
+        let permitted = self.providers.get(&id.forge).is_some_and(|provider| {
+            let caps = provider.capabilities();
+            match action {
+                LifecycleAction::Title => caps.edit_title,
+                LifecycleAction::Body => caps.edit_description,
+                LifecycleAction::Draft | LifecycleAction::Ready => caps.draft_transition,
+                LifecycleAction::Close => caps.close,
+                LifecycleAction::Reopen => caps.reopen,
+            }
+        });
+        if !permitted {
+            self.toast = Some("This forge has not advertised this write capability".into());
+            return;
+        }
+        let Some(op) = self.claim(&id, "update") else {
+            return;
+        };
+        self.toast = Some(match action {
+            LifecycleAction::Title => "Updating title".into(),
+            LifecycleAction::Body => "Updating description".into(),
+            LifecycleAction::Draft => "Marking draft".into(),
+            LifecycleAction::Ready => "Marking ready for review".into(),
+            LifecycleAction::Close => "Closing request".into(),
+            LifecycleAction::Reopen => "Reopening request".into(),
+        });
+        let sender = self.events.clone();
+        if self.demo {
+            let result = self
+                .requests
+                .iter()
+                .find(|request| request.id == id)
+                .cloned()
+                .map(|mut request| {
+                    if let Some(title) = patch.title.clone() {
+                        request.title = title;
+                    }
+                    if let Some(body) = patch.body.clone() {
+                        request.body = Some(body);
+                    }
+                    if let Some(draft) = patch.draft {
+                        request.draft = draft;
+                    }
+                    if let Some(state) = patch.state {
+                        request.state = state;
+                    }
+                    request.updated_at = Utc::now();
+                    request
+                })
+                .ok_or(forge::ForgeError::NotFound);
+            tokio::spawn(async move {
+                let _ = sender.send(AppEvent::RequestWriteCompleted {
+                    id,
+                    op,
+                    action,
+                    result,
+                });
+            });
+            return;
+        }
+        let Some(provider) = self.providers.get(&id.forge).cloned() else {
+            self.in_flight.remove(&(id.clone(), "update"));
+            self.toast = Some("No provider is configured for this request".into());
+            return;
+        };
+        tokio::spawn(async move {
+            let result = provider.update_change_request(&id, &patch).await;
+            let _ = sender.send(AppEvent::RequestWriteCompleted {
+                id,
+                op,
+                action,
+                result,
+            });
+        });
+    }
+    pub(crate) fn start_labels(&mut self, id: ChangeRequestId, labels: Vec<String>) {
+        self.start_metadata(id, MetaKind::Labels, labels, vec![], None);
+    }
+    pub(crate) fn start_assignees(&mut self, id: ChangeRequestId, assignees: Vec<String>) {
+        self.start_metadata(id, MetaKind::Assignees, assignees, vec![], None);
+    }
+    pub(crate) fn start_reviewers(
+        &mut self,
+        id: ChangeRequestId,
+        add: Vec<Person>,
+        remove: Vec<String>,
+    ) {
+        self.start_metadata(id, MetaKind::Reviewers, vec![], add, Some(remove));
+    }
+    pub(crate) fn start_milestone(&mut self, id: ChangeRequestId, milestone: Option<String>) {
+        self.start_metadata(
+            id,
+            MetaKind::Milestone,
+            vec![],
+            vec![],
+            Some(vec![milestone.unwrap_or_default()]),
+        );
+    }
+    fn start_metadata(
+        &mut self,
+        id: ChangeRequestId,
+        kind: MetaKind,
+        names: Vec<String>,
+        people: Vec<Person>,
+        optional: Option<Vec<String>>,
+    ) {
+        let cap_ok = self.providers.get(&id.forge).is_some_and(|provider| {
+            let caps = provider.capabilities();
+            match kind {
+                MetaKind::Labels => caps.labels,
+                MetaKind::Reviewers => caps.request_reviewers,
+                MetaKind::Assignees => caps.assignees,
+                MetaKind::Milestone => caps.milestone,
+            }
+        });
+        if !cap_ok {
+            self.toast = Some("This forge has not advertised this write capability".into());
+            return;
+        }
+        let key = match kind {
+            MetaKind::Labels => "labels",
+            MetaKind::Reviewers => "reviewers",
+            MetaKind::Assignees => "assignees",
+            MetaKind::Milestone => "milestone",
+        };
+        let Some(op) = self.claim(&id, key) else {
+            return;
+        };
+        self.toast = Some("Saving change request metadata".into());
+        let sender = self.events.clone();
+        if self.demo {
+            let result = self
+                .requests
+                .iter()
+                .find(|request| request.id == id)
+                .cloned()
+                .map(|request| {
+                    let mut payload = edit::MetaPayload::default();
+                    match kind {
+                        MetaKind::Labels => {
+                            payload.labels = names
+                                .iter()
+                                .map(|name| Label::named(name.clone()))
+                                .collect();
+                            payload.labels_set = true;
+                        }
+                        MetaKind::Assignees => {
+                            payload.assignees = names
+                                .iter()
+                                .map(|login| Person::named(login.clone()))
+                                .collect();
+                            payload.assignees_set = true;
+                        }
+                        MetaKind::Milestone => {
+                            payload.milestone = optional
+                                .as_ref()
+                                .and_then(|values| values.first())
+                                .filter(|value| !value.is_empty())
+                                .cloned();
+                            payload.milestone_set = true;
+                        }
+                        MetaKind::Reviewers => {
+                            let current = request
+                                .reviewers
+                                .iter()
+                                .filter(|reviewer| reviewer.state == ReviewState::Requested)
+                                .map(|reviewer| reviewer.person.login.clone())
+                                .collect::<Vec<_>>();
+                            let removes = optional.unwrap_or_default();
+                            let mut reviewers = request
+                                .reviewers
+                                .into_iter()
+                                .filter(|reviewer| {
+                                    reviewer.state != ReviewState::Requested
+                                        || (!removes.contains(&reviewer.person.login)
+                                            && (people.is_empty()
+                                                || !current.contains(&reviewer.person.login)))
+                                })
+                                .collect::<Vec<_>>();
+                            reviewers.extend(people.iter().map(|person| Reviewer {
+                                person: person.clone(),
+                                state: ReviewState::Requested,
+                            }));
+                            payload.reviewers = reviewers;
+                            payload.reviewers_set = true;
+                        }
+                    }
+                    payload
+                })
+                .ok_or(forge::ForgeError::NotFound);
+            tokio::spawn(async move {
+                let _ = sender.send(AppEvent::MetadataWriteCompleted {
+                    id,
+                    op,
+                    kind,
+                    result,
+                });
+            });
+            return;
+        }
+        let Some(provider) = self.providers.get(&id.forge).cloned() else {
+            self.in_flight.remove(&(id.clone(), key));
+            self.toast = Some("No provider is configured for this request".into());
+            return;
+        };
+        tokio::spawn(async move {
+            let result = match kind {
+                MetaKind::Labels => {
+                    provider
+                        .set_labels(&id, &names)
+                        .await
+                        .map(|labels| edit::MetaPayload {
+                            labels,
+                            labels_set: true,
+                            ..edit::MetaPayload::default()
+                        })
+                }
+                MetaKind::Assignees => {
+                    provider
+                        .set_assignees(&id, &names)
+                        .await
+                        .map(|assignees| edit::MetaPayload {
+                            assignees,
+                            assignees_set: true,
+                            ..edit::MetaPayload::default()
+                        })
+                }
+                MetaKind::Milestone => {
+                    let milestone = optional
+                        .as_ref()
+                        .and_then(|values| values.first())
+                        .filter(|value| !value.is_empty())
+                        .map(String::as_str);
+                    provider
+                        .set_milestone(&id, milestone)
+                        .await
+                        .map(|milestone| edit::MetaPayload {
+                            milestone,
+                            milestone_set: true,
+                            ..edit::MetaPayload::default()
+                        })
+                }
+                MetaKind::Reviewers => {
+                    let removes = optional.unwrap_or_default();
+                    let mut result = Ok(());
+                    for reviewer in removes {
+                        if let Err(error) = provider.remove_reviewer(&id, &reviewer).await {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                    if result.is_ok() {
+                        for person in &people {
+                            if let Err(error) = provider.request_reviewer(&id, person).await {
+                                result = Err(error);
+                                break;
+                            }
+                        }
+                    }
+                    match result {
+                        Ok(()) => provider.get_change_request(&id).await.map(|request| {
+                            edit::MetaPayload {
+                                reviewers: request.reviewers,
+                                reviewers_set: true,
+                                ..edit::MetaPayload::default()
+                            }
+                        }),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            let _ = sender.send(AppEvent::MetadataWriteCompleted {
+                id,
+                op,
+                kind,
+                result,
+            });
+        });
+    }
+    pub(crate) fn start_merge(&mut self, id: ChangeRequestId, strategy: MergeStrategy, op: OpId) {
+        if self.in_flight.contains_key(&(id.clone(), "merge")) {
+            return;
+        }
+        self.in_flight.insert((id.clone(), "merge"), op);
+        let sender = self.events.clone();
+        if self.demo {
+            let result = Ok(MergeOutcome {
+                sha: Some(format!("demo-merge-{}", id.number)),
+                message: Some(format!("Merged with {}", strategy.label())),
+            });
+            tokio::spawn(async move {
+                let _ = sender.send(AppEvent::MergeCompleted { id, op, result });
+            });
+            return;
+        }
+        let Some(provider) = self.providers.get(&id.forge).cloned() else {
+            self.in_flight.remove(&(id.clone(), "merge"));
+            self.toast = Some("No provider is configured for this request".into());
+            return;
+        };
+        tokio::spawn(async move {
+            let result = provider.merge_change_request(&id, strategy).await;
+            let _ = sender.send(AppEvent::MergeCompleted { id, op, result });
+        });
+    }
+    fn start_auto_merge(&mut self, id: ChangeRequestId, enabled: bool) {
+        let Some(provider) = self.providers.get(&id.forge).cloned() else {
+            self.toast = Some("No provider is configured for this request".into());
+            return;
+        };
+        let caps = self.capabilities_for(&id);
+        if !caps.auto_merge {
+            self.toast = Some("Auto-merge is not supported by this forge".into());
+            return;
+        }
+        let strategy = [
+            (MergeStrategy::Squash, caps.squash_merge),
+            (MergeStrategy::MergeCommit, caps.merge_commit),
+            (MergeStrategy::Rebase, caps.rebase_merge),
+        ]
+        .into_iter()
+        .find_map(|(strategy, supported)| supported.then_some(strategy));
+        let Some(strategy) = strategy else {
+            self.toast = Some("No supported strategy is available for auto-merge".into());
+            return;
+        };
+        self.toast = Some(
+            if enabled {
+                "Enabling auto-merge"
+            } else {
+                "Disabling auto-merge"
+            }
+            .into(),
+        );
+        let Some(op) = self.claim(&id, "auto-merge") else {
+            return;
+        };
+        let sender = self.events.clone();
+        if self.demo {
+            tokio::spawn(async move {
+                let _ = sender.send(AppEvent::AutoMergeCompleted {
+                    id,
+                    op,
+                    enabled,
+                    result: Ok(enabled),
+                });
+            });
+            return;
+        }
+        tokio::spawn(async move {
+            let result = provider.set_auto_merge(&id, enabled, strategy).await;
+            let _ = sender.send(AppEvent::AutoMergeCompleted {
+                id,
+                op,
+                enabled,
+                result,
+            });
+        });
+    }
+    fn confirm(&mut self, action: ConfirmAction) {
+        self.overlay = None;
+        match action {
+            ConfirmAction::CloseRequest(id) => self.start_update(
+                id,
+                forge::RequestPatch {
+                    state: Some(RequestState::Closed),
+                    ..forge::RequestPatch::default()
+                },
+                LifecycleAction::Close,
+            ),
+            ConfirmAction::DeleteRemoteBranch { id, branch } => {
+                self.start_branch_delete(id, branch)
+            }
+        }
+    }
+    fn start_branch_delete(&mut self, id: ChangeRequestId, branch: String) {
+        let Some(provider) = self.providers.get(&id.forge).cloned() else {
+            self.toast = Some("No provider is configured for this request".into());
+            return;
+        };
+        if !provider.capabilities().delete_source_branch {
+            self.toast = Some("Source branch deletion is not supported".into());
+            return;
+        }
+        let sender = self.events.clone();
+        tokio::spawn(async move {
+            let result = provider.delete_branch(&id.repository, &branch).await;
+            let _ = sender.send(AppEvent::BranchCleanupCompleted {
+                id,
+                message: "Remote source branch deleted".into(),
+                result: result.map_err(|error| error_summary(&error)),
+            });
+        });
+    }
+    fn start_branch_cleanup(&mut self, mut session: BranchCleanupSession) {
+        let Some(choice) = session.choices.get(session.selected).copied() else {
+            self.overlay = None;
+            return;
+        };
+        if choice == BranchCleanupChoice::KeepBranches {
+            self.overlay = None;
+            return;
+        }
+        session.pending = true;
+        self.overlay = Some(Overlay::BranchCleanup(session.clone()));
+        self.toast = Some("Deleting source branch".into());
+        let id = session.id.clone();
+        let branch = session.branch.clone();
+        let root = session.root.clone();
+        let provider = self.providers.get(&id.forge).cloned();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = async {
+                if matches!(
+                    choice,
+                    BranchCleanupChoice::DeleteRemote | BranchCleanupChoice::DeleteBoth
+                ) {
+                    let provider = provider
+                        .as_ref()
+                        .ok_or_else(|| "provider unavailable".to_owned())?;
+                    provider
+                        .delete_branch(&id.repository, &branch)
+                        .await
+                        .map_err(|error| error_summary(&error))?;
+                }
+                if matches!(
+                    choice,
+                    BranchCleanupChoice::DeleteLocal | BranchCleanupChoice::DeleteBoth
+                ) {
+                    let root = root
+                        .as_ref()
+                        .ok_or_else(|| "local repository is unavailable".to_owned())?;
+                    repo::delete_local_branch(root, &branch)
+                        .await
+                        .map_err(|error| -> String {
+                            match error {
+                                PushError::TimedOut => "git branch delete timed out".into(),
+                                PushError::Failed { .. } => {
+                                    "git could not delete the local branch safely".into()
+                                }
+                            }
+                        })?;
+                }
+                Ok(())
+            }
+            .await;
+            let message = match choice {
+                BranchCleanupChoice::DeleteRemote => "Remote source branch deleted",
+                BranchCleanupChoice::DeleteLocal => "Local source branch deleted",
+                BranchCleanupChoice::DeleteBoth => "Local and remote source branches deleted",
+                BranchCleanupChoice::KeepBranches => "Branches kept",
+            }
+            .to_owned();
+            let _ = events.send(AppEvent::BranchCleanupCompleted {
+                id,
+                message,
+                result,
+            });
+        });
+    }
+    fn load_request(&self, id: ChangeRequestId) {
+        if self.demo {
+            return;
+        }
+        if let Some(provider) = self.providers.get(&id.forge).cloned() {
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                let result = provider.get_change_request(&id).await;
+                let _ = events.send(AppEvent::TargetedRequestLoaded { id, result });
+            });
+        }
+    }
+    pub fn apply_git_preflight(&mut self, op: OpId, result: Result<GitPreflight, String>) {
+        let Some(Overlay::Create(session)) = &mut self.overlay else {
+            return;
+        };
+        if session.preflight_op != Some(op) {
+            return;
+        }
+        session.preflight_loading = false;
+        match result {
+            Ok(preflight) => session.apply_preflight(
+                preflight.state,
+                preflight.remote_exists,
+                preflight.template,
+                preflight.subjects,
+            ),
+            Err(error) => {
+                session.preflight_error = Some(error);
+                session.set_button(vec![create::Button::Cancel]);
+            }
+        }
+    }
+    pub fn apply_project_git(&mut self, result: Result<BranchState, String>) {
+        match result {
+            Ok(state) => self.project_git = Some(state),
+            Err(error) => self.toast = Some(format!("Git status unavailable: {error}")),
+        }
+    }
+    pub fn apply_repository_info(
+        &mut self,
+        forge: String,
+        repository: String,
+        result: Result<forge::RepositoryInfo, forge::ForgeError>,
+    ) {
+        match result {
+            Ok(info) => {
+                let key = (forge.clone(), repository.clone());
+                self.repository_info_loading.remove(&key);
+                self.repository_info_failed.remove(&key);
+                if self.repository_info.get(&key) == Some(&info) {
+                    return;
+                }
+                self.repository_info.insert(key, info.clone());
+                if self.repo_context.repository.as_deref() == Some(repository.as_str()) {
+                    self.repo_context.default_branch = info
+                        .default_branch
+                        .clone()
+                        .or(self.repo_context.default_branch.clone());
+                }
+                let mut restart_create = false;
+                if let Some(Overlay::Create(session)) = &mut self.overlay
+                    && session.forge == forge
+                    && session.repository == repository
+                    && session.target.is_empty()
+                    && let Some(default_branch) = info.default_branch
+                {
+                    session.target = default_branch;
+                    restart_create = true;
+                }
+                if restart_create && let Some(Overlay::Create(mut session)) = self.overlay.take() {
+                    session.start_preflight(self);
+                    self.overlay = Some(Overlay::Create(session));
+                }
+                let pending_merge = self.overlay.as_ref().and_then(|overlay| match overlay {
+                    Overlay::Merge(session)
+                        if session.id.forge == forge && session.id.repository == repository =>
+                    {
+                        Some((
+                            session.id.clone(),
+                            session.selected_strategy(),
+                            session.loading,
+                        ))
+                    }
+                    _ => None,
+                });
+                if let Some((id, strategy, loading)) = pending_merge
+                    && let Some(request) = self.requests.iter().find(|request| request.id == id)
+                    && let Some(mut session) =
+                        MergeSession::build(request, &self.capabilities_for(&id))
+                {
+                    if let Some(index) = session
+                        .strategies
+                        .iter()
+                        .position(|candidate| *candidate == strategy)
+                    {
+                        session.strategy = index;
+                    }
+                    session.loading = loading;
+                    self.overlay = Some(Overlay::Merge(session));
+                }
+            }
+            Err(error) => {
+                let key = (forge.clone(), repository.clone());
+                self.repository_info_loading.remove(&key);
+                self.repository_info_failed.insert(key);
+                if matches!(self.overlay, Some(Overlay::Create(_))) {
+                    self.toast = Some(format!(
+                        "Repository settings unavailable: {}",
+                        error_summary(&error)
+                    ));
+                }
+                if let Some(Overlay::Merge(session)) = &mut self.overlay
+                    && session.id.forge == forge
+                    && session.id.repository == repository
+                {
+                    session.preflight_error = Some(format!(
+                        "Repository merge policy unavailable: {}",
+                        error_summary(&error)
+                    ));
+                }
+            }
+        }
+    }
+    pub fn apply_merge_preflight(
+        &mut self,
+        id: ChangeRequestId,
+        result: Result<ChangeRequest, forge::ForgeError>,
+    ) {
+        let Some(current) = self.overlay.as_ref().and_then(|overlay| match overlay {
+            Overlay::Merge(session) if session.id == id => Some(session.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        match result {
+            Ok(request) => {
+                let caps = self.capabilities_for(&id);
+                if let Some(mut refreshed) = MergeSession::build(&request, &caps) {
+                    if let Some(index) = refreshed
+                        .strategies
+                        .iter()
+                        .position(|strategy| *strategy == current.selected_strategy())
+                    {
+                        refreshed.strategy = index;
+                    }
+                    self.reconcile_request(request);
+                    self.overlay = Some(Overlay::Merge(refreshed));
+                } else {
+                    self.overlay = None;
+                    self.toast = Some(
+                        if self
+                            .repository_info_failed
+                            .contains(&(id.forge.clone(), id.repository.clone()))
+                        {
+                            "Repository merge policy could not be verified".into()
+                        } else {
+                            "This request is no longer open or the repository allows no merge strategy".into()
+                        },
+                    );
+                }
+            }
+            Err(error) => {
+                if let Some(Overlay::Merge(session)) = &mut self.overlay {
+                    session.loading = false;
+                    session.preflight_error = Some(error_summary(&error));
+                }
+            }
+        }
+    }
+    pub fn apply_git_branches(&mut self, token: OpId, branches: Vec<String>) {
+        let Some(Overlay::Create(session)) = &mut self.overlay else {
+            return;
+        };
+        if let Some(create::CreateEditor::Target(picker)) = &mut session.editor {
+            picker.apply_items(
+                token,
+                branches.into_iter().map(PickerItem::simple).collect(),
+            );
+        }
+    }
+    pub fn apply_picker(
+        &mut self,
+        token: OpId,
+        result: Result<Vec<PickerItem>, forge::ForgeError>,
+    ) {
+        let apply =
+            |picker: &mut PickerSession,
+             token,
+             result: Result<Vec<PickerItem>, forge::ForgeError>| match result {
+                Ok(items) => picker.apply_items(token, items),
+                Err(error) => picker.failed(token, error_summary(&error)),
+            };
+        match self.overlay.as_mut() {
+            Some(Overlay::Create(session)) => {
+                if let Some(
+                    create::CreateEditor::Target(picker)
+                    | create::CreateEditor::Reviewers(picker)
+                    | create::CreateEditor::Labels(picker)
+                    | create::CreateEditor::Assignees(picker)
+                    | create::CreateEditor::Milestone(picker),
+                ) = session.editor.as_mut()
+                {
+                    apply(picker, token, result)
+                }
+            }
+            Some(Overlay::Edit(session)) => {
+                if let Some(edit::EditField::Picker(picker)) = session.active.as_mut() {
+                    apply(picker, token, result);
+                }
+            }
+            _ => {}
+        }
+    }
+    pub fn apply_push(&mut self, op: OpId, branch: String, result: Result<(), PushError>) {
+        let Some(Overlay::Create(session)) = &mut self.overlay else {
+            return;
+        };
+        if session.push_op != Some(op) {
+            return;
+        }
+        session.apply_push(op, branch, result);
+    }
+    pub fn apply_create(
+        &mut self,
+        op: OpId,
+        result: Result<forge::CreateResult, forge::ForgeError>,
+    ) {
+        let metadata_warnings = result
+            .as_ref()
+            .ok()
+            .map(|created| created.metadata_warnings.clone())
+            .unwrap_or_default();
+        let (created, failure) = match &mut self.overlay {
+            Some(Overlay::Create(session)) => {
+                let created = session.apply_submit(op, result.map(|created| created.request));
+                let failure = session.failure_message();
+                (created, failure)
+            }
+            _ => return,
+        };
+        let Some(created) = created else {
+            if let Some(failure) = failure {
+                self.toast = Some(format!("Create failed: {failure}"));
+            }
+            return;
+        };
+        let id = created.id.clone();
+        self.reconcile_request(created.clone());
+        self.overlay = None;
+        self.view = View::ChangeRequestDetail(id.clone());
+        self.toast = Some(if metadata_warnings.is_empty() {
+            format!("Created {}", id.display(created.kind))
+        } else {
+            format!(
+                "Created {}; metadata needs attention: {}",
+                id.display(created.kind),
+                metadata_warnings.join("; ")
+            )
+        });
+        self.load_request(id);
+    }
+    fn reconcile_request(&mut self, request: ChangeRequest) {
+        if let Some(current) = self
+            .requests
+            .iter_mut()
+            .find(|current| current.id == request.id)
+        {
+            *current = request;
+        } else {
+            self.requests.push(request);
+        }
+    }
+    pub fn apply_request_write(
+        &mut self,
+        id: ChangeRequestId,
+        op: OpId,
+        action: LifecycleAction,
+        result: Result<ChangeRequest, forge::ForgeError>,
+    ) {
+        if self.in_flight.get(&(id.clone(), "update")) != Some(&op) {
+            return;
+        }
+        self.in_flight.remove(&(id.clone(), "update"));
+        match result {
+            Ok(updated) => {
+                if let Some(current) = self.requests.iter_mut().find(|request| request.id == id) {
+                    match action {
+                        LifecycleAction::Title => current.title = updated.title,
+                        LifecycleAction::Body => current.body = updated.body,
+                        LifecycleAction::Draft | LifecycleAction::Ready => {
+                            current.draft = updated.draft
+                        }
+                        LifecycleAction::Close | LifecycleAction::Reopen => {
+                            current.state = updated.state
+                        }
+                    }
+                    current.updated_at = updated.updated_at;
+                }
+                self.finish_edit_write(op, true);
+                self.toast = Some(
+                    match action {
+                        LifecycleAction::Title => "Title updated",
+                        LifecycleAction::Body => "Description updated",
+                        LifecycleAction::Draft => "Marked as draft",
+                        LifecycleAction::Ready => "Marked ready for review",
+                        LifecycleAction::Close => "Request closed",
+                        LifecycleAction::Reopen => "Request reopened",
+                    }
+                    .into(),
+                );
+                self.load_request(id);
+            }
+            Err(error) => {
+                self.finish_edit_write(op, false);
+                self.toast = Some(format!("Update failed: {}", error_summary(&error)));
+            }
+        }
+    }
+    fn finish_edit_write(&mut self, op: OpId, success: bool) {
+        if let Some(Overlay::Edit(session)) = &mut self.overlay
+            && session
+                .pending
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == op)
+        {
+            session.pending = None;
+            if success {
+                session.active = None;
+            }
+        }
+    }
+    pub fn apply_metadata_write(
+        &mut self,
+        id: ChangeRequestId,
+        op: OpId,
+        kind: MetaKind,
+        result: Result<edit::MetaPayload, forge::ForgeError>,
+    ) {
+        let key = match kind {
+            MetaKind::Labels => "labels",
+            MetaKind::Reviewers => "reviewers",
+            MetaKind::Assignees => "assignees",
+            MetaKind::Milestone => "milestone",
+        };
+        if self.in_flight.get(&(id.clone(), key)) != Some(&op) {
+            return;
+        }
+        self.in_flight.remove(&(id.clone(), key));
+        match result {
+            Ok(payload) => {
+                if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
+                    edit::apply_metadata_payload(request, &payload);
+                }
+                self.finish_edit_write(op, true);
+                self.toast = Some("Change request metadata updated".into());
+                self.load_request(id);
+            }
+            Err(error) => {
+                self.finish_edit_write(op, false);
+                self.toast = Some(format!("Metadata update failed: {}", error_summary(&error)));
+            }
+        }
+    }
+    pub fn apply_merge(
+        &mut self,
+        id: ChangeRequestId,
+        op: OpId,
+        result: Result<MergeOutcome, forge::ForgeError>,
+    ) {
+        if self.in_flight.get(&(id.clone(), "merge")) != Some(&op) {
+            return;
+        }
+        self.in_flight.remove(&(id.clone(), "merge"));
+        match result {
+            Ok(outcome) => {
+                if let Some(Overlay::Merge(session)) = &mut self.overlay {
+                    session.apply(op, Ok(outcome.clone()));
+                }
+                if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
+                    request.state = RequestState::Merged;
+                    request.merged_sha = outcome.sha.clone();
+                }
+                self.activity
+                    .entry(id.clone())
+                    .or_default()
+                    .push(outcome.message.unwrap_or_else(|| "Merged".into()));
+                let cleanup =
+                    self.requests
+                        .iter()
+                        .find(|request| request.id == id)
+                        .map(|request| {
+                            let remote = self.providers.get(&id.forge).is_some_and(|provider| {
+                                provider.capabilities().delete_source_branch
+                            });
+                            let same_repo = self.repo_context.repository.as_deref()
+                                == Some(id.repository.as_str());
+                            let local_root =
+                                same_repo.then(|| self.repo_context.root.clone()).flatten();
+                            let mut choices = vec![BranchCleanupChoice::KeepBranches];
+                            if remote {
+                                choices.push(BranchCleanupChoice::DeleteRemote);
+                            }
+                            if local_root.is_some() {
+                                choices.push(BranchCleanupChoice::DeleteLocal);
+                            }
+                            if remote && local_root.is_some() {
+                                choices.push(BranchCleanupChoice::DeleteBoth);
+                            }
+                            BranchCleanupSession {
+                                id: id.clone(),
+                                kind: request.kind,
+                                branch: request.source_branch.clone(),
+                                root: local_root,
+                                remote: self.repo_context.remote.clone(),
+                                choices,
+                                selected: 0,
+                                pending: false,
+                                button_hits: vec![],
+                            }
+                        });
+                self.toast = Some("Request merged".into());
+                self.load_request(id.clone());
+                if let Some(cleanup) = cleanup {
+                    self.overlay = Some(Overlay::BranchCleanup(cleanup));
+                } else {
+                    self.overlay = None;
+                }
+            }
+            Err(error) => {
+                let message = error_summary(&error);
+                if let Some(Overlay::Merge(session)) = &mut self.overlay {
+                    session.apply(op, Err(message.clone()));
+                }
+                self.toast = Some(format!("Merge failed: {message}"));
+            }
+        }
+    }
+    pub fn apply_auto_merge(
+        &mut self,
+        id: ChangeRequestId,
+        op: OpId,
+        enabled: bool,
+        result: Result<bool, forge::ForgeError>,
+    ) {
+        if self.in_flight.get(&(id.clone(), "auto-merge")) != Some(&op) {
+            return;
+        }
+        self.in_flight.remove(&(id.clone(), "auto-merge"));
+        match result {
+            Ok(value) => {
+                if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
+                    request.auto_merge = value;
+                }
+                self.toast = Some(
+                    if enabled {
+                        "Auto-merge enabled"
+                    } else {
+                        "Auto-merge disabled"
+                    }
+                    .into(),
+                );
+                self.load_request(id);
+            }
+            Err(error) => {
+                self.toast = Some(format!("Auto-merge failed: {}", error_summary(&error)))
+            }
+        }
+    }
+    pub fn apply_targeted_request(
+        &mut self,
+        id: ChangeRequestId,
+        result: Result<ChangeRequest, forge::ForgeError>,
+    ) {
+        match result {
+            Ok(request) => self.reconcile_request(request),
+            Err(error) => self.toast = Some(format!("Refresh failed: {}", error_summary(&error))),
+        }
+        if self.view == View::ChangeRequestDetail(id.clone()) {
+            self.load_pipelines(id);
+        }
+    }
+    pub fn apply_branch_cleanup(
+        &mut self,
+        id: ChangeRequestId,
+        message: String,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.activity.entry(id).or_default().push(message.clone());
+                self.toast = Some(message);
+            }
+            Err(error) => self.toast = Some(format!("Branch cleanup failed: {error}")),
+        }
+        if matches!(self.overlay, Some(Overlay::BranchCleanup(_))) {
+            self.overlay = None;
+        }
     }
     fn submit_comment(&mut self, body: String) {
         if body.trim().is_empty() {
@@ -955,36 +2598,247 @@ impl App {
             _ => self.can(|capabilities| capabilities.reviews),
         }
     }
-    fn palette_command_count(query: &str) -> usize {
-        PALETTE_COMMANDS
+    pub(crate) fn palette_commands(&self) -> Vec<&'static str> {
+        let mut commands = Vec::new();
+        if self.view == View::Dashboard && self.can_create_current_project() {
+            commands.push("Create pull request");
+        }
+        if let Some(request) = self.request_for_view() {
+            let caps = self.capabilities_for(&request.id);
+            let any_edit = caps.edit_title
+                || caps.edit_description
+                || caps.labels
+                || caps.request_reviewers
+                || caps.assignees
+                || caps.milestone
+                || caps.draft_transition
+                || (request.state == RequestState::Open && caps.close)
+                || (request.state != RequestState::Open && caps.reopen);
+            if self.view == View::ChangeRequestDetail(request.id.clone()) && any_edit {
+                commands.push("Edit");
+            }
+            if self.view == View::ChangeRequestDetail(request.id.clone()) {
+                if caps.edit_title {
+                    commands.push("Edit title");
+                }
+                if caps.edit_description {
+                    commands.push("Edit description");
+                }
+                if caps.labels {
+                    commands.push("Edit labels");
+                }
+                if caps.request_reviewers {
+                    commands.push("Edit reviewers");
+                }
+                if caps.assignees {
+                    commands.push("Edit assignees");
+                }
+                if caps.milestone {
+                    commands.push("Edit milestone");
+                }
+                if caps.draft_transition && !request.draft && request.state == RequestState::Open {
+                    commands.push("Mark as draft");
+                }
+                if caps.draft_transition && request.draft {
+                    commands.push("Mark ready for review");
+                }
+                if caps.close && request.state == RequestState::Open {
+                    commands.push("Close request");
+                }
+                if caps.reopen && request.state == RequestState::Closed {
+                    commands.push("Reopen request");
+                }
+                if MergeSession::build(request, &caps).is_some() {
+                    commands.push("Merge");
+                }
+                if caps.auto_merge && request.state == RequestState::Open {
+                    commands.push(if request.auto_merge {
+                        "Disable auto-merge"
+                    } else {
+                        "Enable auto-merge"
+                    });
+                }
+            }
+            if caps.comments {
+                commands.push("Add comment");
+            }
+            if caps.approve {
+                commands.push("Approve");
+            }
+            if caps.request_changes {
+                commands.push("Request changes");
+            }
+            if caps.request_reviewers {
+                commands.push("Request reviewer");
+            }
+            if request.web_url.is_some() {
+                commands.push("Open in browser");
+            }
+            if caps.ci_read {
+                commands.extend(["Open pipeline", "Refresh pipeline"]);
+            }
+            if caps.ci_logs {
+                commands.extend(["Open job logs", "Follow logs"]);
+            }
+            if caps.ci_retry_job {
+                commands.push("Retry failed job");
+            }
+            if caps.ci_retry_pipeline {
+                commands.push("Retry pipeline");
+            }
+            if caps.ci_cancel_job {
+                commands.push("Cancel job");
+            }
+            if caps.ci_cancel_pipeline {
+                commands.push("Cancel pipeline");
+            }
+        }
+        commands.push("Refresh");
+        commands
+    }
+    fn palette_command_count(&self, query: &str) -> usize {
+        self.palette_commands()
             .iter()
             .filter(|command| command.to_lowercase().contains(&query.to_lowercase()))
             .count()
             .saturating_sub(1)
     }
     fn run_palette(&mut self, query: &str, selected: usize) {
-        let command = PALETTE_COMMANDS
+        let command = self
+            .palette_commands()
             .iter()
-            .enumerate()
-            .filter(|(_, command)| command.to_lowercase().contains(&query.to_lowercase()))
+            .filter(|command| command.to_lowercase().contains(&query.to_lowercase()))
             .nth(selected)
-            .map(|(index, _)| index);
+            .copied();
         match command {
-            Some(0) => {
+            Some("Create pull request") => self.open_create(),
+            Some("Edit") => self.open_edit(),
+            Some("Edit title") => self.open_edit_action(EditAction::Title),
+            Some("Edit description") => self.open_edit_action(EditAction::Description),
+            Some("Edit labels") => self.open_edit_action(EditAction::Labels),
+            Some("Edit reviewers") => self.open_edit_action(EditAction::Reviewers),
+            Some("Edit assignees") => self.open_edit_action(EditAction::Assignees),
+            Some("Edit milestone") => self.open_edit_action(EditAction::Milestone),
+            Some("Mark as draft") => self.open_edit_action(EditAction::Draft),
+            Some("Mark ready for review") => self.open_edit_action(EditAction::Ready),
+            Some("Close request") => self.open_edit_action(EditAction::Close),
+            Some("Reopen request") => self.open_edit_action(EditAction::Reopen),
+            Some("Merge") => self.open_merge(),
+            Some("Enable auto-merge") => {
+                if let Some(id) = self.detail_request().map(|r| r.id.clone()) {
+                    self.start_auto_merge(id, true);
+                }
+            }
+            Some("Disable auto-merge") => {
+                if let Some(id) = self.detail_request().map(|r| r.id.clone()) {
+                    self.start_auto_merge(id, false);
+                }
+            }
+            Some("Add comment") => {
                 self.overlay = Some(Overlay::Composer {
                     body: String::new(),
                 })
             }
-            Some(1) => self.apply_review(ReviewState::Approved),
-            Some(2) => self.apply_review(ReviewState::ChangesRequested),
-            Some(3) => self.request_refresh(),
-            _ => self.toast = Some("Command unavailable for this forge".into()),
+            Some("Approve") => self.apply_review(ReviewState::Approved),
+            Some("Request changes") => self.apply_review(ReviewState::ChangesRequested),
+            Some("Refresh") => self.request_refresh(),
+            Some("Request reviewer") => self.open_edit_action(EditAction::Reviewers),
+            Some(_) => {
+                self.toast = Some("This command is not available in the current view".into())
+            }
+            None => {}
         }
     }
     pub fn set_regions(&mut self, regions: HitRegions) {
         self.regions = regions;
     }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        if let Some(overlay) = self.overlay.take() {
+            if !matches!(event.kind, MouseEventKind::Down(_)) {
+                self.overlay = Some(overlay);
+                return;
+            }
+            match overlay {
+                Overlay::Create(mut session) => {
+                    let close = session.handle_mouse(self, event.column, event.row);
+                    if self.overlay.is_none() && !close {
+                        self.overlay = Some(Overlay::Create(session));
+                    }
+                }
+                Overlay::Edit(mut session) => {
+                    session.handle_mouse(self, event.column, event.row);
+                    if self.overlay.is_none() {
+                        self.overlay = Some(Overlay::Edit(session));
+                    }
+                }
+                Overlay::Merge(mut session) => {
+                    let close = session.handle_mouse(self, event.column, event.row);
+                    if self.overlay.is_none() && !close {
+                        self.overlay = Some(Overlay::Merge(session));
+                    }
+                }
+                Overlay::Confirm(mut dialog) => {
+                    if matches!(event.kind, MouseEventKind::Down(_)) {
+                        for (rect, index) in dialog.button_hits.clone() {
+                            if rect.contains(ratatui::layout::Position {
+                                x: event.column,
+                                y: event.row,
+                            }) {
+                                dialog.selected = index;
+                                if index == 1 {
+                                    self.confirm(dialog.action.clone());
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    self.overlay = Some(Overlay::Confirm(dialog));
+                }
+                Overlay::BranchCleanup(mut session) => {
+                    if matches!(event.kind, MouseEventKind::Down(_)) {
+                        for (rect, index) in session.button_hits.clone() {
+                            if rect.contains(ratatui::layout::Position {
+                                x: event.column,
+                                y: event.row,
+                            }) {
+                                session.selected = index;
+                                if index > 0 && !session.pending {
+                                    self.start_branch_cleanup(session);
+                                } else if index == 0 {
+                                    return;
+                                } else {
+                                    self.overlay = Some(Overlay::BranchCleanup(session));
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    self.overlay = Some(Overlay::BranchCleanup(session));
+                }
+                Overlay::Palette {
+                    query,
+                    mut selected,
+                } => {
+                    if matches!(event.kind, MouseEventKind::Down(_)) {
+                        if let Some((_, index)) = self.palette_hits.iter().find(|(rect, _)| {
+                            rect.contains(ratatui::layout::Position {
+                                x: event.column,
+                                y: event.row,
+                            })
+                        }) {
+                            selected = *index;
+                            self.run_palette(&query, selected);
+                        } else {
+                            self.overlay = Some(Overlay::Palette { query, selected });
+                        }
+                    } else {
+                        self.overlay = Some(Overlay::Palette { query, selected });
+                    }
+                }
+                other => self.overlay = Some(other),
+            }
+            return;
+        }
         let point = |rect: Rect| {
             event.column >= rect.x
                 && event.column < rect.x + rect.width
@@ -1121,7 +2975,20 @@ impl App {
         });
     }
     pub fn apply_refresh(&mut self, result: RefreshResult) {
+        let opened = match &self.view {
+            View::ChangeRequestDetail(id) => self
+                .requests
+                .iter()
+                .find(|request| request.id == *id)
+                .cloned(),
+            _ => None,
+        };
         self.requests = result.requests;
+        if let Some(opened) = opened
+            && !self.requests.iter().any(|request| request.id == opened.id)
+        {
+            self.requests.push(opened);
+        }
         self.health = result.health;
         self.stale = result.from_cache;
         self.last_refresh = Some(Instant::now());
@@ -1229,6 +3096,52 @@ impl App {
             }
             Err(error) => self.toast = Some(format!("CI action failed: {error}")),
         }
+    }
+}
+
+pub(crate) fn error_summary(error: &forge::ForgeError) -> String {
+    match error {
+        forge::ForgeError::AuthenticationRequired(_) => "authentication required".into(),
+        forge::ForgeError::Unavailable(_) => "network or provider unavailable".into(),
+        forge::ForgeError::PermissionDenied => "permission denied".into(),
+        forge::ForgeError::RateLimited { .. } => "rate limited".into(),
+        forge::ForgeError::NotFound => "request or repository not found".into(),
+        forge::ForgeError::Validation(message) => format!("validation failed: {message}"),
+        forge::ForgeError::Conflict => "conflict; refresh and try again".into(),
+        forge::ForgeError::Unsupported => "unsupported by this provider".into(),
+        forge::ForgeError::JobNotRetryable => "job cannot be retried".into(),
+        forge::ForgeError::PipelineNotCancelable => "pipeline cannot be cancelled".into(),
+        forge::ForgeError::LogsUnavailable => "logs are unavailable".into(),
+    }
+}
+
+fn summarize_ci(pipelines: &[Pipeline]) -> CiState {
+    if pipelines.iter().any(|pipeline| {
+        matches!(
+            pipeline.status,
+            PipelineStatus::Failed | PipelineStatus::TimedOut
+        )
+    }) {
+        CiState::Failed
+    } else if pipelines
+        .iter()
+        .any(|pipeline| pipeline.status == PipelineStatus::Running)
+    {
+        CiState::Running
+    } else if pipelines.iter().any(|pipeline| {
+        matches!(
+            pipeline.status,
+            PipelineStatus::Queued | PipelineStatus::Pending | PipelineStatus::Waiting
+        )
+    }) {
+        CiState::Pending
+    } else if pipelines
+        .iter()
+        .any(|pipeline| pipeline.status == PipelineStatus::Success)
+    {
+        CiState::Passed
+    } else {
+        CiState::None
     }
 }
 
@@ -1548,8 +3461,7 @@ mod tests {
                 },
             }),
         );
-        app.selected = 2;
-        app.handle_key(KeyCode::Enter);
+        app.view = View::ChangeRequestDetail(id);
         app.overlay = Some(Overlay::ReviewMenu { selected: 0 });
 
         app.handle_key(KeyCode::Enter);
@@ -1596,6 +3508,293 @@ mod tests {
         app.handle_key(KeyCode::Enter);
 
         assert!(!matches!(app.overlay, Some(Overlay::Composer { .. })));
+    }
+
+    #[tokio::test]
+    async fn project_n_and_palette_open_the_same_create_flow_when_empty() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.requests.clear();
+
+        app.handle_key(KeyCode::Char('n'));
+        let (first_repository, first_kind, first_stage, first_push_state) =
+            match app.overlay.as_ref() {
+                Some(Overlay::Create(session)) => (
+                    session.repository.clone(),
+                    session.kind,
+                    session.stage.clone(),
+                    session.push_state.clone(),
+                ),
+                other => panic!("expected create workflow from n, got {other:?}"),
+            };
+        assert_eq!(first_repository, "jack/quickdrop");
+        assert_eq!(first_stage, create::CreateStage::Preflight);
+        assert_eq!(first_push_state, create::PushState::WaitingForPush);
+
+        app.overlay = None;
+        app.handle_key(KeyCode::Char(':'));
+        for key in "create pull request".chars() {
+            app.handle_key(KeyCode::Char(key));
+        }
+        app.handle_key(KeyCode::Enter);
+
+        let second = match app.overlay.as_ref() {
+            Some(Overlay::Create(session)) => session,
+            other => panic!("expected create workflow from palette, got {other:?}"),
+        };
+        assert_eq!(second.repository, first_repository);
+        assert_eq!(second.kind, first_kind);
+        assert_eq!(second.stage, first_stage);
+        assert_eq!(second.push_state, first_push_state);
+    }
+
+    #[tokio::test]
+    async fn demo_create_push_and_success_reach_the_new_detail_through_app_events() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.requests.clear();
+        app.handle_key(KeyCode::Char('n'));
+        app.handle_key(KeyCode::Right);
+        app.handle_key(KeyCode::Enter);
+
+        let AppEvent::PushCompleted { op, branch, result } = receiver.recv().await.unwrap() else {
+            panic!("expected async push completion");
+        };
+        app.apply_push(op, branch, result);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Create(ref session)) if session.stage == create::CreateStage::Fields
+        ));
+
+        app.handle_key(KeyCode::Down);
+        app.handle_key(KeyCode::Enter);
+        for _ in 0.."New reader".chars().count() {
+            app.handle_key(KeyCode::Backspace);
+        }
+        for character in "New demo request".chars() {
+            app.handle_key(KeyCode::Char(character));
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        app.handle_key(KeyCode::Right);
+        app.handle_key(KeyCode::Enter);
+
+        let AppEvent::CreateCompleted { op, result } = receiver.recv().await.unwrap() else {
+            panic!("expected async create completion");
+        };
+        app.apply_create(op, result);
+        let View::ChangeRequestDetail(id) = app.view.clone() else {
+            panic!("successful creation must open the new detail view");
+        };
+        let created = app
+            .requests
+            .iter()
+            .find(|request| request.id == id)
+            .expect("created request is reconciled immediately");
+        assert_eq!(created.title, "New demo request");
+        assert_eq!(id.number, 1);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.toast.as_deref(), Some("Created #1"));
+    }
+
+    #[tokio::test]
+    async fn demo_lifecycle_writes_reconcile_draft_ready_close_and_reopen() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.requests[0].id.clone();
+        app.view = View::ChangeRequestDetail(id.clone());
+        for (action, patch, expected_state, expected_draft) in [
+            (
+                LifecycleAction::Draft,
+                forge::RequestPatch {
+                    draft: Some(true),
+                    ..forge::RequestPatch::default()
+                },
+                RequestState::Open,
+                true,
+            ),
+            (
+                LifecycleAction::Ready,
+                forge::RequestPatch {
+                    draft: Some(false),
+                    ..forge::RequestPatch::default()
+                },
+                RequestState::Open,
+                false,
+            ),
+            (
+                LifecycleAction::Close,
+                forge::RequestPatch {
+                    state: Some(RequestState::Closed),
+                    ..forge::RequestPatch::default()
+                },
+                RequestState::Closed,
+                false,
+            ),
+            (
+                LifecycleAction::Reopen,
+                forge::RequestPatch {
+                    state: Some(RequestState::Open),
+                    ..forge::RequestPatch::default()
+                },
+                RequestState::Open,
+                false,
+            ),
+        ] {
+            app.start_update(id.clone(), patch, action);
+            let AppEvent::RequestWriteCompleted {
+                id: event_id,
+                op,
+                action: event_action,
+                result,
+            } = receiver.recv().await.unwrap()
+            else {
+                panic!("expected lifecycle write completion");
+            };
+            assert_eq!(event_action, action);
+            app.apply_request_write(event_id, op, event_action, result);
+            let request = app
+                .requests
+                .iter()
+                .find(|request| request.id == id)
+                .unwrap();
+            assert_eq!(request.state, expected_state);
+            assert_eq!(request.draft, expected_draft);
+        }
+    }
+
+    #[tokio::test]
+    async fn demo_merge_success_updates_detail_and_adds_merge_activity() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.requests[0].id.clone();
+        app.view = View::ChangeRequestDetail(id.clone());
+        app.handle_key(KeyCode::Char('M'));
+        app.handle_key(KeyCode::Right);
+        app.handle_key(KeyCode::Enter);
+        assert!(
+            matches!(app.overlay, Some(Overlay::Merge(ref session)) if session.stage == crate::merge::MergeStage::Confirm),
+            "unexpected merge overlay state: {:?}",
+            app.overlay
+        );
+        app.handle_key(KeyCode::Right);
+        app.handle_key(KeyCode::Enter);
+
+        let AppEvent::MergeCompleted {
+            id: event_id,
+            op,
+            result,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("expected async merge completion");
+        };
+        app.apply_merge(event_id, op, result);
+        let request = app
+            .requests
+            .iter()
+            .find(|request| request.id == id)
+            .unwrap();
+        assert_eq!(request.state, RequestState::Merged);
+        assert!(request.merged_sha.is_some());
+        assert_eq!(app.activity.get(&id).unwrap().len(), 1);
+        assert!(
+            matches!(app.overlay, Some(Overlay::BranchCleanup(ref session)) if session.selected == 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_overlay_consumes_keys_and_mouse_scroll_without_touching_detail() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.requests[0].id.clone();
+        app.view = View::ChangeRequestDetail(id.clone());
+        let mut session = MergeSession::build(
+            app.requests
+                .iter()
+                .find(|request| request.id == id)
+                .unwrap(),
+            &app.capabilities_for(&id),
+        )
+        .unwrap();
+        session.button_hits.push((Rect::new(10, 10, 10, 1), 1));
+        app.overlay = Some(Overlay::Merge(session));
+
+        app.handle_key(KeyCode::Char('e'));
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 11,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.view, View::ChangeRequestDetail(id));
+        assert!(
+            matches!(app.overlay, Some(Overlay::Merge(ref session)) if session.stage == crate::merge::MergeStage::Preflight && !session.write.is_pending())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_overlay_consumes_detail_shortcuts_and_escape_closes_only_the_overlay() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        let id = app.requests[0].id.clone();
+        app.view = View::ChangeRequestDetail(id.clone());
+        app.open_create();
+
+        app.handle_key(KeyCode::Char('M'));
+        assert!(matches!(app.overlay, Some(Overlay::Create(_))));
+        app.handle_key(KeyCode::Esc);
+
+        assert!(app.overlay.is_none());
+        assert_eq!(app.view, View::ChangeRequestDetail(id));
+    }
+
+    #[tokio::test]
+    async fn merge_palette_waits_for_repository_policy_and_hides_disabled_actions() {
+        let (sender, _) = mpsc::unbounded_channel();
+        let mut app = App::new(Config::default(), true, None, sender)
+            .await
+            .unwrap();
+        app.demo = false;
+        let id = app.requests[0].id.clone();
+        app.view = View::ChangeRequestDetail(id.clone());
+        app.providers.insert(
+            id.forge.clone(),
+            Arc::new(edit::RecordingProvider::default()),
+        );
+
+        assert!(!app.palette_commands().contains(&"Merge"));
+        assert!(!app.palette_commands().contains(&"Enable auto-merge"));
+        app.apply_repository_info(
+            id.forge.clone(),
+            id.repository.clone(),
+            Ok(forge::RepositoryInfo {
+                allow_merge_commit: Some(false),
+                allow_squash_merge: Some(true),
+                allow_rebase_merge: Some(false),
+                allow_auto_merge: Some(false),
+                ..forge::RepositoryInfo::default()
+            }),
+        );
+
+        assert!(app.palette_commands().contains(&"Merge"));
+        assert!(!app.palette_commands().contains(&"Enable auto-merge"));
+        app.open_merge();
+        let Some(Overlay::Merge(session)) = app.overlay.clone() else {
+            panic!("repository policy should leave the supported squash strategy available");
+        };
+        assert_eq!(session.strategies, vec![MergeStrategy::Squash]);
     }
 
     #[tokio::test]

@@ -1,12 +1,12 @@
 use crate::{
     config::ProjectConfig,
     forge::{
-        ForgeCapabilities, ForgeError, ForgeProvider, MergeOutcome, MergeStrategy, NewChangeRequest,
-        RepositoryInfo, RequestPatch, ReviewAction, auth, normalized_request,
+        CreateResult, ForgeCapabilities, ForgeError, ForgeProvider, MergeOutcome, MergeStrategy,
+        NewChangeRequest, RepositoryInfo, RequestPatch, ReviewAction, auth, normalized_request,
     },
     model::{
-        ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Job, JobId, Label, MergeQueue,
-        Person, Pipeline, PipelineId, PipelineStatus, RequestState, ReviewState, Reviewer,
+        ChangeRequest, ChangeRequestId, ChangeRequestKind, Comment, Job, JobId, Label, Person,
+        Pipeline, PipelineId, PipelineStatus, RequestState, Reviewer,
     },
 };
 use async_trait::async_trait;
@@ -55,7 +55,44 @@ impl GitHubProvider {
             format!("https://{}/api/v3/{path}", self.host)
         }
     }
-    async fn get_pull(&self, token: &str, repository: &str, number: u64) -> Result<Row, ForgeError> {
+    fn graphql_api(&self) -> String {
+        if self.host == "github.com" {
+            "https://api.github.com/graphql".into()
+        } else {
+            format!("https://{}/api/graphql", self.host)
+        }
+    }
+    async fn review_decision(&self, id: &ChangeRequestId) -> Option<bool> {
+        let token = self.credential().await.ok()?;
+        let (owner, name) = id.repository.split_once('/')?;
+        let response = reqwest::Client::new()
+            .post(self.graphql_api())
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", "prtop")
+            .json(&serde_json::json!({
+                "query": "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewDecision } } }",
+                "variables": { "owner": owner, "name": name, "number": id.number },
+            }))
+            .send()
+            .await
+            .ok()?;
+        let response = ensure(response).await.ok()?;
+        let payload: serde_json::Value = response.json().await.ok()?;
+        if payload.get("errors").is_some() {
+            return None;
+        }
+        approval_satisfied(
+            payload
+                .pointer("/data/repository/pullRequest/reviewDecision")
+                .and_then(serde_json::Value::as_str),
+        )
+    }
+    async fn get_pull(
+        &self,
+        token: &str,
+        repository: &str,
+        number: u64,
+    ) -> Result<Row, ForgeError> {
         let response = reqwest::Client::new()
             .get(self.api(&format!("repos/{repository}/pulls/{number}")))
             .header("Authorization", format!("Bearer {token}"))
@@ -75,10 +112,7 @@ impl GitHubProvider {
         body: serde_json::Value,
     ) -> Result<Row, ForgeError> {
         let response = reqwest::Client::new()
-            .patch(self.api(&format!(
-                "repos/{}/pulls/{}",
-                id.repository, id.number
-            )))
+            .patch(self.api(&format!("repos/{}/pulls/{}", id.repository, id.number)))
             .header("Authorization", format!("Bearer {token}"))
             .header("User-Agent", "prtop")
             .json(&body)
@@ -95,15 +129,8 @@ impl GitHubProvider {
         let row = self.get_pull(token, &id.repository, id.number).await?;
         Ok(normalize(&self.name, &id.repository, row))
     }
-    async fn find_milestone(
-        &self,
-        token: String,
-        repository: &str,
-        title: &str,
-    ) -> Option<u64> {
-        self.milestone_number(&token, repository, title)
-            .await
-            .ok()
+    async fn find_milestone(&self, token: String, repository: &str, title: &str) -> Option<u64> {
+        self.milestone_number(&token, repository, title).await.ok()
     }
     async fn milestone_number(
         &self,
@@ -148,13 +175,14 @@ impl ForgeProvider for GitHubProvider {
             ci_retry_pipeline: true,
             ci_cancel_pipeline: true,
             create_change_request: true,
+            create_draft: true,
             edit_title: true,
             edit_description: true,
             labels: true,
             assignees: true,
             milestone: true,
-            // The REST patch endpoint has no draft parameter; GraphQL-only.
-            draft_transition: false,
+            // Draft transitions are handled through the supported GraphQL mutations.
+            draft_transition: true,
             close: true,
             reopen: true,
             merge: true,
@@ -199,7 +227,32 @@ impl ForgeProvider for GitHubProvider {
     }
     async fn get_change_request(&self, id: &ChangeRequestId) -> Result<ChangeRequest, ForgeError> {
         let token = self.credential().await?;
-        self.fetch_full(&token, id).await
+        let mut request = self.fetch_full(&token, id).await?;
+        crate::forge::apply_review_states(&mut request, self.list_reviews(id).await?);
+        Ok(request)
+    }
+    async fn get_change_request_for_merge(
+        &self,
+        id: &ChangeRequestId,
+    ) -> Result<ChangeRequest, ForgeError> {
+        let mut request = self.get_change_request(id).await?;
+        request.approvals_satisfied = self.review_decision(id).await;
+        Ok(request)
+    }
+    async fn list_reviews(&self, id: &ChangeRequestId) -> Result<Vec<Reviewer>, ForgeError> {
+        let token = self.credential().await?;
+        let response = reqwest::Client::new()
+            .get(self.api(&format!(
+                "repos/{}/pulls/{}/reviews?per_page=100",
+                id.repository, id.number
+            )))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", "prtop")
+            .send()
+            .await
+            .map_err(network)?;
+        let rows: Vec<ReviewRow> = ensure(response).await?.json().await.map_err(network)?;
+        Ok(latest_reviews(rows))
     }
     async fn get_repository(&self, repository: &str) -> Result<RepositoryInfo, ForgeError> {
         let token = self.credential().await?;
@@ -211,15 +264,13 @@ impl ForgeProvider for GitHubProvider {
             .await
             .map_err(network)?;
         let row: RepositoryRow = ensure(response).await?.json().await.map_err(network)?;
-        Ok(RepositoryInfo {
-            default_branch: row.default_branch,
-        })
+        Ok(repository_info(row))
     }
     async fn create_change_request(
         &self,
         input: &NewChangeRequest,
         repository: &str,
-    ) -> Result<ChangeRequest, ForgeError> {
+    ) -> Result<CreateResult, ForgeError> {
         let token = self.credential().await?;
         let response = reqwest::Client::new()
             .post(self.api(&format!("repos/{repository}/pulls")))
@@ -236,11 +287,10 @@ impl ForgeProvider for GitHubProvider {
             .await
             .map_err(network)?;
         let row: Row = ensure(response).await?.json().await.map_err(network)?;
-        let mut created = normalize(&self.name, repository, row);
-        // Metadata attached after creation is best-effort: the PR exists either way and the
-        // targeted refresh reconciles the provider truth.
+        let created = normalize(&self.name, repository, row);
+        let mut metadata_warnings = Vec::new();
         if !input.reviewers.is_empty() {
-            let _ = reqwest::Client::new()
+            let result = reqwest::Client::new()
                 .post(self.api(&format!(
                     "repos/{}/pulls/{}/requested_reviewers",
                     repository, created.id.number
@@ -250,6 +300,13 @@ impl ForgeProvider for GitHubProvider {
                 .json(&serde_json::json!({"reviewers": input.reviewers}))
                 .send()
                 .await;
+            let result = match result {
+                Ok(response) => ensure(response).await.map(|_| ()),
+                Err(error) => Err(network(error)),
+            };
+            if result.is_err() {
+                metadata_warnings.push("reviewers were not applied; edit request metadata".into());
+            }
         }
         if !input.labels.is_empty() || !input.assignees.is_empty() || input.milestone.is_some() {
             let mut issue = serde_json::Map::new();
@@ -260,14 +317,16 @@ impl ForgeProvider for GitHubProvider {
                 issue.insert("assignees".into(), serde_json::json!(input.assignees));
             }
             if let Some(milestone) = &input.milestone {
-                if let Some(number) = self
-                    .find_milestone(token.clone(), repository, milestone)
-                    .await
-                {                    issue.insert("milestone".into(), serde_json::json!(number));
+                match self.milestone_number(&token, repository, milestone).await {
+                    Ok(number) => {
+                        issue.insert("milestone".into(), serde_json::json!(number));
+                    }
+                    Err(_) => metadata_warnings
+                        .push("milestone was not applied; edit request metadata".into()),
                 }
             }
             if !issue.is_empty() {
-                let _ = reqwest::Client::new()
+                let result = reqwest::Client::new()
                     .patch(self.api(&format!(
                         "repos/{}/issues/{}",
                         repository, created.id.number
@@ -276,10 +335,28 @@ impl ForgeProvider for GitHubProvider {
                     .header("User-Agent", "prtop")
                     .json(&serde_json::json!(issue))
                     .send()
-                    .await;
+                    .await
+                    .map_err(network);
+                match result {
+                    Ok(response) => {
+                        if ensure(response).await.is_err() {
+                            metadata_warnings.push(
+                                "labels, assignees or milestone were not applied; edit request metadata"
+                                    .into(),
+                            );
+                        }
+                    }
+                    Err(_) => metadata_warnings.push(
+                        "labels, assignees or milestone were not applied; edit request metadata"
+                            .into(),
+                    ),
+                }
             }
         }
-        Ok(created)
+        Ok(CreateResult {
+            request: created,
+            metadata_warnings,
+        })
     }
     async fn update_change_request(
         &self,
@@ -304,13 +381,38 @@ impl ForgeProvider for GitHubProvider {
                 }),
             );
         }
-        if patch.draft.is_some() {
-            return Err(ForgeError::Validation(
-                "GitHub REST does not support draft transitions".into(),
-            ));
-        }
         if !body.is_empty() {
             self.patch_pull(&token, id, body.into()).await?;
+        }
+        if let Some(draft) = patch.draft {
+            let pull = self.get_pull(&token, &id.repository, id.number).await?;
+            let node_id = pull.node_id.ok_or_else(|| {
+                ForgeError::Validation("GitHub did not return the pull request node id".into())
+            })?;
+            let query = if draft {
+                "mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { id } } }"
+            } else {
+                "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id } } }"
+            };
+            let response = reqwest::Client::new()
+                .post(self.graphql_api())
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", "prtop")
+                .json(&serde_json::json!({
+                    "query": query,
+                    "variables": { "id": node_id },
+                }))
+                .send()
+                .await
+                .map_err(network)?;
+            let response: GraphQlResponse =
+                ensure(response).await?.json().await.map_err(network)?;
+            if let Some(error) = response.errors.and_then(|errors| errors.into_iter().next()) {
+                return Err(ForgeError::Validation(format!(
+                    "GitHub draft update failed: {}",
+                    error.message
+                )));
+            }
         }
         self.fetch_full(&token, id).await
     }
@@ -365,9 +467,7 @@ impl ForgeProvider for GitHubProvider {
     ) -> Result<Vec<Person>, ForgeError> {
         let token = self.credential().await?;
         let response = reqwest::Client::new()
-            .get(self.api(&format!(
-                "repos/{repository}/assignees?per_page=100"
-            )))
+            .get(self.api(&format!("repos/{repository}/assignees?per_page=100")))
             .header("Authorization", format!("Bearer {token}"))
             .header("User-Agent", "prtop")
             .send()
@@ -392,10 +492,7 @@ impl ForgeProvider for GitHubProvider {
     ) -> Result<Vec<Person>, ForgeError> {
         let token = self.credential().await?;
         let current: IssueDetail = reqwest::Client::new()
-            .get(self.api(&format!(
-                "repos/{}/issues/{}",
-                id.repository, id.number
-            )))
+            .get(self.api(&format!("repos/{}/issues/{}", id.repository, id.number)))
             .header("Authorization", format!("Bearer {token}"))
             .header("User-Agent", "prtop")
             .send()
@@ -408,7 +505,7 @@ impl ForgeProvider for GitHubProvider {
         let missing: Vec<&String> = wanted
             .iter()
             .filter(|login| !current.assignees.iter().any(|user| &user.login == **login))
-            .map(|login| *login)
+            .copied()
             .collect();
         let removed: Vec<&String> = current
             .assignees
@@ -445,10 +542,7 @@ impl ForgeProvider for GitHubProvider {
             ensure(response).await?;
         }
         let refreshed: IssueDetail = reqwest::Client::new()
-            .get(self.api(&format!(
-                "repos/{}/issues/{}",
-                id.repository, id.number
-            )))
+            .get(self.api(&format!("repos/{}/issues/{}", id.repository, id.number)))
             .header("Authorization", format!("Bearer {token}"))
             .header("User-Agent", "prtop")
             .send()
@@ -495,13 +589,13 @@ impl ForgeProvider for GitHubProvider {
         let token = self.credential().await?;
         let number = match milestone {
             None => None,
-            Some(name) => self.find_milestone(token.clone(), &id.repository, name).await,
+            Some(name) => {
+                self.find_milestone(token.clone(), &id.repository, name)
+                    .await
+            }
         };
         let response = reqwest::Client::new()
-            .patch(self.api(&format!(
-                "repos/{}/issues/{}",
-                id.repository, id.number
-            )))
+            .patch(self.api(&format!("repos/{}/issues/{}", id.repository, id.number)))
             .header("Authorization", format!("Bearer {token}"))
             .header("User-Agent", "prtop")
             .json(&serde_json::json!({"milestone": number}))
@@ -518,33 +612,39 @@ impl ForgeProvider for GitHubProvider {
         strategy: MergeStrategy,
     ) -> Result<bool, ForgeError> {
         let token = self.credential().await?;
-        let response = reqwest::Client::new();
-        let result = if enable {
-            response
-                .put(self.api(&format!(
-                    "repos/{}/pulls/{}/auto-merge",
-                    id.repository, id.number
-                )))
-                .header("Authorization", format!("Bearer {token}"))
-                .header("User-Agent", "prtop")
-                .json(&serde_json::json!({
-                    "merge_method": strategy.api_name(),
-                }))
-                .send()
-                .await
+        let pull = self.get_pull(&token, &id.repository, id.number).await?;
+        let node_id = pull.node_id.ok_or_else(|| {
+            ForgeError::Validation("GitHub did not return the pull request node id".into())
+        })?;
+        let (query, variables) = if enable {
+            (
+                "mutation($id: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { pullRequest { id } } }",
+                serde_json::json!({
+                    "id": node_id,
+                    "method": strategy.api_name().to_uppercase(),
+                }),
+            )
         } else {
-            response
-                .delete(self.api(&format!(
-                    "repos/{}/pulls/{}/auto-merge",
-                    id.repository, id.number
-                )))
-                .header("Authorization", format!("Bearer {token}"))
-                .header("User-Agent", "prtop")
-                .send()
-                .await
+            (
+                "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { pullRequest { id } } }",
+                serde_json::json!({ "id": node_id }),
+            )
         };
-        let response = result.map_err(network)?;
-        ensure(response).await?;
+        let response = reqwest::Client::new()
+            .post(self.graphql_api())
+            .header("Authorization", format!("Bearer {token}"))
+            .header("User-Agent", "prtop")
+            .json(&serde_json::json!({ "query": query, "variables": variables }))
+            .send()
+            .await
+            .map_err(network)?;
+        let response: GraphQlResponse = ensure(response).await?.json().await.map_err(network)?;
+        if let Some(error) = response.errors.and_then(|errors| errors.into_iter().next()) {
+            return Err(ForgeError::Validation(format!(
+                "GitHub auto-merge failed: {}",
+                error.message
+            )));
+        }
         Ok(enable)
     }
     async fn merge_change_request(
@@ -833,6 +933,13 @@ impl ForgeProvider for GitHubProvider {
 fn network(error: reqwest::Error) -> ForgeError {
     ForgeError::Unavailable(error.to_string())
 }
+fn approval_satisfied(decision: Option<&str>) -> Option<bool> {
+    match decision {
+        Some("APPROVED") => Some(true),
+        Some("REVIEW_REQUIRED" | "CHANGES_REQUESTED") => Some(false),
+        _ => None,
+    }
+}
 async fn ensure(response: reqwest::Response) -> Result<reqwest::Response, ForgeError> {
     match response.status().as_u16() {
         200..=299 => Ok(response),
@@ -851,6 +958,8 @@ async fn ensure(response: reqwest::Response) -> Result<reqwest::Response, ForgeE
 }
 #[derive(Deserialize)]
 struct Row {
+    #[serde(default)]
+    node_id: Option<String>,
     number: u64,
     title: String,
     #[serde(default)]
@@ -888,6 +997,11 @@ struct User {
     login: String,
     #[serde(default)]
     id: u64,
+}
+#[derive(Deserialize)]
+struct ReviewRow {
+    user: User,
+    state: String,
 }
 #[derive(Deserialize)]
 struct Branch {
@@ -978,6 +1092,23 @@ struct MilestoneRow {
 struct RepositoryRow {
     #[serde(default)]
     default_branch: Option<String>,
+    #[serde(default)]
+    allow_merge_commit: Option<bool>,
+    #[serde(default)]
+    allow_squash_merge: Option<bool>,
+    #[serde(default)]
+    allow_rebase_merge: Option<bool>,
+    #[serde(default)]
+    allow_auto_merge: Option<bool>,
+}
+#[derive(Deserialize)]
+struct GraphQlResponse {
+    #[serde(default)]
+    errors: Option<Vec<GraphQlError>>,
+}
+#[derive(Deserialize)]
+struct GraphQlError {
+    message: String,
 }
 #[derive(Deserialize)]
 struct IssueDetail {
@@ -1014,6 +1145,47 @@ fn labels(rows: &[LabelRow]) -> Vec<Label> {
         })
         .collect()
 }
+fn latest_reviews(rows: Vec<ReviewRow>) -> Vec<Reviewer> {
+    let mut latest: Vec<Reviewer> = Vec::new();
+    for row in rows {
+        if matches!(row.state.as_str(), "COMMENTED" | "PENDING") {
+            continue;
+        }
+        let state = match row.state.as_str() {
+            "APPROVED" => crate::model::ReviewState::Approved,
+            "CHANGES_REQUESTED" => crate::model::ReviewState::ChangesRequested,
+            "DISMISSED" => crate::model::ReviewState::None,
+            _ => crate::model::ReviewState::None,
+        };
+        let reviewer = Reviewer {
+            person: Person {
+                login: row.user.login,
+                name: None,
+                id: Some(row.user.id),
+            },
+            state,
+        };
+        if let Some(current) = latest
+            .iter_mut()
+            .find(|current| current.person.login == reviewer.person.login)
+        {
+            *current = reviewer;
+        } else {
+            latest.push(reviewer);
+        }
+    }
+    latest
+}
+fn repository_info(row: RepositoryRow) -> RepositoryInfo {
+    RepositoryInfo {
+        default_branch: row.default_branch,
+        allow_merge_commit: row.allow_merge_commit,
+        allow_squash_merge: row.allow_squash_merge,
+        allow_rebase_merge: row.allow_rebase_merge,
+        allow_auto_merge: row.allow_auto_merge,
+        ..RepositoryInfo::default()
+    }
+}
 fn mergeability(row: &Row) -> crate::model::Mergeability {
     match row.mergeable {
         Some(true) => crate::model::Mergeability::Mergeable,
@@ -1047,7 +1219,22 @@ fn normalize(forge: &str, repo: &str, row: Row) -> ChangeRequest {
             id: Some(user.id),
         })
         .collect();
-    request.milestone = row.milestone.as_ref().map(|milestone| milestone.title.clone());
+    request.milestone = row
+        .milestone
+        .as_ref()
+        .map(|milestone| milestone.title.clone());
+    request.reviewers = row
+        .requested_reviewers
+        .iter()
+        .map(|user| Reviewer {
+            person: Person {
+                login: user.login.clone(),
+                name: None,
+                id: Some(user.id),
+            },
+            state: crate::model::ReviewState::Requested,
+        })
+        .collect();
     request.web_url = row.html_url.clone();
     request.auto_merge = row.auto_merge.unwrap_or(false);
     request.mergeable_state = row.mergeable_state.clone();
@@ -1162,7 +1349,10 @@ mod tests {
         assert_eq!(item.labels[0].name, "bug");
         assert_eq!(item.assignees[0].login, "alice");
         assert_eq!(item.milestone.as_deref(), Some("v1.2"));
-        assert_eq!(item.web_url.as_deref(), Some("https://github.com/jack/quickdrop/pull/184"));
+        assert_eq!(
+            item.web_url.as_deref(),
+            Some("https://github.com/jack/prtop/pull/184")
+        );
         assert_eq!(item.mergeable_state.as_deref(), Some("clean"));
         assert_eq!(item.head_sha.as_deref(), Some("4e2f73a"));
         assert_eq!(item.reviewers.len(), 1);
@@ -1194,6 +1384,42 @@ mod tests {
     }
 
     #[test]
+    fn maps_review_decisions_without_treating_missing_data_as_approval() {
+        assert_eq!(approval_satisfied(Some("APPROVED")), Some(true));
+        assert_eq!(approval_satisfied(Some("REVIEW_REQUIRED")), Some(false));
+        assert_eq!(approval_satisfied(Some("CHANGES_REQUESTED")), Some(false));
+        assert_eq!(approval_satisfied(None), None);
+        assert_eq!(approval_satisfied(Some("DISMISSED")), None);
+    }
+
+    #[test]
+    fn non_decisive_reviews_do_not_replace_the_latest_decision() {
+        let rows: Vec<ReviewRow> = serde_json::from_str(
+            r#"[
+                {"user":{"login":"bob","id":4},"state":"APPROVED"},
+                {"user":{"login":"bob","id":4},"state":"COMMENTED"},
+                {"user":{"login":"bob","id":4},"state":"PENDING"}
+            ]"#,
+        )
+        .unwrap();
+        let latest = latest_reviews(rows);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state, crate::model::ReviewState::Approved);
+    }
+
+    #[test]
+    fn omitted_repository_merge_settings_remain_unknown() {
+        let row: RepositoryRow = serde_json::from_str(r#"{"default_branch":"main"}"#).unwrap();
+        let info = repository_info(row);
+        let mut caps =
+            GitHubProvider::new("github".into(), "github.com".into(), &[]).capabilities();
+        info.filter_capabilities(&mut caps);
+        assert!(caps.merge_commit);
+        assert!(caps.squash_merge);
+        assert!(caps.rebase_merge);
+    }
+
+    #[test]
     fn strategy_api_names_match_github() {
         assert_eq!(MergeStrategy::MergeCommit.api_name(), "merge");
         assert_eq!(MergeStrategy::Squash.api_name(), "squash");
@@ -1202,25 +1428,9 @@ mod tests {
 
     #[test]
     fn capabilities_advertise_supported_lifecycle() {
-        let caps = ForgeCapabilities {
-            create_change_request: true,
-            edit_title: true,
-            edit_description: true,
-            labels: true,
-            assignees: true,
-            milestone: true,
-            close: true,
-            reopen: true,
-            merge: true,
-            merge_commit: true,
-            squash_merge: true,
-            rebase_merge: true,
-            auto_merge: true,
-            delete_source_branch: true,
-            ..ForgeCapabilities::default()
-        };
+        let caps = GitHubProvider::new("github".into(), "github.com".into(), &[]).capabilities();
         assert!(caps.create_change_request && caps.auto_merge);
-        assert!(!caps.draft_transition);
+        assert!(caps.draft_transition);
         assert!(!caps.ci_logs);
     }
 }
