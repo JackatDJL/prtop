@@ -17,7 +17,11 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
-use std::{sync::Arc, time::Instant};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
 
 pub const PALETTE_COMMANDS: [&str; 29] = [
@@ -1291,7 +1295,6 @@ impl App {
             return;
         };
         let resources = self.detail_resources.entry(request.clone()).or_default();
-        resources.refreshed_at = Some(Instant::now());
         let load_request = begin_load(&mut resources.request, force, stale);
         let load_comments = begin_load(&mut resources.comments, force, stale);
         let load_reviews = begin_load(&mut resources.reviews, force, stale);
@@ -2753,7 +2756,11 @@ impl App {
         });
         let sender = self.events.clone();
         tokio::spawn(async move {
-            let result = provider.create_comment(&request, &body).await;
+            let result = comment_write_with_timeout(
+                provider.create_comment(&request, &body),
+                Duration::from_secs(30),
+            )
+            .await;
             let _ = sender.send(AppEvent::CommentWrite {
                 request,
                 correlation_id,
@@ -3269,6 +3276,22 @@ impl App {
         self.requests = result.requests;
         if self.demo {
             self.hydrate_demo_resources();
+        } else {
+            for request in &mut self.requests {
+                let Some(resources) = self.detail_resources.get(&request.id) else {
+                    continue;
+                };
+                if let LoadState::Loaded(comments) = &resources.comments {
+                    request.comments = comments.clone();
+                }
+                if let LoadState::Loaded(reviewers) = &resources.reviews {
+                    request.reviewers = reviewers.clone();
+                }
+                if let LoadState::Loaded(pipelines) = &resources.ci {
+                    request.pipelines = pipelines.clone();
+                    request.ci = summarize_ci(pipelines);
+                }
+            }
         }
         if let Some(opened) = opened
             && !self.requests.iter().any(|request| request.id == opened.id)
@@ -3507,6 +3530,21 @@ pub(crate) fn error_summary(error: &forge::ForgeError) -> String {
         forge::ForgeError::JobNotRetryable => "job cannot be retried".into(),
         forge::ForgeError::PipelineNotCancelable => "pipeline cannot be cancelled".into(),
         forge::ForgeError::LogsUnavailable => "logs are unavailable".into(),
+    }
+}
+
+async fn comment_write_with_timeout<F>(
+    write: F,
+    limit: Duration,
+) -> Result<Comment, forge::ForgeError>
+where
+    F: Future<Output = Result<Comment, forge::ForgeError>>,
+{
+    match tokio::time::timeout(limit, write).await {
+        Ok(result) => result,
+        Err(_) => Err(forge::ForgeError::Unavailable(
+            "comment submission timed out; refresh comments before retrying".into(),
+        )),
     }
 }
 
@@ -4579,6 +4617,95 @@ mod tests {
     }
 
     #[test]
+    fn live_refresh_restores_loaded_detail_resources_onto_list_requests() {
+        let mut app = App::test_app();
+        app.demo = false;
+        let mut request = app.requests[0].clone();
+        let id = request.id.clone();
+        request.comments.clear();
+        request.reviewers.clear();
+        request.pipelines.clear();
+        request.ci = CiState::None;
+
+        let created_at = Utc::now();
+        let comment = Comment {
+            id: "cached-comment".into(),
+            author: Person::named("alice"),
+            body: "cached detail comment".into(),
+            created_at,
+            updated_at: None,
+            can_edit: false,
+            can_delete: false,
+            url: None,
+            resolved: None,
+        };
+        let reviewer = Reviewer {
+            person: Person::named("bob"),
+            state: ReviewState::Approved,
+        };
+        let pipeline = Pipeline {
+            id: PipelineId {
+                forge: id.forge.clone(),
+                repository: id.repository.clone(),
+                value: "cached-pipeline".into(),
+            },
+            name: "cached pipeline".into(),
+            ref_name: "main".into(),
+            sha: "abc123".into(),
+            status: PipelineStatus::Success,
+            created_at,
+            started_at: None,
+            finished_at: None,
+            stages: vec![],
+            jobs: vec![],
+            url: None,
+            environment: None,
+        };
+        let mut resources = DetailResources::default();
+        resources.comments = LoadState::Loaded(vec![comment.clone()]);
+        resources.reviews = LoadState::Loaded(vec![reviewer.clone()]);
+        resources.ci = LoadState::Loaded(vec![pipeline.clone()]);
+        app.detail_resources.insert(id.clone(), resources);
+
+        app.apply_refresh(RefreshResult {
+            requests: vec![request],
+            health: vec![],
+            from_cache: false,
+        });
+
+        let refreshed = app.requests.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(refreshed.comments.len(), 1);
+        assert_eq!(refreshed.comments[0].id, comment.id);
+        assert_eq!(refreshed.comments[0].body, comment.body);
+        assert_eq!(refreshed.reviewers.len(), 1);
+        assert_eq!(refreshed.reviewers[0].person.login, "bob");
+        assert_eq!(refreshed.pipelines.len(), 1);
+        assert_eq!(refreshed.pipelines[0].id.value, pipeline.id.value);
+        assert_eq!(refreshed.ci, CiState::Passed);
+    }
+
+    #[tokio::test]
+    async fn reopening_loaded_detail_does_not_extend_freshness_before_results_arrive() {
+        let mut app = App::test_app();
+        app.demo = false;
+        let id = app.requests[0].id.clone();
+        let refreshed_at = Instant::now() - Duration::from_secs(120);
+        let resources = app.detail_resources.entry(id.clone()).or_default();
+        resources.request = LoadState::Loaded(());
+        resources.comments = LoadState::Loaded(vec![]);
+        resources.reviews = LoadState::Loaded(vec![]);
+        resources.ci = LoadState::Loaded(vec![]);
+        resources.refreshed_at = Some(refreshed_at);
+
+        app.hydrate_detail(id.clone(), false);
+
+        assert_eq!(
+            app.detail_resources.get(&id).unwrap().refreshed_at,
+            Some(refreshed_at)
+        );
+    }
+
+    #[test]
     fn toast_state_rejects_empty_and_whitespace_messages() {
         let mut app = App::test_app();
         app.set_toast("");
@@ -4606,6 +4733,20 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_comment_write_returns_refresh_before_retry_guidance() {
+        let result = comment_write_with_timeout(
+            std::future::pending::<Result<Comment, forge::ForgeError>>(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(forge::ForgeError::Unavailable(message))
+                if message.contains("refresh comments before retrying")
+        ));
     }
 
     #[tokio::test]

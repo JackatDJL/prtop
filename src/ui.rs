@@ -3,6 +3,7 @@ use crate::app::{
     App, BranchCleanupChoice, DetailFocus, HitRegions, Overlay, PALETTE_COMMANDS, View,
 };
 use crate::model::LoadState;
+use chrono::{DateTime, Utc};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -100,6 +101,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         toast(frame, message, theme);
     }
     draw_overlay(frame, app, theme);
+}
+
+fn comment_was_edited(created_at: DateTime<Utc>, updated_at: Option<DateTime<Utc>>) -> bool {
+    updated_at.is_some_and(|updated| updated > created_at)
 }
 fn draw_full_detail(frame: &mut Frame, app: &mut App, theme: Theme) {
     let outer = Layout::default()
@@ -325,7 +330,7 @@ fn draw_comment_composer(
             format!("Failed to post comment: {error}"),
             Style::default().fg(theme.danger),
         ));
-        lines.push(Line::from("Ctrl+Enter retries · Esc keeps the draft"));
+        lines.push(Line::from("Ctrl+Enter retries · Esc discards the draft"));
     }
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
@@ -1229,7 +1234,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
                             .as_deref()
                             .unwrap_or(&comment.author.login),
                         comment.created_at.format("%H:%M"),
-                        if comment.updated_at.is_some() {
+                        if comment_was_edited(comment.created_at, comment.updated_at) {
                             " edited"
                         } else {
                             ""
@@ -1760,6 +1765,17 @@ mod stabilization_tests {
         let buffer = terminal.backend().buffer();
         assert!(text_position(buffer, "organization/long-project-repository").is_some());
         assert!(text_position(buffer, "A long request title remains readable with room").is_some());
+    }
+
+    #[test]
+    fn comment_is_edited_only_when_updated_after_creation() {
+        let created = Utc::now();
+        assert!(!comment_was_edited(created, None));
+        assert!(!comment_was_edited(created, Some(created)));
+        assert!(comment_was_edited(
+            created,
+            Some(created + chrono::Duration::seconds(1))
+        ));
     }
 }
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

@@ -256,18 +256,29 @@ impl ForgeProvider for GitHubProvider {
     }
     async fn list_comments(&self, id: &ChangeRequestId) -> Result<Vec<Comment>, ForgeError> {
         let token = self.credential().await?;
-        let response = reqwest::Client::new()
-            .get(self.api(&format!(
-                "repos/{}/issues/{}/comments?per_page=100",
-                id.repository, id.number
-            )))
-            .header("Authorization", format!("Bearer {token}"))
-            .header("User-Agent", "prtop")
-            .send()
-            .await
-            .map_err(network)?;
-        let rows: Vec<IssueComment> = ensure(response).await?.json().await.map_err(network)?;
-        Ok(rows.into_iter().map(IssueComment::into_comment).collect())
+        let client = reqwest::Client::new();
+        let mut comments = Vec::new();
+        let mut page = 1;
+        loop {
+            let response = client
+                .get(self.api(&format!(
+                    "repos/{}/issues/{}/comments?per_page=100&page={page}",
+                    id.repository, id.number
+                )))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", "prtop")
+                .send()
+                .await
+                .map_err(network)?;
+            let rows: Vec<IssueComment> = ensure(response).await?.json().await.map_err(network)?;
+            let page_len = rows.len();
+            comments.extend(rows.into_iter().map(IssueComment::into_comment));
+            if page_len < 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(comments)
     }
     async fn get_repository(&self, repository: &str) -> Result<RepositoryInfo, ForgeError> {
         let token = self.credential().await?;

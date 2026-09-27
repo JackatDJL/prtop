@@ -585,6 +585,11 @@ impl ForgeProvider for GitLabProvider {
         id: &ChangeRequestId,
         body: &str,
     ) -> Result<Comment, ForgeError> {
+        if !is_note_text(body) {
+            return Err(ForgeError::Validation(
+                "GitLab treats emoji-only notes as reactions; add text to post a comment".into(),
+            ));
+        }
         let token = self.credential().await?;
         let response = reqwest::Client::new()
             .post(self.api(&format!(
@@ -682,17 +687,28 @@ impl ForgeProvider for GitLabProvider {
     }
     async fn list_comments(&self, id: &ChangeRequestId) -> Result<Vec<Comment>, ForgeError> {
         let token = self.credential().await?;
-        let response = reqwest::Client::new()
-            .get(self.api(&format!(
-                "projects/{}/merge_requests/{}/notes?per_page=100",
-                Self::project(id),
-                id.number
-            )))
-            .header("PRIVATE-TOKEN", token)
-            .send()
-            .await
-            .map_err(network)?;
-        let notes: Vec<Note> = ensure(response).await?.json().await.map_err(network)?;
+        let client = reqwest::Client::new();
+        let mut notes = Vec::new();
+        let mut page = 1;
+        loop {
+            let response = client
+                .get(self.api(&format!(
+                    "projects/{}/merge_requests/{}/notes?per_page=100&page={page}",
+                    Self::project(id),
+                    id.number
+                )))
+                .header("PRIVATE-TOKEN", &token)
+                .send()
+                .await
+                .map_err(network)?;
+            let mut batch: Vec<Note> = ensure(response).await?.json().await.map_err(network)?;
+            let has_more = batch.len() == 100;
+            notes.append(&mut batch);
+            if !has_more {
+                break;
+            }
+            page += 1;
+        }
         Ok(notes
             .into_iter()
             .filter(|note| !note.system)
@@ -934,6 +950,10 @@ impl ForgeProvider for GitLabProvider {
             .map_err(network)?;
         ensure(response).await.map(|_| ())
     }
+}
+
+fn is_note_text(body: &str) -> bool {
+    body.chars().any(char::is_alphanumeric)
 }
 fn network(error: reqwest::Error) -> ForgeError {
     ForgeError::Unavailable(error.to_string())
@@ -1232,6 +1252,14 @@ fn normalize(forge: &str, repo: &str, row: Row) -> ChangeRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gitlab_comment_text_requires_non_emoji_text() {
+        assert!(!is_note_text("👍"));
+        assert!(!is_note_text("  🔥  "));
+        assert!(is_note_text("👍 looks good"));
+        assert!(is_note_text("unicode café"));
+    }
     #[test]
     fn normalizes_gitlab_mr() {
         let row: Row=serde_json::from_str(r#"{"iid":43,"title":"Blocks","author":{"username":"jack"},"source_branch":"public","target_branch":"main","draft":true,"updated_at":"2026-08-29T12:00:00Z"}"#).unwrap();
