@@ -643,8 +643,11 @@ struct User {
 }
 #[derive(Deserialize)]
 struct ReviewRow {
-    user: User,
+    #[serde(default)]
+    user: Option<User>,
     state: String,
+    #[serde(default)]
+    dismissed: bool,
 }
 #[derive(Deserialize)]
 struct Branch {
@@ -714,22 +717,27 @@ fn repository_info(row: RepositoryRow) -> RepositoryInfo {
 fn latest_reviews(rows: Vec<ReviewRow>) -> Vec<Reviewer> {
     let mut latest: Vec<Reviewer> = Vec::new();
     for row in rows {
-        if matches!(
-            row.state.as_str(),
-            "COMMENT" | "COMMENTED" | "PENDING" | "REQUEST_REVIEW"
-        ) {
+        if matches!(row.state.as_str(), "COMMENT" | "COMMENTED" | "PENDING") {
             continue;
         }
-        let state = match row.state.as_str() {
-            "APPROVED" => ReviewState::Approved,
-            "REQUEST_CHANGES" | "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
-            _ => ReviewState::None,
+        let Some(user) = row.user else {
+            continue;
+        };
+        let state = if row.dismissed {
+            ReviewState::None
+        } else {
+            match row.state.as_str() {
+                "APPROVED" => ReviewState::Approved,
+                "REQUEST_CHANGES" | "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
+                "REQUEST_REVIEW" => ReviewState::Requested,
+                _ => ReviewState::None,
+            }
         };
         let reviewer = Reviewer {
             person: Person {
-                login: row.user.login,
-                name: row.user.full_name,
-                id: Some(row.user.id),
+                login: user.login,
+                name: user.full_name,
+                id: Some(user.id),
             },
             state,
         };
@@ -885,13 +893,45 @@ mod tests {
             r#"[
                 {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"APPROVED"},
                 {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"COMMENT"},
-                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"REQUEST_REVIEW"}
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"PENDING"}
             ]"#,
         )
         .unwrap();
         let latest = latest_reviews(rows);
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].state, ReviewState::Approved);
+    }
+
+    #[test]
+    fn request_review_and_dismissal_update_reviewer_state() {
+        let rows: Vec<ReviewRow> = serde_json::from_str(
+            r#"[
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"APPROVED"},
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"REQUEST_REVIEW"},
+                {"user":{"login":"alice","id":7,"full_name":"Alice"},"state":"APPROVED"},
+                {"user":{"login":"alice","id":7,"full_name":"Alice"},"state":"APPROVED","dismissed":true},
+                {"user":null,"team":{"id":9,"name":"reviewers"},"state":"APPROVED"}
+            ]"#,
+        )
+        .unwrap();
+        let latest = latest_reviews(rows);
+        assert_eq!(latest.len(), 2);
+        assert_eq!(
+            latest
+                .iter()
+                .find(|reviewer| reviewer.person.login == "bob")
+                .unwrap()
+                .state,
+            ReviewState::Requested
+        );
+        assert_eq!(
+            latest
+                .iter()
+                .find(|reviewer| reviewer.person.login == "alice")
+                .unwrap()
+                .state,
+            ReviewState::None
+        );
     }
 
     #[test]
