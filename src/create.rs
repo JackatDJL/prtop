@@ -542,22 +542,19 @@ impl CreateWorkflow {
             return;
         }
         if self.remote_branch_exists != Some(true) {
-            app.toast = Some(
-                if self.push_needed() {
-                    "Push the source branch before creating the request"
-                } else {
-                    "Waiting for Git preflight"
-                }
-                .into(),
-            );
+            app.set_toast(if self.push_needed() {
+                "Push the source branch before creating the request"
+            } else {
+                "Waiting for Git preflight"
+            });
             return;
         }
         if self.title.trim().is_empty() || self.target.is_empty() {
-            app.toast = Some("A target branch and title are required".into());
+            app.set_toast("A target branch and title are required");
             return;
         }
         if self.target == self.preflight_branch() {
-            app.toast = Some("The target branch must differ from the source branch".into());
+            app.set_toast("The target branch must differ from the source branch");
             return;
         }
         let op = OpId::next();
@@ -1265,7 +1262,7 @@ mod tests {
         // A second submit attempt (double Enter) must not re-arm the write.
         workflow.begin_submit(&mut app);
         assert_eq!(workflow.submit_op, first_op);
-        assert_eq!(app.toast.as_deref(), None);
+        assert_eq!(app.toast(), None);
     }
 
     #[tokio::test]

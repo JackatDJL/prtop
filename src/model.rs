@@ -1,6 +1,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum LoadState<T> {
+    #[default]
+    NotLoaded,
+    Loading,
+    Loaded(T),
+    Failed(String),
+    Unsupported,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct ChangeRequestId {
     pub forge: String,

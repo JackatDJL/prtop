@@ -580,7 +580,16 @@ impl ForgeProvider for GitLabProvider {
             .map_err(network)?;
         ensure(response).await.map(|_| ())
     }
-    async fn create_comment(&self, id: &ChangeRequestId, body: &str) -> Result<(), ForgeError> {
+    async fn create_comment(
+        &self,
+        id: &ChangeRequestId,
+        body: &str,
+    ) -> Result<Comment, ForgeError> {
+        if !is_note_text(body) {
+            return Err(ForgeError::Validation(
+                "GitLab treats emoji-only notes as reactions; add text to post a comment".into(),
+            ));
+        }
         let token = self.credential().await?;
         let response = reqwest::Client::new()
             .post(self.api(&format!(
@@ -593,7 +602,8 @@ impl ForgeProvider for GitLabProvider {
             .send()
             .await
             .map_err(network)?;
-        ensure(response).await.map(|_| ())
+        let note: Note = ensure(response).await?.json().await.map_err(network)?;
+        Ok(note.into_comment())
     }
     async fn edit_comment(
         &self,
@@ -655,7 +665,7 @@ impl ForgeProvider for GitLabProvider {
                     .map_err(network)?;
                 ensure(response).await.map(|_| ())
             }
-            ReviewAction::Comment => self.create_comment(id, body).await,
+            ReviewAction::Comment => self.create_comment(id, body).await.map(|_| ()),
             ReviewAction::RequestChanges => Err(ForgeError::Unsupported),
         }
     }
@@ -673,6 +683,36 @@ impl ForgeProvider for GitLabProvider {
                 },
                 state: ReviewState::Approved,
             })
+            .collect())
+    }
+    async fn list_comments(&self, id: &ChangeRequestId) -> Result<Vec<Comment>, ForgeError> {
+        let token = self.credential().await?;
+        let client = reqwest::Client::new();
+        let mut notes = Vec::new();
+        let mut page = 1;
+        loop {
+            let response = client
+                .get(self.api(&format!(
+                    "projects/{}/merge_requests/{}/notes?per_page=100&page={page}",
+                    Self::project(id),
+                    id.number
+                )))
+                .header("PRIVATE-TOKEN", &token)
+                .send()
+                .await
+                .map_err(network)?;
+            let mut batch: Vec<Note> = ensure(response).await?.json().await.map_err(network)?;
+            let has_more = batch.len() == 100;
+            notes.append(&mut batch);
+            if !has_more {
+                break;
+            }
+            page += 1;
+        }
+        Ok(notes
+            .into_iter()
+            .filter(|note| !note.system)
+            .map(Note::into_comment)
             .collect())
     }
     async fn search_reviewers(
@@ -911,6 +951,77 @@ impl ForgeProvider for GitLabProvider {
         ensure(response).await.map(|_| ())
     }
 }
+
+fn is_note_text(body: &str) -> bool {
+    let body = body.trim();
+    !body.is_empty() && !is_emoji_shortcode(body) && !is_unicode_emoji_only(body)
+}
+
+fn is_emoji_shortcode(body: &str) -> bool {
+    let Some(name) = body
+        .strip_prefix(':')
+        .and_then(|body| body.strip_suffix(':'))
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_+-".contains(character))
+}
+
+fn is_unicode_emoji_only(body: &str) -> bool {
+    let mut has_emoji = false;
+    let mut characters = body.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_whitespace() {
+            continue;
+        }
+
+        if matches!(character, '0'..='9' | '#' | '*') {
+            let mut next = characters.clone();
+            if next.next() == Some('\u{fe0f}') && next.next() == Some('\u{20e3}') {
+                characters.next();
+                characters.next();
+                has_emoji = true;
+                continue;
+            }
+            return false;
+        }
+
+        if !is_emoji_codepoint(character as u32) {
+            return false;
+        }
+        has_emoji = true;
+    }
+    has_emoji
+}
+
+fn is_emoji_codepoint(codepoint: u32) -> bool {
+    matches!(
+        codepoint,
+        0x200d
+            | 0x20e3
+            | 0xfe0e..=0xfe0f
+            | 0x1f000..=0x1faff
+            | 0x2190..=0x21ff
+            | 0x2300..=0x23ff
+            | 0x25a0..=0x25ff
+            | 0x2600..=0x27bf
+            | 0x2934..=0x2935
+            | 0x2b00..=0x2bff
+            | 0x3030
+            | 0x303d
+            | 0x3297
+            | 0x3299
+            | 0x00a9
+            | 0x00ae
+            | 0x203c
+            | 0x2049
+            | 0x2122
+            | 0x2139
+    )
+}
 fn network(error: reqwest::Error) -> ForgeError {
     ForgeError::Unavailable(error.to_string())
 }
@@ -1000,6 +1111,8 @@ struct ApprovalUser {
 struct Note {
     id: u64,
     body: String,
+    #[serde(default)]
+    system: bool,
     author: User,
     created_at: DateTime<Utc>,
     updated_at: Option<DateTime<Utc>>,
@@ -1206,6 +1319,20 @@ fn normalize(forge: &str, repo: &str, row: Row) -> ChangeRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gitlab_comment_text_rejects_only_emoji_reactions() {
+        assert!(!is_note_text("👍"));
+        assert!(!is_note_text("  🔥  "));
+        assert!(!is_note_text(":thumbsup:"));
+        assert!(!is_note_text("  :+1:  "));
+        assert!(!is_note_text("👨‍👩‍👧‍👦"));
+        assert!(!is_note_text("1️⃣"));
+        assert!(is_note_text("👍 looks good"));
+        assert!(is_note_text("unicode café"));
+        assert!(is_note_text("?"));
+        assert!(is_note_text("…"));
+    }
     #[test]
     fn normalizes_gitlab_mr() {
         let row: Row=serde_json::from_str(r#"{"iid":43,"title":"Blocks","author":{"username":"jack"},"source_branch":"public","target_branch":"main","draft":true,"updated_at":"2026-08-29T12:00:00Z"}"#).unwrap();

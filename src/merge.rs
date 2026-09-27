@@ -339,11 +339,11 @@ impl MergeSession {
     }
     pub fn begin_merge(&mut self, app: &mut App) {
         if self.loading || self.preflight_error.is_some() {
-            app.toast = Some("Merge preflight must complete before merging".into());
+            app.set_toast("Merge preflight must complete before merging");
             return;
         }
         if !self.technically_mergeable {
-            app.toast = Some("The provider reports merge conflicts".into());
+            app.set_toast("The provider reports merge conflicts");
             return;
         }
         if self.warnings.is_empty() {
@@ -520,7 +520,7 @@ mod tests {
             let mut app = App::test_app();
             session.begin_merge(&mut app);
             assert_eq!(session.stage, MergeStage::Preflight);
-            assert!(app.toast.as_deref().is_some_and(|toast| !toast.is_empty()));
+            assert!(app.toast().is_some_and(|toast| !toast.is_empty()));
         }
     }
 

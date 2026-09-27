@@ -18,6 +18,8 @@ pub enum ForgeError {
     AuthenticationRequired(String),
     #[error("provider unavailable: {0}")]
     Unavailable(String),
+    #[error("comment submission timed out")]
+    CommentTimedOut,
     #[error("permission denied")]
     PermissionDenied,
     #[error("rate limited")]
@@ -256,6 +258,9 @@ pub trait ForgeProvider: Send + Sync {
     async fn list_reviews(&self, _id: &ChangeRequestId) -> Result<Vec<Reviewer>, ForgeError> {
         Err(ForgeError::Unsupported)
     }
+    async fn list_comments(&self, _id: &ChangeRequestId) -> Result<Vec<Comment>, ForgeError> {
+        Err(ForgeError::Unsupported)
+    }
     async fn list_pipelines(&self, _id: &ChangeRequestId) -> Result<Vec<Pipeline>, ForgeError> {
         Err(ForgeError::Unsupported)
     }
@@ -280,7 +285,11 @@ pub trait ForgeProvider: Send + Sync {
     async fn play_job(&self, _id: &JobId) -> Result<(), ForgeError> {
         Err(ForgeError::Unsupported)
     }
-    async fn create_comment(&self, _id: &ChangeRequestId, _body: &str) -> Result<(), ForgeError> {
+    async fn create_comment(
+        &self,
+        _id: &ChangeRequestId,
+        _body: &str,
+    ) -> Result<Comment, ForgeError> {
         Err(ForgeError::Unsupported)
     }
     #[allow(dead_code)] // Provider adapters expose these endpoints; comment editing is outside M4.
