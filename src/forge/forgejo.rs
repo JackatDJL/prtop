@@ -223,31 +223,7 @@ impl ForgeProvider for ForgejoProvider {
             .await
             .map_err(network)?;
         let rows: Vec<ReviewRow> = ensure(response).await?.json().await.map_err(network)?;
-        let mut latest: Vec<Reviewer> = Vec::new();
-        for row in rows {
-            let state = match row.state.as_str() {
-                "APPROVED" => ReviewState::Approved,
-                "REQUEST_CHANGES" | "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
-                _ => ReviewState::None,
-            };
-            let reviewer = Reviewer {
-                person: Person {
-                    login: row.user.login,
-                    name: row.user.full_name,
-                    id: Some(row.user.id),
-                },
-                state,
-            };
-            if let Some(current) = latest
-                .iter_mut()
-                .find(|current| current.person.login == reviewer.person.login)
-            {
-                *current = reviewer;
-            } else {
-                latest.push(reviewer);
-            }
-        }
-        Ok(latest)
+        Ok(latest_reviews(rows))
     }
     async fn get_repository(&self, repository: &str) -> Result<RepositoryInfo, ForgeError> {
         let token = self.credential().await?;
@@ -729,11 +705,44 @@ struct RepositoryRow {
 fn repository_info(row: RepositoryRow) -> RepositoryInfo {
     RepositoryInfo {
         default_branch: row.default_branch,
-        allow_merge_commit: Some(row.allow_merge_commits.unwrap_or(false)),
-        allow_squash_merge: Some(row.allow_squash_merge.unwrap_or(false)),
-        allow_rebase_merge: Some(row.allow_rebase.unwrap_or(false)),
+        allow_merge_commit: row.allow_merge_commits,
+        allow_squash_merge: row.allow_squash_merge,
+        allow_rebase_merge: row.allow_rebase,
         ..RepositoryInfo::default()
     }
+}
+fn latest_reviews(rows: Vec<ReviewRow>) -> Vec<Reviewer> {
+    let mut latest: Vec<Reviewer> = Vec::new();
+    for row in rows {
+        if matches!(
+            row.state.as_str(),
+            "COMMENT" | "COMMENTED" | "PENDING" | "REQUEST_REVIEW"
+        ) {
+            continue;
+        }
+        let state = match row.state.as_str() {
+            "APPROVED" => ReviewState::Approved,
+            "REQUEST_CHANGES" | "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
+            _ => ReviewState::None,
+        };
+        let reviewer = Reviewer {
+            person: Person {
+                login: row.user.login,
+                name: row.user.full_name,
+                id: Some(row.user.id),
+            },
+            state,
+        };
+        if let Some(current) = latest
+            .iter_mut()
+            .find(|current| current.person.login == reviewer.person.login)
+        {
+            *current = reviewer;
+        } else {
+            latest.push(reviewer);
+        }
+    }
+    latest
 }
 fn request_state(row: &Row) -> RequestState {
     if row.merged.unwrap_or(false) || row.merged_at.is_some() {
@@ -868,5 +877,32 @@ mod tests {
         assert!(!caps.squash_merge);
         assert!(caps.rebase_merge);
         assert!(!caps.auto_merge);
+    }
+
+    #[test]
+    fn non_decisive_reviews_do_not_replace_the_latest_decision() {
+        let rows: Vec<ReviewRow> = serde_json::from_str(
+            r#"[
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"APPROVED"},
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"COMMENT"},
+                {"user":{"login":"bob","id":4,"full_name":"Bob"},"state":"REQUEST_REVIEW"}
+            ]"#,
+        )
+        .unwrap();
+        let latest = latest_reviews(rows);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state, ReviewState::Approved);
+    }
+
+    #[test]
+    fn omitted_repository_merge_settings_remain_unknown() {
+        let row: RepositoryRow = serde_json::from_str(r#"{"default_branch":"main"}"#).unwrap();
+        let info = repository_info(row);
+        let mut caps =
+            ForgejoProvider::new("codeberg".into(), "codeberg.org".into(), &[]).capabilities();
+        info.filter_capabilities(&mut caps);
+        assert!(caps.merge_commit);
+        assert!(caps.squash_merge);
+        assert!(caps.rebase_merge);
     }
 }

@@ -905,7 +905,7 @@ fn overlay_legacy(frame: &mut Frame, overlay: &Overlay, theme: Theme) {
 }
 fn draw_list(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let visible = app.visible();
-    if visible.is_empty() && app.repo_context.repository.is_some() {
+    if visible.is_empty() && app.filter.is_empty() && app.repo_context.repository.is_some() {
         let mut lines = vec![
             Line::styled(
                 "No open pull requests or merge requests.",

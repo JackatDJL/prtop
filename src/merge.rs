@@ -222,7 +222,7 @@ impl MergeSession {
             record(CheckStatus::Info, format!("merge queue: {position}"));
         }
         let technical_mergeability = request.mergeability;
-        let technically_mergeable = request.mergeability == Mergeability::Mergeable
+        let technically_mergeable = request.mergeability != Mergeability::Conflicting
             && request.mergeable_state.as_deref() != Some("dirty");
         let policy_satisfied = matches!(request.ci, CiState::Passed | CiState::None)
             && approvals_satisfied == Some(true)
@@ -298,6 +298,11 @@ impl MergeSession {
                 }
                 Left | Char('h') => self.button_selected = self.button_selected.saturating_sub(1),
                 Right | Char('l') => self.button_selected = (self.button_selected + 1).min(1),
+                Enter
+                    if self.button_selected == 0 && !modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    return true;
+                }
                 Enter if self.preflight_error.is_some() => {
                     self.preflight_error = None;
                     self.loading = true;
@@ -486,6 +491,44 @@ mod tests {
                 .iter()
                 .any(|warning| { warning.contains("approval requirement is unknown") })
         );
+    }
+
+    #[test]
+    fn unknown_or_provider_blocked_mergeability_requires_unsafe_confirmation() {
+        for mergeability in [Mergeability::Unknown, Mergeability::Blocked] {
+            let mut item = request();
+            item.mergeability = mergeability;
+            let mut session = MergeSession::build(&item, &full_caps()).unwrap();
+            assert!(session.technically_mergeable);
+            let mut app = App::test_app();
+            session.begin_merge(&mut app);
+            assert_eq!(session.stage, MergeStage::ConfirmUnsafe);
+        }
+    }
+
+    #[test]
+    fn conflicts_and_dirty_merge_state_remain_hard_blocks() {
+        for (mergeability, state) in [
+            (Mergeability::Conflicting, Some("clean")),
+            (Mergeability::Unknown, Some("dirty")),
+        ] {
+            let mut item = request();
+            item.mergeability = mergeability;
+            item.mergeable_state = state.map(str::to_owned);
+            let mut session = MergeSession::build(&item, &full_caps()).unwrap();
+            assert!(!session.technically_mergeable);
+            let mut app = App::test_app();
+            session.begin_merge(&mut app);
+            assert_eq!(session.stage, MergeStage::Preflight);
+            assert!(app.toast.as_deref().is_some_and(|toast| !toast.is_empty()));
+        }
+    }
+
+    #[test]
+    fn enter_on_preflight_cancel_closes_the_session() {
+        let mut session = MergeSession::build(&request(), &full_caps()).unwrap();
+        let mut app = App::test_app();
+        assert!(session.handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE));
     }
 
     #[test]

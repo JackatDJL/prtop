@@ -284,7 +284,7 @@ impl CreateWorkflow {
         if remote_exists.is_some() {
             self.remote_branch_exists = remote_exists;
         }
-        self.push_state = if self.remote_branch_exists == Some(false) {
+        self.push_state = if self.push_needed() {
             PushState::WaitingForPush
         } else {
             PushState::Idle
@@ -336,6 +336,7 @@ impl CreateWorkflow {
         let sender = app.events.clone();
         tokio::spawn(async move {
             let result = repo::push(&root, &remote, &branch).await;
+            let branch = repo::current_branch(&root).await.unwrap_or_default();
             let _ = sender.send(AppEvent::PushCompleted { op, branch, result });
         });
     }
@@ -345,7 +346,7 @@ impl CreateWorkflow {
         }
         self.push_op = None;
         self.pushing = false;
-        if !branch.is_empty() && branch != self.preflight_branch() {
+        if result.is_ok() && branch != self.preflight_branch() {
             self.push_error = Some("the checked-out source branch changed during push".into());
             self.push_state = PushState::PushFailed;
             return;
@@ -406,13 +407,19 @@ impl CreateWorkflow {
             Field::Draft => self.draft = !self.draft,
             Field::Reviewers => {
                 let token = OpId::next();
-                self.editor = Some(CreateEditor::Reviewers(PickerSession::new(
-                    PickerKind::Reviewer,
-                    token,
-                )));
-                if let Some(CreateEditor::Reviewers(session)) = &mut self.editor {
-                    session.multi = true;
-                }
+                let mut session = PickerSession::new(PickerKind::Reviewer, token);
+                session.checked = self
+                    .reviewers
+                    .iter()
+                    .map(|person| person.login.clone())
+                    .collect();
+                session.remember_items(self.reviewers.iter().map(|person| PickerItem {
+                    id: person.login.clone(),
+                    label: person.display_name().to_owned(),
+                    detail: person.id.map(|id| id.to_string()),
+                }));
+                session.multi = true;
+                self.editor = Some(CreateEditor::Reviewers(session));
                 app.spawn_picker_search(
                     PickerKind::Reviewer,
                     token,
@@ -423,10 +430,9 @@ impl CreateWorkflow {
             }
             Field::Labels => {
                 let token = OpId::next();
-                self.editor = Some(CreateEditor::Labels(PickerSession::new(
-                    PickerKind::Label,
-                    token,
-                )));
+                let mut session = PickerSession::new(PickerKind::Label, token);
+                session.checked = self.labels.clone();
+                self.editor = Some(CreateEditor::Labels(session));
                 app.spawn_picker_search(
                     PickerKind::Label,
                     token,
@@ -437,10 +443,9 @@ impl CreateWorkflow {
             }
             Field::Assignees => {
                 let token = OpId::next();
-                self.editor = Some(CreateEditor::Assignees(PickerSession::new(
-                    PickerKind::Assignee,
-                    token,
-                )));
+                let mut session = PickerSession::new(PickerKind::Assignee, token);
+                session.checked = self.assignees.clone();
+                self.editor = Some(CreateEditor::Assignees(session));
                 app.spawn_picker_search(
                     PickerKind::Assignee,
                     token,
@@ -773,6 +778,9 @@ impl CreateWorkflow {
                     }
                     Enter => {
                         self.commit_picker(&mut session, false);
+                        if session.multi {
+                            self.editor = Some(Self::editor_with_session(&editor, session));
+                        }
                         return false;
                     }
                     _ => {}
@@ -785,7 +793,7 @@ impl CreateWorkflow {
         match self.stage {
             CreateStage::Preflight => {
                 if self.preflight_loading || self.pushing {
-                    return false;
+                    return key == Esc;
                 }
                 if self.push_needed() && !self.pushing {
                     self.set_button(vec![Button::Cancel, Button::PushAndContinue]);
@@ -905,7 +913,7 @@ impl CreateWorkflow {
                         .iter()
                         .map(|login| {
                             session
-                                .items
+                                .known_items
                                 .iter()
                                 .find(|item| item.id == *login)
                                 .map(|item| Person {
@@ -954,7 +962,7 @@ impl CreateWorkflow {
             if rect.contains(ratatui::layout::Position { x: column, y: row }) {
                 if (self.preflight_loading || self.pushing) && self.stage == CreateStage::Preflight
                 {
-                    return false;
+                    return button == Button::Cancel;
                 }
                 let picker_open = self.editor.as_ref().is_some_and(|editor| {
                     matches!(
@@ -1042,6 +1050,11 @@ impl CreateWorkflow {
                 if row < session.visible_count() {
                     if row == session.selected {
                         self.commit_picker(&mut session, false);
+                        if session.multi
+                            && let Some(editor) = &self.editor
+                        {
+                            self.editor = Some(Self::editor_with_session(editor, session));
+                        }
                     } else {
                         session.select_row(row);
                         if let Some(editor) = &self.editor {
@@ -1151,6 +1164,36 @@ mod tests {
     }
 
     #[test]
+    fn unpushed_commits_require_a_push_even_when_remote_branch_exists() {
+        let mut workflow = demo_workflow();
+        workflow.apply_preflight(
+            BranchState {
+                branch: "feature/new-reader".into(),
+                unpushed: Some(2),
+                remote_branch_exists: Some(true),
+                ..BranchState::default()
+            },
+            Some(true),
+            None,
+            vec![],
+        );
+        assert!(workflow.push_needed());
+        assert_eq!(workflow.push_state, PushState::WaitingForPush);
+    }
+
+    #[test]
+    fn preflight_escape_can_cancel_while_loading() {
+        let mut workflow = demo_workflow();
+        workflow.preflight_loading = true;
+        let mut app = App::test_app();
+        assert!(workflow.handle_key(
+            &mut app,
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    #[test]
     fn preflight_summary_reports_state() {
         let mut workflow = demo_workflow();
         workflow.start_preflight(&App::test_app());
@@ -1189,6 +1232,20 @@ mod tests {
         assert_eq!(
             workflow.push_error.as_deref(),
             Some("remote repository not found")
+        );
+    }
+
+    #[test]
+    fn push_completion_detects_a_changed_checkout_branch() {
+        let mut workflow = demo_workflow();
+        workflow.start_preflight(&App::test_app());
+        let op = OpId::next();
+        workflow.push_op = Some(op);
+        workflow.apply_push(op, "another-branch".into(), Ok(()));
+        assert_eq!(workflow.stage, CreateStage::Preflight);
+        assert_eq!(
+            workflow.push_error.as_deref(),
+            Some("the checked-out source branch changed during push")
         );
     }
 
@@ -1309,6 +1366,28 @@ mod tests {
         labels.toggle_checked("mobile");
         workflow.commit_picker(&mut labels, true);
         assert_eq!(workflow.labels, vec!["bug", "mobile"]);
+    }
+
+    #[test]
+    fn enter_toggles_multi_picker_selection_without_losing_the_session() {
+        let mut workflow = demo_workflow();
+        workflow.stage = CreateStage::Fields;
+        let mut app = App::test_app();
+        let mut session = PickerSession::new(PickerKind::Reviewer, OpId(9));
+        session.apply_items(
+            OpId(9),
+            vec![PickerItem::simple("alice"), PickerItem::simple("bob")],
+        );
+        workflow.editor = Some(CreateEditor::Reviewers(session));
+        workflow.handle_key(
+            &mut app,
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let Some(CreateEditor::Reviewers(session)) = workflow.editor else {
+            panic!("multi picker should remain open after toggling");
+        };
+        assert_eq!(session.checked, vec!["alice"]);
     }
 
     #[test]

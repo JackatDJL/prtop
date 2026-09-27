@@ -252,32 +252,7 @@ impl ForgeProvider for GitHubProvider {
             .await
             .map_err(network)?;
         let rows: Vec<ReviewRow> = ensure(response).await?.json().await.map_err(network)?;
-        let mut latest: Vec<Reviewer> = Vec::new();
-        for row in rows {
-            let state = match row.state.as_str() {
-                "APPROVED" => crate::model::ReviewState::Approved,
-                "CHANGES_REQUESTED" => crate::model::ReviewState::ChangesRequested,
-                "DISMISSED" | "COMMENTED" => crate::model::ReviewState::None,
-                _ => crate::model::ReviewState::None,
-            };
-            let reviewer = Reviewer {
-                person: Person {
-                    login: row.user.login,
-                    name: None,
-                    id: Some(row.user.id),
-                },
-                state,
-            };
-            if let Some(current) = latest
-                .iter_mut()
-                .find(|current| current.person.login == reviewer.person.login)
-            {
-                *current = reviewer;
-            } else {
-                latest.push(reviewer);
-            }
-        }
-        Ok(latest)
+        Ok(latest_reviews(rows))
     }
     async fn get_repository(&self, repository: &str) -> Result<RepositoryInfo, ForgeError> {
         let token = self.credential().await?;
@@ -289,14 +264,7 @@ impl ForgeProvider for GitHubProvider {
             .await
             .map_err(network)?;
         let row: RepositoryRow = ensure(response).await?.json().await.map_err(network)?;
-        Ok(RepositoryInfo {
-            default_branch: row.default_branch,
-            allow_merge_commit: Some(row.allow_merge_commit.unwrap_or(false)),
-            allow_squash_merge: Some(row.allow_squash_merge.unwrap_or(false)),
-            allow_rebase_merge: Some(row.allow_rebase_merge.unwrap_or(false)),
-            allow_auto_merge: Some(row.allow_auto_merge.unwrap_or(false)),
-            ..RepositoryInfo::default()
-        })
+        Ok(repository_info(row))
     }
     async fn create_change_request(
         &self,
@@ -373,13 +341,15 @@ impl ForgeProvider for GitHubProvider {
                     Ok(response) => {
                         if ensure(response).await.is_err() {
                             metadata_warnings.push(
-                                "labels or assignees were not applied; edit request metadata"
+                                "labels, assignees or milestone were not applied; edit request metadata"
                                     .into(),
                             );
                         }
                     }
-                    Err(_) => metadata_warnings
-                        .push("labels or assignees were not applied; edit request metadata".into()),
+                    Err(_) => metadata_warnings.push(
+                        "labels, assignees or milestone were not applied; edit request metadata"
+                            .into(),
+                    ),
                 }
             }
         }
@@ -1175,6 +1145,47 @@ fn labels(rows: &[LabelRow]) -> Vec<Label> {
         })
         .collect()
 }
+fn latest_reviews(rows: Vec<ReviewRow>) -> Vec<Reviewer> {
+    let mut latest: Vec<Reviewer> = Vec::new();
+    for row in rows {
+        if matches!(row.state.as_str(), "COMMENTED" | "PENDING") {
+            continue;
+        }
+        let state = match row.state.as_str() {
+            "APPROVED" => crate::model::ReviewState::Approved,
+            "CHANGES_REQUESTED" => crate::model::ReviewState::ChangesRequested,
+            "DISMISSED" => crate::model::ReviewState::None,
+            _ => crate::model::ReviewState::None,
+        };
+        let reviewer = Reviewer {
+            person: Person {
+                login: row.user.login,
+                name: None,
+                id: Some(row.user.id),
+            },
+            state,
+        };
+        if let Some(current) = latest
+            .iter_mut()
+            .find(|current| current.person.login == reviewer.person.login)
+        {
+            *current = reviewer;
+        } else {
+            latest.push(reviewer);
+        }
+    }
+    latest
+}
+fn repository_info(row: RepositoryRow) -> RepositoryInfo {
+    RepositoryInfo {
+        default_branch: row.default_branch,
+        allow_merge_commit: row.allow_merge_commit,
+        allow_squash_merge: row.allow_squash_merge,
+        allow_rebase_merge: row.allow_rebase_merge,
+        allow_auto_merge: row.allow_auto_merge,
+        ..RepositoryInfo::default()
+    }
+}
 fn mergeability(row: &Row) -> crate::model::Mergeability {
     match row.mergeable {
         Some(true) => crate::model::Mergeability::Mergeable,
@@ -1379,6 +1390,33 @@ mod tests {
         assert_eq!(approval_satisfied(Some("CHANGES_REQUESTED")), Some(false));
         assert_eq!(approval_satisfied(None), None);
         assert_eq!(approval_satisfied(Some("DISMISSED")), None);
+    }
+
+    #[test]
+    fn non_decisive_reviews_do_not_replace_the_latest_decision() {
+        let rows: Vec<ReviewRow> = serde_json::from_str(
+            r#"[
+                {"user":{"login":"bob","id":4},"state":"APPROVED"},
+                {"user":{"login":"bob","id":4},"state":"COMMENTED"},
+                {"user":{"login":"bob","id":4},"state":"PENDING"}
+            ]"#,
+        )
+        .unwrap();
+        let latest = latest_reviews(rows);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state, crate::model::ReviewState::Approved);
+    }
+
+    #[test]
+    fn omitted_repository_merge_settings_remain_unknown() {
+        let row: RepositoryRow = serde_json::from_str(r#"{"default_branch":"main"}"#).unwrap();
+        let info = repository_info(row);
+        let mut caps =
+            GitHubProvider::new("github".into(), "github.com".into(), &[]).capabilities();
+        info.filter_capabilities(&mut caps);
+        assert!(caps.merge_commit);
+        assert!(caps.squash_merge);
+        assert!(caps.rebase_merge);
     }
 
     #[test]

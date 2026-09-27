@@ -81,8 +81,10 @@ impl TextArea {
         }
     }
     pub fn up(&mut self) {
-        self.row = self.row.saturating_sub(1);
-        self.col = self.lines[self.row].len();
+        if self.row > 0 {
+            self.row -= 1;
+            self.col = self.lines[self.row].len();
+        }
     }
     pub fn down(&mut self) {
         if self.row + 1 < self.lines.len() {
@@ -130,6 +132,14 @@ mod tests {
         area.end();
         area.right();
         assert_eq!(area.col, 1);
+        area.up();
+        assert_eq!((area.row, area.col), (0, 2));
+    }
+
+    #[test]
+    fn up_at_first_line_preserves_the_cursor_column() {
+        let mut area = TextArea::from_str("hello");
+        area.col = 2;
         area.up();
         assert_eq!((area.row, area.col), (0, 2));
     }

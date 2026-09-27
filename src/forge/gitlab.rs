@@ -527,10 +527,7 @@ impl ForgeProvider for GitLabProvider {
             .request(method, self.api(&path))
             .header("PRIVATE-TOKEN", &token);
         if enable {
-            request = request.json(&serde_json::json!({
-                "auto_merge": true,
-                "squash": strategy == MergeStrategy::Squash,
-            }));
+            request = request.json(&auto_merge_payload(strategy));
         }
         let response = request.send().await.map_err(network)?;
         ensure(response).await?;
@@ -917,6 +914,13 @@ impl ForgeProvider for GitLabProvider {
 fn network(error: reqwest::Error) -> ForgeError {
     ForgeError::Unavailable(error.to_string())
 }
+fn auto_merge_payload(strategy: MergeStrategy) -> serde_json::Value {
+    serde_json::json!({
+        "auto_merge": true,
+        "merge_when_pipeline_succeeds": true,
+        "squash": strategy == MergeStrategy::Squash,
+    })
+}
 async fn ensure(response: reqwest::Response) -> Result<reqwest::Response, ForgeError> {
     match response.status().as_u16() {
         200..=299 => Ok(response),
@@ -1269,5 +1273,13 @@ mod tests {
         assert_eq!(MergeStrategy::MergeCommit.api_name(), "merge");
         assert_eq!(MergeStrategy::Squash.api_name(), "squash");
         assert_eq!(MergeStrategy::Rebase.api_name(), "rebase");
+    }
+
+    #[test]
+    fn auto_merge_payload_keeps_legacy_pipeline_flag_and_strategy() {
+        let payload = auto_merge_payload(MergeStrategy::Squash);
+        assert_eq!(payload["auto_merge"], true);
+        assert_eq!(payload["merge_when_pipeline_succeeds"], true);
+        assert_eq!(payload["squash"], true);
     }
 }

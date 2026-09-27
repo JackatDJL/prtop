@@ -7,7 +7,7 @@ use crate::editor::TextArea;
 use crate::forge::ForgeError;
 use crate::forge::{ForgeCapabilities, RequestPatch};
 use crate::model::{ChangeRequest, ChangeRequestId, Person, RequestState};
-use crate::picker::{PickerKind, PickerSession};
+use crate::picker::{PickerItem, PickerKind, PickerSession};
 use crate::write::OpId;
 use ratatui::layout::Rect;
 
@@ -374,6 +374,11 @@ impl EditSession {
                     .filter(|reviewer| reviewer.state == crate::model::ReviewState::Requested)
                     .map(|reviewer| reviewer.person.login.clone())
                     .collect();
+                session.remember_items(request.reviewers.iter().map(|reviewer| PickerItem {
+                    id: reviewer.person.login.clone(),
+                    label: reviewer.person.display_name().to_owned(),
+                    detail: reviewer.person.id.map(|id| id.to_string()),
+                }));
                 self.active = Some(EditField::Picker(session));
                 self.load_picker(app, PickerKind::Reviewer, "");
             }
@@ -494,7 +499,7 @@ impl EditSession {
                         .filter(|login| !current.contains(login))
                         .map(|login| {
                             let id = session
-                                .items
+                                .known_items
                                 .iter()
                                 .find(|item| item.id == **login)
                                 .and_then(|item| item.detail.as_deref())
@@ -542,11 +547,15 @@ impl EditSession {
                 }
             }
             PickerKind::Milestone => {
+                let current = app
+                    .detail_request()
+                    .or_else(|| app.request_for_view())
+                    .and_then(|request| request.milestone.clone());
+                if !session.selection_touched && current.is_some() {
+                    self.active = None;
+                    return;
+                }
                 if let Some(item) = session.selected_item() {
-                    let current = app
-                        .detail_request()
-                        .or_else(|| app.request_for_view())
-                        .and_then(|request| request.milestone.clone());
                     let next = if current.as_deref() == Some(item.id.as_str()) {
                         None
                     } else {
@@ -615,6 +624,7 @@ impl EditSession {
                 let mut session = session.clone();
                 if relative < session.visible_count() {
                     if relative == session.selected {
+                        session.selection_touched = true;
                         self.commit_picker(app, &mut session, false);
                     } else {
                         session.select_row(relative);
@@ -703,6 +713,25 @@ mod tests {
         assert!(names.iter().any(|name| name == "Mark as draft"));
         assert!(names.iter().any(|name| name == "Close"));
         assert!(!names.iter().any(|name| name == "Edit labels"));
+    }
+
+    #[test]
+    fn applying_untouched_milestone_picker_preserves_current_milestone() {
+        let (mut app, id) = open_edit_menu();
+        app.requests[0].milestone = Some("v1.2".into());
+        let mut session = PickerSession::new(PickerKind::Milestone, OpId(10));
+        session.checked.push("v1.2".into());
+        session.apply_items(
+            OpId(10),
+            vec![PickerItem::simple("v1.3"), PickerItem::simple("v1.2")],
+        );
+        let mut edit = EditSession::new(id, full_caps());
+        edit.active = Some(EditField::Picker(session.clone()));
+
+        edit.commit_picker(&mut app, &mut session, false);
+
+        assert_eq!(app.requests[0].milestone.as_deref(), Some("v1.2"));
+        assert!(app.last_op.is_none());
     }
 
     #[test]
