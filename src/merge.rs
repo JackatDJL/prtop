@@ -520,7 +520,7 @@ mod tests {
             let mut app = App::test_app();
             session.begin_merge(&mut app);
             assert_eq!(session.stage, MergeStage::Preflight);
-            assert!(app.toast.as_deref().is_some_and(|toast| !toast.is_empty()));
+            assert!(app.toast().is_some_and(|toast| !toast.is_empty()));
         }
     }
 
