@@ -2780,7 +2780,13 @@ impl App {
             );
             return;
         }
-        self.comment_retry_draft = None;
+        if self
+            .comment_retry_draft
+            .as_ref()
+            .is_some_and(|(draft_request, _)| draft_request == &request)
+        {
+            self.comment_retry_draft = None;
+        }
         let correlation_id = OpId::next();
         if self.demo {
             let comment = Comment {
@@ -3435,8 +3441,16 @@ impl App {
         let pending = self.pending_comment.take().unwrap();
         match result {
             Ok(comment) => {
-                self.comment_retry_requires_refresh = None;
-                self.comment_retry_draft = None;
+                if self.comment_retry_requires_refresh.as_ref() == Some(&request) {
+                    self.comment_retry_requires_refresh = None;
+                }
+                if self
+                    .comment_retry_draft
+                    .as_ref()
+                    .is_some_and(|(draft_request, _)| draft_request == &request)
+                {
+                    self.comment_retry_draft = None;
+                }
                 self.append_confirmed_comment(&request, comment);
                 if matches!(self.overlay, Some(Overlay::Composer { .. })) {
                     self.overlay = None;
@@ -3567,6 +3581,19 @@ impl App {
                 resources.refreshed_at = Some(Instant::now());
                 if self.comment_retry_requires_refresh.as_ref() == Some(&id) {
                     self.comment_retry_requires_refresh = None;
+                    if self
+                        .request_for_view()
+                        .is_some_and(|request| request.id == id)
+                        && let Some(Overlay::Composer {
+                            error,
+                            retry_requires_refresh,
+                            ..
+                        }) = &mut self.overlay
+                        && *retry_requires_refresh
+                    {
+                        *retry_requires_refresh = false;
+                        *error = None;
+                    }
                 }
             }
             Err(error) => {
@@ -5008,6 +5035,74 @@ mod tests {
             &app.overlay,
             Some(Overlay::Composer { body, retry_requires_refresh: false, .. })
                 if body == "ambiguous timeout draft"
+        ));
+    }
+
+    #[tokio::test]
+    async fn comment_retry_state_for_one_request_survives_another_request_success() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut app, request_a, mut receiver) = live_comment_app(calls, false);
+        let mut request_b_model = app.requests[0].clone();
+        request_b_model.id.number += 1;
+        let request_b = request_b_model.id.clone();
+        app.requests.push(request_b_model);
+
+        let timeout_id = OpId::next();
+        app.pending_comment = Some(PendingComment {
+            request: request_a.clone(),
+            correlation_id: timeout_id,
+            body: "request A draft".into(),
+        });
+        app.overlay = Some(Overlay::Composer {
+            body: "request A draft".into(),
+            error: None,
+            retry_requires_refresh: false,
+            button_hits: vec![],
+        });
+        app.apply_comment_write(
+            request_a.clone(),
+            timeout_id,
+            Err(forge::ForgeError::CommentTimedOut),
+        );
+
+        app.view = View::ChangeRequestDetail(request_b.clone());
+        app.submit_comment("request B comment".into());
+        let Some(AppEvent::CommentWrite {
+            request,
+            correlation_id,
+            result,
+        }) = receiver.recv().await
+        else {
+            panic!("request B should complete independently")
+        };
+        app.apply_comment_write(request, correlation_id, result);
+
+        assert_eq!(app.comment_retry_requires_refresh, Some(request_a.clone()));
+        assert_eq!(
+            app.comment_retry_draft,
+            Some((request_a, "request A draft".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshed_comments_clear_the_guard_in_an_open_composer() {
+        let mut app = App::test_app();
+        let id = app.requests[0].id.clone();
+        app.view = View::ChangeRequestDetail(id.clone());
+        app.comment_retry_requires_refresh = Some(id.clone());
+        app.comment_retry_draft = Some((id.clone(), "keep this draft".into()));
+        app.open_comment_composer();
+
+        app.apply_comments(id, 0, Ok(vec![]));
+
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Composer {
+                body,
+                error: None,
+                retry_requires_refresh: false,
+                ..
+            }) if body == "keep this draft"
         ));
     }
 
